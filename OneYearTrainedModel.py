@@ -1348,23 +1348,81 @@ class StochasticAnalyzer:
         )
 
         # 2) entrena una sola vez
+        def expected_calibration_error(y_true, y_prob, n_bins=10):
+            """ECE clásico sobre la confianza máxima."""
+            bins = np.linspace(0.0, 1.0, n_bins + 1)
+            conf_max = np.max(y_prob, axis=1)
+            pred_cls = np.argmax(y_prob, axis=1)
+            # Mapear y_true a índices 0..K-1 según el orden de clases que uses afuera
+            return_pred = None  # placeholder para consistencia, no se usa
+
+        def multiclass_brier(y_true, y_prob, classes):
+            """
+            Brier multiclase: promedio sobre muestras de sum_k (p_k - y_k)^2.
+            y_true: iterable de labels (no one-hot)
+            y_prob: ndarray shape (n_samples, n_classes)
+            classes: iterable con el orden de columnas de y_prob (model.classes_)
+            """
+            class_to_idx = {c: i for i, c in enumerate(classes)}
+            y_idx = np.array([class_to_idx[y] for y in y_true])
+            Y = np.zeros_like(y_prob)
+            Y[np.arange(len(y_true)), y_idx] = 1.0
+            return float(np.mean(np.sum((y_prob - Y) ** 2, axis=1)))
+
+        def ece_maxprob(y_true, y_prob, classes, n_bins=10):
+            """ECE usando la confianza máxima."""
+            class_to_idx = {c: i for i, c in enumerate(classes)}
+            y_idx = np.array([class_to_idx[y] for y in y_true])
+
+            conf = np.max(y_prob, axis=1)
+            pred = np.argmax(y_prob, axis=1)
+
+            bins = np.linspace(0.0, 1.0, n_bins + 1)
+            binids = np.digitize(conf, bins) - 1
+
+            ece = 0.0
+            n = len(y_true)
+            for i in range(n_bins):
+                mask = binids == i
+                if np.any(mask):
+                    acc = np.mean(pred[mask] == y_idx[mask])
+                    avg_conf = np.mean(conf[mask])
+                    ece += (np.sum(mask) / n) * abs(acc - avg_conf)
+            return float(ece)
+
+        # ===============================
+        # Entrenamiento modelo base
+        # ===============================
         base_model = RandomForestClassifier(
             n_estimators=1000, max_features="sqrt", n_jobs=-1, random_state=42
         )
         base_model.fit(X_tr, y_tr)
 
+        # ==== Sin calibrar ====
         preds_vanilla = base_model.predict(X_test_scaled)
-        print("Reporte de clasificación de modelo sin calibrar:")
-        print(classification_report(y_test, preds_vanilla))
+        proba_vanilla = base_model.predict_proba(X_test_scaled)
+        classes = base_model.classes_
 
-        # 3) calibración rápida (sin reentrenar RF)
-        self.model = CalibratedClassifierCV(base_model, method='sigmoid',
-                                            cv='prefit')  # 'sigmoid' es mucho más rápido/estable
+        print("Reporte de clasificación de modelo SIN calibrar:")
+        print(classification_report(y_test, preds_vanilla))
+        print(f"Brier (multiclase): {multiclass_brier(y_test, proba_vanilla, classes):.6f}")
+        print(f"Log loss: {log_loss(y_test, proba_vanilla, labels=classes):.6f}")
+        print(f"ECE: {ece_maxprob(y_test, proba_vanilla, classes):.6f}")
+        print("=" * 50)
+
+        # ==== Con calibración ====
+        self.model = CalibratedClassifierCV(base_model, method='isotonic', cv='prefit')
         self.model.fit(X_cal, y_cal)
 
         preds_cal = self.model.predict(X_test_scaled)
-        print("Reporte de clasificación de modelo calibrado:")
+        proba_cal = self.model.predict_proba(X_test_scaled)
+        classes_cal = self.model.classes_  # puede coincidir, pero toma el del calibrado
+
+        print("Reporte de clasificación de modelo CALIBRADO:")
         print(classification_report(y_test, preds_cal))
+        print(f"Brier (multiclase): {multiclass_brier(y_test, proba_cal, classes_cal):.6f}")
+        print(f"Log loss: {log_loss(y_test, proba_cal, labels=classes_cal):.6f}")
+        print(f"ECE: {ece_maxprob(y_test, proba_cal, classes_cal):.6f}")
 
         u_strong, info_strong, u_soft, info_soft, df_bands = self.select_thresholds_by_band_precision(
             X_hold=X_test_scaled, y_hold=y_test,
@@ -2041,13 +2099,13 @@ class StochasticAnalyzer:
     def send_email(self, subject, body):
         msg = MIMEText(body)
         msg['Subject'] = subject
-        msg['From'] = EMAIL_SENDER
+        msg['From'] = email_sender
         msg['To'] = EMAIL_RECEIVER
         try:
             with smtplib.SMTP(EMAIL_SMTP, EMAIL_PORT) as server:
                 server.starttls()
-                server.login(user=EMAIL_SENDER, password=EMAIL_PASSWORD)
-                server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+                server.login(user=email_sender, password=email_password)
+                server.sendmail(email_sender, EMAIL_RECEIVER, msg.as_string())
             print("Alerta email por enviada ✅")
         except Exception as e:
             print(f"Error enviando email: {e}")
@@ -2552,13 +2610,12 @@ class StochasticAnalyzer:
             self.data = pd.concat([self.data, new_df], ignore_index=True)
             self.data = self.data.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
 
-    def preparar_features(self, df, lags=[1, 2]):
+    def preparar_features(self, df, lags=[1]):
         df = df.copy()
 
-        # === Variables numéricas principales (originales + para lag) ===
         base_features = [
             'd100', 'e100', 'e', 'volatility', 'ATR', 'ADX_14', 'RSI_14', 'avg_volume_last_n', 'pct_volume_change', 'k',
-            'd'
+            'd', 'close', 'high', 'low', 'volume',
         ]
 
         no_lag_features = [
@@ -2951,7 +3008,7 @@ if __name__ == "__main__":
     now = datetime.now()
 
     # analyzer = StochasticAnalyzer(api_key=api_key_roge, api_secret=api_secret_roge)
-    analyzer = StochasticAnalyzer(api_key=API_KEY, api_secret=API_SECRET)
+    analyzer = StochasticAnalyzer(api_key=api_key, api_secret=api_secret)
     # API pública
     # analyzer = StochasticAnalyzer()
 
@@ -2999,7 +3056,7 @@ if __name__ == "__main__":
                 print(f"tomorrow will be {end_date}")
                 filename_tomorrow = f'AVAXUSDT_5m_2024-01-01_{end_date}.csv'
                 if os.path.exists(filename_tomorrow):
-                    analyzer = StochasticAnalyzer(api_key=API_KEY, api_secret=API_SECRET)
+                    analyzer = StochasticAnalyzer(api_key=api_key, api_secret=api_secret)
                     analyzer.run_analysis(
                         symbol="AVAXUSDT",
                         start_date="2024-01-01",
