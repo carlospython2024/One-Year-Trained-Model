@@ -20,7 +20,7 @@ from sklearn.preprocessing import StandardScaler, label_binarize
 import os, json, uuid, time
 from collections import defaultdict
 from dataclasses import dataclass, asdict
-from typing import Optional, Dict, List, Literal, Tuple
+from typing import Optional, Dict, List, Literal, Tuple, Callable
 
 from math import sqrt
 
@@ -54,10 +54,14 @@ warnings.filterwarnings('ignore')
 @dataclass
 class Fees:
     """Estructura de comisiones. Todas en proporción (p.ej., 0.00055 = 0.055%)."""
-    taker_open: float = 0.00055
-    taker_close: float = 0.00055
-    maker_open: float = 0.0002
-    maker_close: float = 0.0002
+    # taker_open: float = 0.00055
+    # taker_close: float = 0.00055
+    # maker_open: float = 0.0002
+    # maker_close: float = 0.0002
+    taker_open: float = 0.00005
+    taker_close: float = 0.00005
+    maker_open: float = 0.00002
+    maker_close: float = 0.00002
 
 
 @dataclass
@@ -75,6 +79,8 @@ class Trade:
     exit_time: Optional[pd.Timestamp] = None
     exit_price: Optional[float] = None
     exit_reason: Optional[Literal["tp", "sl", "close"]] = None
+    entry_proba: Optional[float] = None   # 0..1
+    entry_pred: Optional[str] = None      # 'bullish' | 'bearish' | 'lateral'
 
     def is_open(self) -> bool:
         return self.exit_time is None
@@ -135,8 +141,8 @@ class TradeSimulator:
         fixed_notional_usdt: float = 100.0,
         use_adapter_tp_sl_when_missing: bool = True,
         atr_period: int = 14,
-        atr_mult_tp: float = 1.0,
-        atr_mult_sl: float = 1.0,
+        atr_mult_tp: float = 4,
+        atr_mult_sl: float = 2.7,
         retrain_each_bar: bool = False,
         suppress_fit_stdout: bool = True,
         suppress_predict_stdout: bool = True,
@@ -145,13 +151,26 @@ class TradeSimulator:
         thresholds: Optional[Dict[str, float]] = None,
         n_keep_for_fit: int = 40000,
         close_trades_at_test_end: bool = True,
+        on_event: Optional[Callable[[str, dict], None]] = None,
+        verbose: int = 1,
+        log_every_bars: int = 250,
+        use_tqdm: bool = False,
     ):
         assert {"datetime", "open", "high", "low", "close"}.issubset(candles.columns), \
             "El DataFrame de velas debe contener: datetime, open, high, low, close"
         self.analyzer = analyzer
         self.df = candles.reset_index(drop=True).copy()
-        if not np.issubdtype(self.df["datetime"].dtype, np.datetime64):
-            self.df["datetime"] = pd.to_datetime(self.df["datetime"], utc=False)
+        if not pd.api.types.is_datetime64_any_dtype(self.df["datetime"]):
+            # si viene como string/epoch, parsea; si ya trae tz, pandas la conserva
+            self.df["datetime"] = pd.to_datetime(self.df["datetime"], utc=True)  # o utc=False si lo prefieres
+
+        # si quedó naive (sin tz), localiza; si ya tiene tz, no hace nada
+        if getattr(self.df["datetime"].dt, "tz", None) is None:
+            self.df["datetime"] = self.df["datetime"].dt.tz_localize("UTC")
+
+        # si quieres ver/imprimir en Bogotá:
+        self.df["datetime"] = self.df["datetime"].dt.tz_convert("America/Bogota")
+
         self.symbol = symbol
         self.interval = interval
         self.equity = float(initial_equity)
@@ -176,6 +195,11 @@ class TradeSimulator:
         self.thresholds = thresholds or {"bearish": 0.55, "bullish": 0.55, "lateral": 0.40}
         self.n_keep_for_fit = int(n_keep_for_fit)
         self.close_trades_at_test_end = bool(close_trades_at_test_end)
+        # Verbosidad y callback de eventos
+        self.on_event = on_event
+        self.verbose = int(verbose)
+        self.log_every_bars = int(log_every_bars)
+        self.use_tqdm = bool(use_tqdm)
 
         global fees
         fees = bybit_fees
@@ -386,9 +410,21 @@ class TradeSimulator:
         Por defecto **entrena una sola vez** con el histórico previo a `test_start`.
         Si `retrain_each_bar=True`, reentrena en cada barra antes de predecir.
         """
-        mask = (self.df["datetime"] >= pd.to_datetime(test_start))
-        if test_end is not None:
-            mask &= (self.df["datetime"] <= pd.to_datetime(test_end))
+
+        def _to_same_tz(ts, tz):
+            t = pd.to_datetime(ts)
+            if t.tzinfo is None:
+                return t.tz_localize(tz)  # agrega tz
+            return t.tz_convert(tz)  # cambia tz
+
+        tz = self.df["datetime"].dt.tz
+        start = _to_same_tz(test_start, tz)
+        end = _to_same_tz(test_end, tz) if test_end is not None else None
+
+        mask = self.df["datetime"] >= start
+        if end is not None:
+            mask &= self.df["datetime"] <= end
+
         idxs = self.df.index[mask].tolist()
         if not idxs:
             raise ValueError("Rango de test vacío. Revisa las fechas.")
@@ -405,6 +441,14 @@ class TradeSimulator:
         last_allowed_index = idxs[-1]
 
         for pos, i in enumerate(idxs):
+            just_closed = False
+            # Heartbeat de progreso
+            ts_here = self.df.loc[i, "datetime"]
+            if self.on_event and (pos == 0 or (pos + 1) % self.log_every_bars == 0 or pos == len(idxs) - 1):
+                self.on_event("progress", {"i": pos+1, "total": len(idxs), "time": ts_here,
+                                            "equity": self.equity, "trades": len(self.trades)})
+            elif self.verbose >= 1 and (pos == 0 or (pos + 1) % self.log_every_bars == 0 or pos == len(idxs) - 1):
+                print(f"[{pos+1}/{len(idxs)}] {ts_here} | equity={self.equity:.2f} | trades={len(self.trades)}")
             # (Opcional) reentrenar por barra
             if self.retrain_each_bar:
                 train_slice = self.df.loc[: i - 1]
@@ -419,8 +463,20 @@ class TradeSimulator:
                     pnl = current_trade.pnl_usdt()
                     fees_paid = current_trade.fees_usdt()
                     self.equity += pnl - fees_paid
+                    # Evento de cierre ANTES de limpiar la variable
+                    if self.on_event:
+                        dur = (current_trade.exit_time - current_trade.entry_time) if (current_trade.exit_time and current_trade.entry_time) else None
+                        self.on_event("close", {"time": current_trade.exit_time, "reason": current_trade.exit_reason,
+                                                 "price": current_trade.exit_price, "pnl": pnl, "fees": fees_paid,
+                                                 "equity": self.equity, "entry_time": current_trade.entry_time,
+                                                 "duration": dur})
+                    if self.verbose >= 2:
+                        print(f"CLOSE {current_trade.side} @ {current_trade.exit_price:.4f} ({current_trade.exit_reason}) | PnL={pnl:.2f} | fees={fees_paid:.2f} | equity={self.equity:.2f}")
                     self.trades.append(current_trade)
                     current_trade = None
+
+            if just_closed:
+                continue
 
             # Si no hay trade, evaluar nueva señal
             if current_trade is None:
@@ -443,6 +499,8 @@ class TradeSimulator:
                 side = "long" if pred == "bullish" else "short"
                 tp, sl = self._tp_sl_from_adapter_or_atr(i, side, sig.get("take_profit") or sig.get("tp"),
                                                           sig.get("stop_loss") or sig.get("sl"))
+
+                proba_sel = self._extract_proba_for_monitor(sig)  # ya existe en el simulador
                 current_trade = Trade(
                     side=side,
                     entry_time=ts,
@@ -453,20 +511,35 @@ class TradeSimulator:
                     leverage=self.leverage,
                     opened_with="taker",
                     closed_with="taker",
+                    entry_proba=proba_sel,
+                    entry_pred=pred,
                 )
                 # comisión de entrada
                 entry_fee = px * qty * (self.fees.taker_open if current_trade.opened_with == "taker" else self.fees.maker_open)
                 self.equity -= entry_fee
+                # Evento de apertura y log
+                if self.on_event:
+                    self.on_event("open", {"time": ts, "side": side, "price": px, "tp": float(tp), "sl": float(sl), "qty": float(qty), "prob": proba})
+                if self.verbose >= 2:
+                    print(f"OPEN  {side} @ {px:.4f} | tp={tp:.4f} sl={sl:.4f} | qty={qty:.4f} | proba={proba * 100:.1f}")
 
             # Avanzar para cierre, pero no más allá de `test_end` si se pidió
             j_limit = last_allowed_index if self.close_trades_at_test_end else len(self.df) - 1
             j = i + 1
-            while current_trade is not None and current_trade.is_open() and j <= j_limit:
+            if False and current_trade is not None and current_trade.is_open() and j <= j_limit:
                 self._try_close_trade_on_bar(current_trade, j)
                 if not current_trade.is_open():
                     pnl = current_trade.pnl_usdt()
                     fees_paid = current_trade.fees_usdt()
                     self.equity += pnl - fees_paid
+                    if self.on_event:
+                        dur = (current_trade.exit_time - current_trade.entry_time) if (current_trade.exit_time and current_trade.entry_time) else None
+                        self.on_event("close", {"time": current_trade.exit_time, "reason": current_trade.exit_reason,
+                                                 "price": current_trade.exit_price, "pnl": pnl, "fees": fees_paid,
+                                                 "equity": self.equity, "entry_time": current_trade.entry_time,
+                                                 "duration": dur})
+                    if self.verbose >= 2:
+                        print(f"CLOSE {current_trade.side} @ {current_trade.exit_price:.4f} ({current_trade.exit_reason}) | PnL={pnl:.2f} | fees={fees_paid:.2f} | equity={self.equity:.2f}")
                     self.trades.append(current_trade)
                     current_trade = None
                     break
@@ -481,11 +554,27 @@ class TradeSimulator:
             pnl = current_trade.pnl_usdt()
             fees_paid = current_trade.fees_usdt()
             self.equity += pnl - fees_paid
+            if self.on_event:
+                dur = (current_trade.exit_time - current_trade.entry_time) if (current_trade.exit_time and current_trade.entry_time) else None
+                self.on_event("close", {"time": current_trade.exit_time, "reason": current_trade.exit_reason,
+                                         "price": current_trade.exit_price, "pnl": pnl, "fees": fees_paid,
+                                         "equity": self.equity, "entry_time": current_trade.entry_time,
+                                         "duration": dur})
+            if self.verbose >= 2:
+                print(f"FORCE CLOSE @ period end {current_trade.exit_price:.4f} | PnL={pnl:.2f} | fees={fees_paid:.2f} | equity={self.equity:.2f}")
             self.trades.append(current_trade)
 
         wins = sum(1 for t in self.trades if t.exit_reason == "tp")
         losses = sum(1 for t in self.trades if t.exit_reason == "sl")
         rr = wins / max(1, losses) if (wins + losses) > 0 else None
+
+        proba_summary = self.summarize_by_proba(step=1, include_forced=True)
+
+        if self.verbose >= 1:
+            print("=== Resumen por probabilidad (bucket 10%) ===")
+            for bucket, s in proba_summary.items():
+                print(f"p≈{bucket}%  wins={s['wins']:<4} losses={s['losses']:<4} "
+                      f"forced={s['forced']:<4} trades={s['trades']}")
 
         return {
             "final_equity": float(self.equity),
@@ -495,7 +584,46 @@ class TradeSimulator:
             "win_loss_ratio": float(rr) if rr is not None else None,
             "trades": [asdict(t) for t in self.trades],
             "fees": asdict(self.fees),
+            "proba_summary": proba_summary
         }
+
+    def _bucketize_proba(self, p: Optional[float], step: int = 10) -> Optional[int]:
+        """Convierte p (0..1) a un bucket de porcentaje (0..100) según step (10 -> 0,10,20,...)."""
+        if p is None:
+            return None
+        pct = int(round(100 * float(p)))
+        return (pct // step) * step  # 87% -> 80 si step=10
+
+    def summarize_by_proba(self, step: int = 10, include_forced: bool = True) -> Dict[int, Dict[str, int]]:
+        """
+        Devuelve {bucket_pct: {'wins': x, 'losses': y, 'forced': z, 'trades': n}}, ordenado por 'wins' desc.
+        - wins: tp o (cierre forzado con PnL>0 si include_forced=True)
+        - losses: sl o (cierre forzado con PnL<=0 si include_forced=True)
+        - forced: cierres 'close' (forzados por fin de período)
+        """
+        summ: Dict[int, Dict[str, int]] = {}
+        for t in self.trades:
+            b = self._bucketize_proba(t.entry_proba, step=step)
+            if b is None:
+                continue
+            d = summ.setdefault(b, {"wins": 0, "losses": 0, "forced": 0, "trades": 0})
+            # clasificar resultado
+            if t.exit_reason in ("tp", "sl"):
+                win = (t.exit_reason == "tp")
+            else:
+                # 'close' forzado: decidir por PnL
+                win = (t.pnl_usdt() > 0.0)
+                if include_forced:
+                    d["forced"] += 1
+            if win:
+                d["wins"] += 1
+            else:
+                d["losses"] += 1
+            d["trades"] += 1
+
+        # ordenar por wins desc
+        ordered = dict(sorted(summ.items(), key=lambda kv: kv[1]["wins"], reverse=True))
+        return ordered
 
 
 def _now_iso():
@@ -1966,6 +2094,15 @@ class StochasticAnalyzer:
         """
         # Obtener datos usando cache inteligente
         self.data = self.get_bybit_data_smart(symbol, interval, start_date, end_date)
+        # después de crear self.data
+        self.data["datetime"] = pd.to_datetime(self.data["datetime"])  # sin forzar utc=False
+
+        # forzar awareness y convertir a Bogota (UTC-5)
+        if getattr(self.data["datetime"].dt, "tz", None) is None:
+            # si tus tiempos representan UTC sin tz, primero localiza como UTC
+            self.data["datetime"] = self.data["datetime"].dt.tz_localize("UTC")
+
+        self.data["datetime"] = self.data["datetime"].dt.tz_convert("America/Bogota")
 
         if self.data is None or len(self.data) == 0:
             print("No se pudieron obtener datos")
@@ -4187,22 +4324,40 @@ if __name__ == "__main__":
         # simulacion
         df = analyzer.data
 
+
+        def logger(event, payload):
+            if event == "progress":
+                print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
+                      f"equity={payload['equity']:.2f} | trades={payload['trades']}")
+            elif event == "open":
+                print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
+                      f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | proba={payload['prob'] * 100:.1f}")
+            elif event == "close":
+                dur = payload.get("duration")
+                print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
+                      f"PnL={payload['pnl']:.2f} | fees={payload['fees']:.2f} | "
+                      f"equity={payload['equity']:.2f} | "
+                      f"in={payload['entry_time']} out={payload['time']} "
+                      f"dur={dur}")
+
         sim = TradeSimulator(
             analyzer,
-            df,  # <-- dataset completo (170k). El simulador recorta internamente.
+            df,
             initial_equity=2000,
             leverage=19,
             risk_fraction=0.02,
-            retrain_each_bar=False,  # entrena UNA vez antes del test
-            suppress_fit_stdout=False,  # silencia reporte de entrenamiento
-            suppress_predict_stdout=True,  # silencia prints de predicción offline
-            use_offline_predictor=True,  # no llama al API
-            offline_lookback_bars=200,
-            n_keep_for_fit=40000,
-            close_trades_at_test_end=True
+            on_event=logger,  # <— activar callback
+            verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
+            log_every_bars=250,
+            proba_threshold_day=0.79,
+            proba_threshold_night=0.80,
+            n_keep_for_fit=30000,
+            atr_mult_tp=4,
+            atr_mult_sl=2.7
         )
-        results = sim.run(test_start="2025-06-01", test_end="2025-08-15")
-        print(results["final_equity"], results["n_trades"])
+
+        results = sim.run(test_start="2025-08-13", test_end="2025-08-17")
+        print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
 
         #     # Guardar resultados
         # results_df = analyzer.save_results("avax_stochastic_analysis_cached.csv")
