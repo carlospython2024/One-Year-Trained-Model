@@ -16,11 +16,16 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, log_loss, brier_score_loss
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
-from sklearn.preprocessing import StandardScaler, label_binarize
+from sklearn.preprocessing import StandardScaler, label_binarize, LabelEncoder
+from sklearn.inspection import permutation_importance
+from betacal import BetaCalibration
+
 import os, json, uuid, time
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, List, Literal, Tuple, Callable
+
+
 
 from math import sqrt
 
@@ -28,6 +33,30 @@ import warnings
 import smtplib
 from email.mime.text import MIMEText
 import pytz
+
+# helpers de librerías opcionales
+_HAS_LGBM, _HAS_XGB = False, False
+try:
+    from lightgbm import LGBMClassifier
+    _HAS_LGBM = True
+except Exception:
+    pass
+
+try:
+    from xgboost import XGBClassifier
+    _HAS_XGB = True
+except Exception:
+    pass
+
+# ===== NUEVO: import opcional betacal =====
+_HAS_BETACAL = False
+try:
+    from betacal import BetaCalibration
+    _HAS_BETACAL = True
+except Exception:
+    pass
+
+
 
 load_dotenv()
 
@@ -50,6 +79,144 @@ RESTART_HOUR_3 = 17
 RESTART_HOUR_4 = 22
 
 warnings.filterwarnings('ignore')
+
+def _trades_to_df(self) -> pd.DataFrame:
+    """Convierte self.trades (lista de Trade) en DataFrame listo para estadísticas."""
+    rows = []
+    for t in self.trades:
+        rows.append({
+            "entry_time": t.entry_time,
+            "exit_time": t.exit_time,
+            "side": getattr(t, "side", None),                     # "long"/"short"
+            "entry_price": getattr(t, "entry_price", np.nan),
+            "exit_price": getattr(t, "exit_price", np.nan),
+            "qty": getattr(t, "qty", np.nan),
+            "leverage": getattr(t, "leverage", np.nan),
+            "entry_pred": getattr(t, "entry_pred", None),
+            "entry_proba": getattr(t, "entry_proba", np.nan),
+            "exit_reason": getattr(t, "exit_reason", None),
+            "fees": float(t.fees_usdt()) if hasattr(t, "fees_usdt") else np.nan,
+            "pnl": float(t.pnl_usdt()) if hasattr(t, "pnl_usdt") else np.nan,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["pnl_net"] = df["pnl"] - df.get("fees", 0.0)
+    return df
+
+
+
+
+
+
+# === Multi-class Beta Calibration (uno-vs-rest) ===
+class MultiClassBetaCalibrator:
+    """
+    Aplica BetaCalibration por clase (uno-vs-rest) y renormaliza.
+    Úsalo con probabilidades (n, K). Requiere betacal instalado.
+    """
+    def __init__(self, parameters: str = "abm", classes_=None, label_encoder=None):
+        if not _HAS_BETACAL:
+            raise ImportError("Requiere betacal. Instala con: pip install betacal")
+        self.parameters = parameters
+        self.classes_ = None if classes_ is None else np.array(classes_)
+        self.label_encoder = label_encoder
+        self._per_class = []  # lista de BetaCalibration por clase
+
+    def fit(self, proba: np.ndarray, y_idx: np.ndarray):
+        """
+        proba: (n, K) del modelo base en X_cal
+        y_idx: (n,) enteros 0..K-1 (no one-hot)
+        """
+        n, K = proba.shape
+        self._per_class = []
+        for k in range(K):
+            yk = (y_idx == k).astype(int)             # binario 0/1
+            pk = proba[:, k].reshape(-1)              # vector 1D
+            beta = BetaCalibration(parameters=self.parameters)
+            beta.fit(pk, yk)                          # <- binario correcto
+            self._per_class.append(beta)
+        self.n_classes_ = K
+        return self
+
+    def predict_proba(self, proba_raw: np.ndarray) -> np.ndarray:
+        """
+        proba_raw: (n, K) del modelo base en cualquier X
+        Devuelve (n, K) calibrado y renormalizado.
+        """
+        n, K = proba_raw.shape
+        out = np.zeros_like(proba_raw, dtype=float)
+        for k in range(K):
+            # BetaCalibration.predict_proba devuelve (n, 2); [:,1] es P(clase=1)
+            pk = proba_raw[:, k].reshape(-1)
+            pk_cal = self._per_class[k].predict(pk)
+            out[:, k] = pk_cal
+
+        # renormalización para sumar 1 por fila
+        row_sum = out.sum(axis=1, keepdims=True)
+        eps = 1e-12
+        row_sum = np.where(row_sum < eps, eps, row_sum)
+        out = out / row_sum
+        return out
+
+
+
+
+class BetaMultiWrapper:
+    """
+    Wrapper para exponer API similar a CalibratedClassifierCV pero con MultiClassBetaCalibrator.
+    - Para RF/LGBM: classes_ son las de base_model.
+    - Para XGB + LabelEncoder: devuelve etiquetas en texto.
+    """
+    def __init__(self, base_model, mc_beta: MultiClassBetaCalibrator, classes_, label_encoder=None):
+        self.base_model = base_model
+        self.mc_beta = mc_beta
+        self.le = label_encoder
+        self.classes_ = np.array(classes_) if label_encoder is None else label_encoder.classes_
+
+    def predict_proba(self, X):
+        proba_raw = self.base_model.predict_proba(X)
+        return self.mc_beta.predict_proba(proba_raw)
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        idx = np.argmax(proba, axis=1)
+        if self.le is not None:
+            return self.le.inverse_transform(idx)
+        return self.classes_[idx]
+
+
+class BetaWrapper:
+    """Calibrador beta para RF/LGBM con etiquetas en texto."""
+    def __init__(self, base_model, beta_cal, classes_):
+        self.base_model = base_model
+        self.beta_cal = beta_cal
+        self.classes_ = np.array(classes_)
+
+    def predict_proba(self, X):
+        proba_raw = self.base_model.predict_proba(X)
+        return self.beta_cal.predict_proba(proba_raw)
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        idx = np.argmax(proba, axis=1)
+        return self.classes_[idx]
+
+class LabeledBetaWrapper:
+    """Calibrador beta para XGB entrenado con y codificado (0..K-1), devolviendo etiquetas en texto."""
+    def __init__(self, base_model, beta_cal, label_encoder):
+        self.base_model = base_model
+        self.beta_cal = beta_cal
+        self.le = label_encoder
+        self.classes_ = self.le.classes_
+
+    def predict_proba(self, X):
+        proba_raw = self.base_model.predict_proba(X)
+        return self.beta_cal.predict_proba(proba_raw)
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        idx = np.argmax(proba, axis=1)
+        return self.le.inverse_transform(idx)
 
 @dataclass
 class Fees:
@@ -144,6 +311,7 @@ class TradeSimulator:
         atr_mult_tp: float = 4,
         atr_mult_sl: float = 2.7,
         retrain_each_bar: bool = False,
+        retrain_every_bars: int | None = None,
         suppress_fit_stdout: bool = True,
         suppress_predict_stdout: bool = True,
         use_offline_predictor: bool = True,
@@ -155,6 +323,8 @@ class TradeSimulator:
         verbose: int = 1,
         log_every_bars: int = 250,
         use_tqdm: bool = False,
+        min_margin: float = 0.03,
+        announce_fit: bool = True
     ):
         assert {"datetime", "open", "high", "low", "close"}.issubset(candles.columns), \
             "El DataFrame de velas debe contener: datetime, open, high, low, close"
@@ -188,6 +358,7 @@ class TradeSimulator:
         self.atr_mult_tp = float(atr_mult_tp)
         self.atr_mult_sl = float(atr_mult_sl)
         self.retrain_each_bar = bool(retrain_each_bar)
+        self.retrain_every_bars = int(retrain_every_bars) if retrain_every_bars else None
         self.suppress_fit_stdout = bool(suppress_fit_stdout)
         self.suppress_predict_stdout = bool(suppress_predict_stdout)
         self.use_offline_predictor = bool(use_offline_predictor)
@@ -200,6 +371,7 @@ class TradeSimulator:
         self.verbose = int(verbose)
         self.log_every_bars = int(log_every_bars)
         self.use_tqdm = bool(use_tqdm)
+        self.min_margin = float(min_margin)
 
         global fees
         fees = bybit_fees
@@ -210,47 +382,181 @@ class TradeSimulator:
 
         self.trades: List[Trade] = []
         self.logs: List[str] = []
+        self.announce_fit = bool(announce_fit)
 
     # --------------------------
     # ADAPTERS / INTEGRACIONES
     # --------------------------
 
     def fit_model(self, train_df: pd.DataFrame):
-        """Entrena el modelo del usuario **solo** con `train_df`.
-        Seteamos `analyzer.data = train_df` y llamamos `create_predictive_model` con N_KEEP capado.
         """
-        self.analyzer.data = train_df.copy()
-        N_KEEP = min(len(train_df), self.n_keep_for_fit)
+        Entrena el modelo del usuario solo con train_df.
+        Capamos a las últimas n_keep_for_fit filas para asegurar ventana rodante.
+        Además, imprimimos la ventana (from → to) con la que se entrena.
+        """
+        # Ventana efectiva: últimas n_keep_for_fit antes de la vela a analizar
+        effective_df = train_df.tail(self.n_keep_for_fit).copy() if self.n_keep_for_fit else train_df.copy()
+
+        # Anuncio claro de la ventana de fit
+        if self.announce_fit and not effective_df.empty:
+            t0 = effective_df["datetime"].iloc[0]
+            t1 = effective_df["datetime"].iloc[-1]
+            n = len(effective_df)
+            tzinfo = getattr(effective_df["datetime"].dt, "tz", None)
+            tzname = tzinfo if tzinfo is not None else "naive"
+            msg = f"[FIT] n={n} window: {t0} → {t1} (tz={tzname})"
+            # si tienes callback:
+            if getattr(self, "on_event", None):
+                try:
+                    self.on_event("fit_window", {"n": n, "from": t0, "to": t1, "tz": str(tzname)})
+                except Exception:
+                    pass
+            # y/o a consola si usas verbose
+            if getattr(self, "verbose", 0) >= 1:
+                print(msg)
+
+        # Asignar datos al analyzer y entrenar con N_KEEP consistente
+        self.analyzer.data = effective_df
+        N_KEEP = len(effective_df)
+
+        # rf, lgbm, xgb
+        model = 'xgb'
+        # isotonic, sigmoid, beta
+        method_calibration = 'beta'
         if self.suppress_fit_stdout:
             import io, contextlib
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                self.analyzer.create_predictive_model(display_graphic=False, N_KEEP=N_KEEP)
-        else:
-            self.analyzer.create_predictive_model(display_graphic=False, N_KEEP=N_KEEP)
+                # # RF con beta
+                # self.analyzer.create_predictive_model(model_type="rf", calibrate_method="beta",
+                #                                       model_kwargs={
+                #                                           "n_estimators":700,
+                #                                           "max_features":"sqrt",
+                #                                           "n_jobs":-1,
+                #                                           "random_state":42
+                #                                       })
+                #
+                # # LGBM con beta
+                # self.analyzer.create_predictive_model(model_type="lgbm", calibrate_method="sigmoid",
+                #                              model_kwargs={
+                #                                  "n_estimators":700,
+                #                                  "learning_rate":0.05,
+                #                                  "subsample":0.9,
+                #                                  "colsample_bytree":0.9,
+                #                                  "random_state":42,
+                #                                  "n_jobs":-1
+                #                              })
 
-    def _extract_proba_for_monitor(self, sig: Dict) -> Optional[float]:
-        """Toma la probabilidad relevante para evaluar umbrales de monitor.
-        Acepta tanto 'proba' como 'probabilities'. Si hay 'prediction', usa la de esa clase.
+                # XGB con beta (usa LabelEncoder interno)
+                # self.analyzer.create_predictive_model(model_type="xgb", calibrate_method="sigmoid",
+                #                                       model_kwargs={
+                #                                           "n_estimators": 700,
+                #                                           "learning_rate": 0.05,
+                #                                           "subsample": 0.9,
+                #                                           "colsample_bytree": 0.9,
+                #                                           "max_depth": 8,
+                #                                           "random_state": 42,
+                #                                           "n_jobs": -1,
+                #                                           "tree_method": "hist",
+                #                                           "objective": "multi:softprob"
+                #                                       })
+                self.analyzer.create_predictive_model(model_type="xgb", calibrate_method="beta", N_KEEP=N_KEEP,
+                                                      model_kwargs={
+                                                          "n_estimators": 700,
+                                                          "learning_rate": 0.05,
+                                                          "subsample": 0.9,
+                                                          "colsample_bytree": 0.9,
+                                                          "max_depth": 8,
+                                                          "random_state": 42,
+                                                          "n_jobs": -1,
+                                                          "tree_method": "hist",
+                                                          "objective": "multi:softprob"
+                                                      })
+        else:
+
+            # # RF con beta # isotonic, sigmoid, beta
+            # self.analyzer.create_predictive_model(model_type="rf", calibrate_method="isotonic",  N_KEEP=N_KEEP,
+            #                                       model_kwargs={
+            #                                           "n_estimators":700,
+            #                                           "max_features":"sqrt",
+            #                                           "n_jobs":-1,
+            #                                           "random_state":42
+            #                                       })
+            #
+            # # LGBM con beta
+            # self.analyzer.create_predictive_model(model_type="lgbm", calibrate_method="beta",  N_KEEP=N_KEEP,
+            #                              model_kwargs={
+            #                                  "n_estimators":700,
+            #                                  "learning_rate":0.05,
+            #                                  "subsample":0.9,
+            #                                  "colsample_bytree":0.9,
+            #                                  "random_state":42,
+            #                                  "n_jobs":-1
+            #                              })
+
+            # XGB con beta (usa LabelEncoder interno)
+            self.analyzer.create_predictive_model(model_type="xgb", calibrate_method="isotonic", N_KEEP=N_KEEP,
+                                         model_kwargs={
+                                             "n_estimators": 700,
+                                             "learning_rate": 0.05,
+                                             "subsample": 0.9,
+                                             "colsample_bytree": 0.9,
+                                             "max_depth": 8,
+                                             "random_state": 42,
+                                             "n_jobs": -1,
+                                             "tree_method": "hist",
+                                             "objective": "multi:softprob"
+                                         })
+
+    def _extract_proba_for_monitor(self, sig: Dict, return_margin: bool = False):
+        """
+        Devuelve la probabilidad relevante para evaluar umbrales de monitor.
+        Si return_margin=True, retorna (top_prob, margin_top1_top2).
+        - Usa 'proba' si viene directo.
+        - Si hay 'probabilities' (dict) y 'prediction', usa la prob. de esa clase.
+        - Si no hay 'prediction', usa la mayor del dict.
         """
         if sig is None:
-            return None
+            return (None, None) if return_margin else None
+
+        # 1) Campo directo 'proba'
         if "proba" in sig and sig["proba"] is not None:
             try:
-                return float(sig["proba"])
+                top_prob = float(sig["proba"])
+                return (top_prob, None) if return_margin else top_prob
             except Exception:
                 pass
+
+        # 2) Probabilidades por clase (dict)
         probs = sig.get("probabilities") or sig.get("probs")
         pred = sig.get("prediction")
-        if probs and isinstance(probs, dict):
-            if pred in probs:
-                return float(probs[pred])
-            # si no hay pred, usa la mayor
+
+        if isinstance(probs, dict) and probs:
+            # Asegurar valores numéricos
             try:
-                return float(max(probs.values()))
+                probs_num = {k: float(v) for k, v in probs.items()}
             except Exception:
-                return None
-        return None
+                return (None, None) if return_margin else None
+
+            if pred in probs_num:
+                top_prob = probs_num[pred]
+                # segunda mejor EXCLUYENDO la clase predicha
+                others = [v for k, v in probs_num.items() if k != pred]
+                second = max(others) if others else None
+            else:
+                # ordenar por valor para hallar top-1 y top-2
+                vals = sorted(probs_num.values(), reverse=True)
+                top_prob = vals[0]
+                second = vals[1] if len(vals) > 1 else None
+
+            if return_margin:
+                margin = (top_prob - second) if (second is not None) else None
+                return top_prob, margin
+            else:
+                return top_prob
+
+        # 3) Si no hay nada utilizable
+        return (None, None) if return_margin else None
 
     def offline_predict_at_index(self, i: int) -> Optional[Dict]:
         """Replica `predict_realtime` pero **offline** usando el dataset local.
@@ -289,7 +595,7 @@ class TradeSimulator:
         if hasattr(self.analyzer, "_apply_thresholds"):
             pred_class = self.analyzer._apply_thresholds(
                 proba_vec, classes, self.thresholds,
-                default_class="lateral", global_floor=0.51, min_margin=0.03
+                default_class="lateral", global_floor=0.51, min_margin=self.min_margin
             )
         else:
             # fallback simple
@@ -297,13 +603,16 @@ class TradeSimulator:
             pred_class = classes[best_idx]
 
         # filtro de “fake” señales como en tu predict_realtime
-        ema_10 = float(last_meta.get("EMA_10", np.nan))
+        ema_20 = float(last_meta.get("EMA_15", np.nan))
         close_px = float(last_meta["close"])
-        umbral_strong = getattr(self.analyzer, "umbral_strong", 0.84)
+        open_px = float(last_meta["open"])
+
+        # umbral_strong = getattr(self.analyzer, "umbral_strong", 0.84)
+        umbral_strong = 0.84
         pred = pred_class
-        if pred_class == 'bullish' and (not np.isnan(ema_10)) and close_px < ema_10 and probabilities.get('bullish', 0) < umbral_strong:
+        if pred_class == 'bullish' and (not np.isnan(ema_20)) and close_px < ema_20  and probabilities.get('bullish', 0):
             pred = 'lateral'
-        elif pred_class == 'bearish' and (not np.isnan(ema_10)) and close_px > ema_10 and probabilities.get('bearish', 0) < umbral_strong:
+        elif pred_class == 'bearish' and (not np.isnan(ema_20)) and close_px > ema_20  and probabilities.get('bearish', 0):
             pred = 'lateral'
 
         return {
@@ -451,10 +760,18 @@ class TradeSimulator:
                 print(f"[{pos+1}/{len(idxs)}] {ts_here} | equity={self.equity:.2f} | trades={len(self.trades)}")
             # (Opcional) reentrenar por barra
             if self.retrain_each_bar:
+                # cada 1 vela (comportamiento antiguo)
                 train_slice = self.df.loc[: i - 1]
-                if len(train_slice) < 200:
-                    continue
-                self.fit_model(train_slice)
+                if len(train_slice) >= 200:
+                    self.fit_model(train_slice)
+            elif self.retrain_every_bars is not None and self.retrain_every_bars > 0:
+                # cada N velas (p.ej., 144). Evita pos==0 porque ya hicimos un fit inicial antes del test.
+                if (pos > 0) and ((pos + 1) % self.retrain_every_bars == 0):
+                    # ventana rodante: últimas n_keep_for_fit filas hasta i-1
+                    start_idx = max(0, i - self.n_keep_for_fit) if self.n_keep_for_fit else 0
+                    train_slice = self.df.iloc[start_idx: i]
+                    if len(train_slice) >= 200:
+                        self.fit_model(train_slice)
 
             # Si hay trade abierto, intentar cierre en esta barra
             if current_trade is not None and current_trade.is_open():
@@ -484,7 +801,7 @@ class TradeSimulator:
                 if not sig:
                     continue
                 pred = sig.get("prediction")
-                proba = self._extract_proba_for_monitor(sig)
+                proba, margin = self._extract_proba_for_monitor(sig, return_margin=True)
                 if pred not in {"bullish", "bearish"}:
                     continue
                 ts = self.df.loc[i, "datetime"]
@@ -519,7 +836,10 @@ class TradeSimulator:
                 self.equity -= entry_fee
                 # Evento de apertura y log
                 if self.on_event:
-                    self.on_event("open", {"time": ts, "side": side, "price": px, "tp": float(tp), "sl": float(sl), "qty": float(qty), "prob": proba})
+                    self.on_event("open", {
+                        "time": ts, "side": side, "price": px, "tp": float(tp), "sl": float(sl), "qty": float(qty),
+                        "prob": proba, "margin": float(margin)
+                    })
                 if self.verbose >= 2:
                     print(f"OPEN  {side} @ {px:.4f} | tp={tp:.4f} sl={sl:.4f} | qty={qty:.4f} | proba={proba * 100:.1f}")
 
@@ -576,6 +896,32 @@ class TradeSimulator:
                 print(f"p≈{bucket}%  wins={s['wins']:<4} losses={s['losses']:<4} "
                       f"forced={s['forced']:<4} trades={s['trades']}")
 
+        # === Construir trades_df y resumir ===
+        trades_rows = []
+        for t in self.trades:
+            trades_rows.append({
+                "entry_time": t.entry_time,
+                "exit_time": t.exit_time,
+                "side": t.side,
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "qty": t.qty,
+                "leverage": getattr(t, "leverage", None),
+                "exit_reason": t.exit_reason,
+                "entry_proba": getattr(t, "entry_proba", None),
+                "entry_pred": getattr(t, "entry_pred", None),
+                "fees": t.fees_usdt() if hasattr(t, "fees_usdt") else None,
+                "pnl": t.pnl_usdt() if hasattr(t, "pnl_usdt") else None,
+            })
+        trades_df = pd.DataFrame(trades_rows)
+
+        metrics, trades_df = self._summarize_backtest(trades_df)
+
+        if self.verbose >= 1:
+            print("\n=== Resumen Backtest ===")
+            for k, v in metrics.items():
+                print(f"{k:>18}: {v}")
+
         return {
             "final_equity": float(self.equity),
             "n_trades": len(self.trades),
@@ -584,7 +930,8 @@ class TradeSimulator:
             "win_loss_ratio": float(rr) if rr is not None else None,
             "trades": [asdict(t) for t in self.trades],
             "fees": asdict(self.fees),
-            "proba_summary": proba_summary
+            "proba_summary": proba_summary,
+            "metrics": metrics
         }
 
     def _bucketize_proba(self, p: Optional[float], step: int = 10) -> Optional[int]:
@@ -624,6 +971,118 @@ class TradeSimulator:
         # ordenar por wins desc
         ordered = dict(sorted(summ.items(), key=lambda kv: kv[1]["wins"], reverse=True))
         return ordered
+
+    def _summarize_backtest(self, trades_df: pd.DataFrame, equity_curve: Optional[pd.Series] = None):
+        df = trades_df.copy()
+
+        # Resultado si no existe
+        if 'result' not in df.columns:
+            # si tienes exit_reason con 'tp'/'sl'
+            if 'exit_reason' in df.columns:
+                df['result'] = np.where(df['exit_reason'] == 'tp', 'win',
+                                        np.where(df['exit_reason'] == 'sl', 'loss',
+                                                 np.where(df.get('pnl', 0) == 0, 'breakeven', 'other')))
+            else:
+                df['result'] = np.where(df.get('pnl', 0) > 0, 'win',
+                                        np.where(df.get('pnl', 0) < 0, 'loss', 'breakeven'))
+
+        # Inferir PnL neto si no existe
+        if 'pnl' not in df.columns and {'entry_price', 'exit_price', 'qty', 'side'}.issubset(df.columns):
+            side = df['side'].str.lower()
+            pnl_raw = np.where(side.isin(['short', 'bearish']),
+                               (df['entry_price'] - df['exit_price']) * df['qty'],
+                               (df['exit_price'] - df['entry_price']) * df['qty'])
+            df['pnl'] = pnl_raw
+
+        if 'fees' in df.columns:
+            df['pnl_net'] = df['pnl'] - df['fees']
+        else:
+            df['pnl_net'] = df['pnl']
+
+        # Duraciones
+        if {'entry_time', 'exit_time'}.issubset(df.columns):
+            dur = (pd.to_datetime(df['exit_time']) - pd.to_datetime(df['entry_time'])).dt.total_seconds()
+            df['hold_minutes'] = dur / 60.0
+
+        # Conteos
+        n_trades = len(df)
+        n_closed = int((~df['pnl_net'].isna()).sum())
+        wins = int((df['result'] == 'win').sum())
+        losses = int((df['result'] == 'loss').sum())
+        breakeven = int((df['result'] == 'breakeven').sum())
+        winrate = wins / n_closed if n_closed > 0 else np.nan
+
+        # Rachas
+        def _streak(series, target):
+            best = cur = 0
+            for x in series:
+                if x == target:
+                    cur += 1
+                    best = max(best, cur)
+                else:
+                    cur = 0
+            return best
+
+        max_consec_wins = _streak(df['result'].tolist(), 'win')
+        max_consec_losses = _streak(df['result'].tolist(), 'loss')
+
+        # PnL stats
+        gross_profit = df.loc[df['pnl_net'] > 0, 'pnl_net'].sum()
+        gross_loss = -df.loc[df['pnl_net'] < 0, 'pnl_net'].sum()  # positivo
+        net_profit = gross_profit - gross_loss
+        avg_win = df.loc[df['pnl_net'] > 0, 'pnl_net'].mean()
+        avg_loss = df.loc[df['pnl_net'] < 0, 'pnl_net'].mean()  # negativo
+        payoff_ratio = (avg_win / abs(avg_loss)) if (
+                    pd.notna(avg_win) and pd.notna(avg_loss) and avg_loss != 0) else np.nan
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (np.inf if gross_profit > 0 else np.nan)
+        expectancy_val = net_profit / n_closed if n_closed > 0 else np.nan
+
+        # SQN (si tienes r_multiple)
+        if 'r_multiple' in df.columns and df['r_multiple'].notna().any():
+            exp_R = float(df['r_multiple'].mean(skipna=True))
+            std_R = float(df['r_multiple'].std(skipna=True))
+            sqn = (exp_R / (std_R + 1e-12)) * np.sqrt(max(n_closed, 1))
+        else:
+            exp_R, std_R, sqn = np.nan, np.nan, np.nan
+
+        # Curva de equity (opcional)
+        def _max_drawdown(series):
+            if series is None or len(series) == 0:
+                return np.nan
+            s = series.values.astype(float)
+            peak = np.maximum.accumulate(s)
+            dd = (s - peak) / (peak + 1e-12)
+            return float(dd.min())  # negativo
+
+        if equity_curve is not None:
+            eq = equity_curve.dropna()
+            mdd = _max_drawdown(eq)
+        else:
+            mdd = np.nan
+
+        summary = {
+            "trades": int(n_trades),
+            "cerrados": int(n_closed),
+            "wins": int(wins),
+            "losses": int(losses),
+            "breakeven": int(breakeven),
+            "winrate": round(winrate, 4) if pd.notna(winrate) else np.nan,
+            "profit_factor": round(profit_factor, 4) if np.isfinite(profit_factor) else profit_factor,
+            "payoff_ratio": round(payoff_ratio, 4) if pd.notna(payoff_ratio) else np.nan,
+            "expectancy_$": round(expectancy_val, 4) if pd.notna(expectancy_val) else np.nan,
+            "expectancy_R": round(exp_R, 4) if pd.notna(exp_R) else np.nan,
+            "std_R": round(std_R, 4) if pd.notna(std_R) else np.nan,
+            "SQN": round(sqn, 4) if pd.notna(sqn) else np.nan,
+            "max_drawdown": round(mdd, 4) if pd.notna(mdd) else np.nan,
+            "max_consec_wins": int(max_consec_wins),
+            "max_consec_losses": int(max_consec_losses),
+            "avg_hold_min": round(float(df['hold_minutes'].mean()), 2) if 'hold_minutes' in df.columns else np.nan,
+            "p50_hold_min": round(float(df['hold_minutes'].median()), 2) if 'hold_minutes' in df.columns else np.nan,
+            "gross_profit": round(float(gross_profit), 2),
+            "gross_loss": round(float(gross_loss), 2),
+            "net_profit": round(float(net_profit), 2),
+        }
+        return summary, df
 
 
 def _now_iso():
@@ -1483,7 +1942,7 @@ class StochasticAnalyzer:
         df['ATR'] = tr.rolling(window=atr_period).mean()
 
         # Trend EMA
-        for period in [10, 200]:
+        for period in [10, 15, 20, 200]:
             df[f'EMA_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
             df[f'trend_ema{period}'] = np.where(df['close'] > df[f'EMA_{period}'], 'up', 'down')
 
@@ -2342,7 +2801,410 @@ class StochasticAnalyzer:
 
         return df
 
-    def create_predictive_model(self, display_graphic=False, N_KEEP=40000):
+    def _build_base_model(self, model_type: str, random_state: int = 42, model_kwargs: Optional[Dict] = None):
+        """
+        Devuelve un clasificador scikit-compatible según model_type.
+        - rf: RandomForestClassifier
+        - lgbm: LightGBM (LGBMClassifier)
+        - xgb: XGBoost (XGBClassifier)
+        """
+        model_kwargs = model_kwargs or {}
+        model_type = (model_type or "rf").lower()
+        if model_type in ("rf", "randomforest", "random_forest"):
+            defaults = dict(n_estimators=700, max_features="sqrt", n_jobs=-1, random_state=random_state)
+            defaults.update(model_kwargs)
+            return RandomForestClassifier(**defaults), "rf"
+
+        if model_type in ("lgbm", "lightgbm"):
+            if not _HAS_LGBM:
+                raise ImportError("LightGBM no está instalado. Ejecuta: pip install lightgbm")
+            # valores razonables; puedes ajustarlos vía model_kwargs
+            defaults = dict(
+                n_estimators=700,
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                random_state=random_state,
+                n_jobs=-1
+            )
+            defaults.update(model_kwargs)
+            return LGBMClassifier(**defaults), "lgbm"
+
+        if model_type in ("xgb", "xgboost"):
+            if not _HAS_XGB:
+                raise ImportError("XGBoost no está instalado. Ejecuta: pip install xgboost")
+            # uso del wrapper scikit; eval_metric gestiona multiclase automáticamente en proba
+            defaults = dict(
+                n_estimators=700,
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                max_depth=8,
+                random_state=random_state,
+                n_jobs=-1,
+                tree_method="hist",
+                objective="multi:softprob"  # scikit wrapper usa esto para multiclase con predict_proba
+            )
+            defaults.update(model_kwargs)
+            return XGBClassifier(**defaults), "xgb"
+
+        raise ValueError(f"model_type desconocido: {model_type}. Usa: 'rf', 'lgbm' o 'xgb'.")
+
+    def _safe_feature_importance(self, model, X_tr, y_tr, feature_names):
+        """
+        Intenta obtener importancias nativas; si no hay, usa permutation importance.
+        Devuelve DataFrame con columnas ['feature', 'importance'].
+        """
+        imp = None
+        # intentos comunes
+        for attr in ("feature_importances_",):
+            if hasattr(model, attr):
+                vals = getattr(model, attr)
+                if isinstance(vals, (list, np.ndarray)) and len(vals) == len(feature_names):
+                    imp = np.array(vals, dtype=float)
+                    break
+
+        # XGBoost también permite importance por gain/weight; el wrapper scikit ya expone feature_importances_
+        # Si no se logró, usar permutation importance (más costoso).
+        if imp is None:
+            try:
+                pi = permutation_importance(model, X_tr, y_tr, n_repeats=5, random_state=42, n_jobs=-1)
+                imp = pi.importances_mean
+            except Exception:
+                # último recurso: importancia cero
+                imp = np.zeros(len(feature_names), dtype=float)
+
+        return (
+            pd.DataFrame({"feature": feature_names, "importance": imp})
+            .sort_values("importance", ascending=False)
+            .reset_index(drop=True)
+        )
+
+    def create_predictive_model(
+            self,
+            display_graphic: bool = False,
+            N_KEEP: int = 40000,
+            model_type: str = "rf",
+            model_kwargs: Optional[Dict] = None,
+            calibrate_method: str = "isotonic"  # "isotonic" o "sigmoid"
+    ):
+        if self.data is None:
+            print("No hay datos para entrenar el modelo")
+            return
+
+        # Preparación de dataset y features (tu función existente)
+        df_model, features = self.preparar_features(self.data)
+
+        L = getattr(self, "lookahead", 25)  # usa self.lookahead o 25 por defecto
+
+        n_total = len(df_model)
+        if n_total <= L:
+            raise RuntimeError(f"No hay suficientes filas para excluir lookahead={L} (n={n_total}).")
+
+        # Recorte a las últimas N_KEEP
+        if n_total > N_KEEP:
+            df_model = df_model.iloc[-N_KEEP:].copy()
+            n_total = len(df_model)
+
+        if n_total - L < 1000:
+            print(f"Advertencia: solo {n_total - L} filas de train tras recorte y lookahead. "
+                  f"Considera reducir L o N_KEEP.")
+
+        # Excluir últimas L para evitar fuga de datos
+        df_train = df_model.iloc[:-L].copy()
+        df_train = df_train[df_train["future_trend"].notna()]
+        df_train = df_train.dropna(subset=features + ["future_trend"])
+
+        X = df_train[features]
+        y = df_train["future_trend"]
+
+        # ===== Métricas auxiliares =====
+        def multiclass_brier(y_true_labels, y_prob, classes_text):
+            class_to_idx = {c: i for i, c in enumerate(classes_text)}
+            y_idx = np.array([class_to_idx[v] for v in y_true_labels])
+            Y = np.zeros_like(y_prob)
+            Y[np.arange(len(y_true_labels)), y_idx] = 1.0
+            return float(np.mean(np.sum((y_prob - Y) ** 2, axis=1)))
+
+        def ece_maxprob(y_true_labels, y_prob, classes_text, n_bins=10):
+            class_to_idx = {c: i for i, c in enumerate(classes_text)}
+            y_idx = np.array([class_to_idx[v] for v in y_true_labels])
+            conf = np.max(y_prob, axis=1)
+            pred = np.argmax(y_prob, axis=1)
+            bins = np.linspace(0.0, 1.0, n_bins + 1)
+            binids = np.digitize(conf, bins) - 1
+            ece, n = 0.0, len(y_true_labels)
+            for i in range(n_bins):
+                mask = binids == i
+                if np.any(mask):
+                    acc = np.mean(pred[mask] == y_idx[mask])
+                    avg_conf = np.mean(conf[mask])
+                    ece += (np.sum(mask) / n) * abs(acc - avg_conf)
+            return float(ece)
+
+        # ===============================
+        # Entrenamiento modelo base
+        # ===============================
+        base_model, model_tag = self._build_base_model(model_type=model_type, model_kwargs=model_kwargs or {})
+
+        # Split + escalado (mantener por consistencia)
+        # NOTA: Los árboles no requieren escalado, pero dejamos tu pipeline igual para no romper nada.
+        # Para XGB con LabelEncoder, haremos una ruta especial.
+        use_label_encoding = (model_tag == "xgb")
+
+        if use_label_encoding:
+            # ---- XGB: y debe ser 0..K-1 ----
+            le = LabelEncoder()
+            y_encoded = le.fit_transform(y)
+
+            X_train, X_test, y_train_enc, y_test_enc = train_test_split(
+                X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+            )
+            X_train_scaled = self.scaler.fit_transform(X_train)
+            X_test_scaled = self.scaler.transform(X_test)
+
+            X_tr, X_cal, y_tr_enc, y_cal_enc = train_test_split(
+                X_train_scaled, y_train_enc, test_size=0.2, stratify=y_train_enc, random_state=42
+            )
+
+            # Entrenar base
+            base_model.fit(X_tr, y_tr_enc)
+
+            # --- Sin calibrar ---
+            proba_vanilla = base_model.predict_proba(X_test_scaled)
+            pred_idx = np.argmax(proba_vanilla, axis=1)
+            preds_vanilla_labels = le.inverse_transform(pred_idx)
+            y_test_labels = le.inverse_transform(y_test_enc)
+            classes_text = le.classes_
+
+            print("Reporte de clasificación de modelo SIN calibrar:")
+            print(classification_report(y_test_labels, preds_vanilla_labels, labels=classes_text))
+            print(f"Brier (multiclase): {multiclass_brier(y_test_labels, proba_vanilla, classes_text):.6f}")
+            # Para log_loss con y numérica usamos labels = rango numérico
+            print(f"Log loss: {log_loss(y_test_enc, proba_vanilla, labels=np.arange(len(classes_text))):.6f}")
+            print(f"ECE: {ece_maxprob(y_test_labels, proba_vanilla, classes_text):.6f}")
+            print("=" * 50)
+
+            # --- Calibración ---
+            if calibrate_method not in ("isotonic", "sigmoid", "beta"):
+                calibrate_method = "isotonic"
+
+            if calibrate_method == "beta":
+                # y_cal_enc: enteros 0..K-1
+                proba_cal_in = base_model.predict_proba(X_cal)  # (n, K)
+                mc_beta = MultiClassBetaCalibrator(parameters="abm", label_encoder=le)
+                mc_beta.fit(proba_cal_in, y_cal_enc)
+
+                self.base_model = base_model
+                self.model = BetaMultiWrapper(base_model, mc_beta, classes_=None, label_encoder=le)
+            else:
+                calib = CalibratedClassifierCV(base_model, method=calibrate_method, cv='prefit')
+                calib.fit(X_cal, y_cal_enc)
+
+                self.base_model = base_model
+                self.model = LabeledCalibratedModel(calib, le)
+
+            # Métricas del calibrado final
+            proba_cal = self.model.predict_proba(X_test_scaled)
+            preds_cal_labels = self.model.predict(X_test_scaled)
+
+            print("Reporte de clasificación de modelo CALIBRADO:")
+            print(classification_report(y_test_labels, preds_cal_labels, labels=classes_text))
+            print(f"Brier (multiclase): {multiclass_brier(y_test_labels, proba_cal, classes_text):.6f}")
+            print(f"Log loss: {log_loss(y_test_enc, proba_cal, labels=np.arange(len(classes_text))):.6f}")
+            print(f"ECE: {ece_maxprob(y_test_labels, proba_cal, classes_text):.6f}")
+
+            # Importancias
+            self.feature_importance_ = self._safe_feature_importance(base_model, X_tr, y_tr_enc, features)
+            self.classes_ = classes_text
+            self.model_tag_ = model_tag
+
+            # ==== Selección de umbrales con fallback XGB (como ya lo dejaste) ====
+            try:
+                u_strong, info_strong, u_soft, info_soft, df_bands = self.select_thresholds_by_band_precision(
+                    X_hold=X_test_scaled, y_hold=y_test_labels,
+                    band_step=0.1, u_min=0.55, u_max=0.95,
+                    min_margin=0.03,
+                    min_n_soft=1000,
+                    min_n_strong=1200,
+                    min_trade_rate_soft=0.10,
+                    min_trade_rate_strong=0.03,
+                    soft_range=(0.83, 0.865),
+                    strong_range=(0.89, 0.96),
+                    soft_start=0.60,
+                    strong_start=0.80,
+                    use_ci_lower=True,
+                    prefer_center_soft=True
+                )
+            except Exception as e:
+                print(f"[WARN] select_thresholds_by_band_precision falló con XGB: {e}")
+                u_soft = 0.84
+                u_strong = 0.90
+                self.umbral_soft = u_soft
+                self.umbral_strong = u_strong
+                info_soft = {"reason": "xgb_default_thresholds", "chosen": {"u": u_soft}}
+                info_strong = {"reason": "xgb_default_thresholds", "chosen": {"u": u_strong}}
+                df_bands = pd.DataFrame(columns=["u_lo", "u_hi", "n", "precision", "ci_lo", "ci_hi", "trade_rate"])
+
+            print("\nImportancia de características:")
+            print(self.feature_importance_)
+
+            print(f"\nModelo base: {model_tag.upper()} | calibración: {calibrate_method}")
+            print("u_strong:", u_strong, "| u_soft:", u_soft)
+            print("STRONG:", info_strong)
+            print("SOFT:", info_soft)
+
+
+            # Gráficas de calibración
+            if display_graphic:
+                proba_base = proba_vanilla
+                proba_calib = proba_cal
+                clases = classes_text
+
+                plt.figure(figsize=(7, 5))
+                for target_class in clases:
+                    idx = list(clases).index(target_class)
+                    y_true_bin = np.array([1 if yt == target_class else 0 for yt in y_test_labels])
+
+                    ppb_x, ppb_y = calibration_curve(y_true_bin, proba_base[:, idx], n_bins=10, strategy='uniform')
+                    plt.plot(ppb_x, ppb_y, marker='o', label=f"Sin calibrar '{target_class}'")
+
+                    ppc_x, ppc_y = calibration_curve(y_true_bin, proba_calib[:, idx], n_bins=10, strategy='uniform')
+                    plt.plot(ppc_x, ppc_y, marker='o', linestyle='--', label=f"Calibrado '{target_class}'")
+
+                fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                plt.plot([0, 1], [0, 1], 'k--', label='Perfectamente calibrado')
+                plt.xlabel('Probabilidad predicha por el modelo')
+                plt.ylabel('Proporción real de acierto')
+                plt.title(f'Gráfico de calibración: sin calibrar vs calibrado\nEntrenado: {fecha_actual}')
+                plt.legend();
+                plt.grid();
+                plt.show()
+
+            # Guardar en self con wrapper que devuelve etiquetas en texto
+            self.base_model = base_model
+            self.classes_ = classes_text
+            self.model_tag_ = model_tag
+
+            return self.model
+
+        # ===== Ruta normal (RF / LGBM) sin encoding =====
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+
+        X_tr, X_cal, y_tr, y_cal = train_test_split(
+            X_train_scaled, y_train, test_size=0.2, stratify=y_train, random_state=42
+        )
+
+        base_model.fit(X_tr, y_tr)
+
+        # ---- Sin calibrar ----
+        preds_vanilla = base_model.predict(X_test_scaled)
+        proba_vanilla = base_model.predict_proba(X_test_scaled)
+        classes = base_model.classes_
+
+        print("Reporte de clasificación de modelo SIN calibrar:")
+        print(classification_report(y_test, preds_vanilla, labels=classes))
+        print(f"Brier (multiclase): {multiclass_brier(y_test, proba_vanilla, classes):.6f}")
+        print(f"Log loss: {log_loss(y_test, proba_vanilla, labels=classes):.6f}")
+        print(f"ECE: {ece_maxprob(y_test, proba_vanilla, classes):.6f}")
+        print("=" * 50)
+
+        # ---- Calibración ----
+        if calibrate_method not in ("isotonic", "sigmoid", "beta"):
+            calibrate_method = "isotonic"
+
+        if calibrate_method == "beta":
+            classes = list(base_model.classes_)
+            class_to_idx = {c: i for i, c in enumerate(classes)}
+            y_cal_idx = np.array([class_to_idx[v] for v in y_cal])  # enteros 0..K-1
+
+            proba_cal_in = base_model.predict_proba(X_cal)  # (n, K)
+            mc_beta = MultiClassBetaCalibrator(parameters="abm", classes_=classes)
+            mc_beta.fit(proba_cal_in, y_cal_idx)
+
+            self.model = BetaMultiWrapper(base_model, mc_beta, classes_=classes, label_encoder=None)
+        else:
+            self.model = CalibratedClassifierCV(base_model, method=calibrate_method, cv='prefit')
+            self.model.fit(X_cal, y_cal)
+
+        # Métricas del calibrado final
+        proba_cal = self.model.predict_proba(X_test_scaled)
+        preds_cal = self.model.predict(X_test_scaled)
+        classes_cal = getattr(self.model, "classes_", base_model.classes_)
+
+        print("Reporte de clasificación de modelo CALIBRADO:")
+        print(classification_report(y_test, preds_cal, labels=classes_cal))
+        print(f"Brier (multiclase): {multiclass_brier(y_test, proba_cal, classes_cal):.6f}")
+        print(f"Log loss: {log_loss(y_test, proba_cal, labels=classes_cal):.6f}")
+        print(f"ECE: {ece_maxprob(y_test, proba_cal, classes_cal):.6f}")
+
+        # Selector de umbrales (tu función)
+        u_strong, info_strong, u_soft, info_soft, df_bands = self.select_thresholds_by_band_precision(
+            X_hold=X_test_scaled, y_hold=y_test,
+            band_step=0.1, u_min=0.55, u_max=0.95,
+            min_margin=0.03,
+            min_n_soft=1000,
+            min_n_strong=1200,
+            min_trade_rate_soft=0.10,
+            min_trade_rate_strong=0.03,
+            soft_range=(0.83, 0.865),
+            strong_range=(0.89, 0.96),
+            soft_start=0.60,
+            strong_start=0.80,
+            use_ci_lower=True,
+            prefer_center_soft=True
+        )
+
+        # Importancias
+        feature_importance = self._safe_feature_importance(base_model, X_tr, y_tr, features)
+        print("\nImportancia de características:")
+        print(feature_importance)
+
+        print(f"\nModelo base: {model_tag.upper()} | calibración: {calibrate_method}")
+        print("u_strong:", u_strong, "| u_soft:", u_soft)
+        print("STRONG:", info_strong)
+        print("SOFT:", info_soft)
+
+        # Gráficas de calibración
+        if display_graphic:
+            proba_base = proba_vanilla
+            proba_calib = proba_cal
+            clases = classes_cal  # o classes; ambas deberían coincidir en orden
+
+            plt.figure(figsize=(7, 5))
+            for target_class in clases:
+                idx = list(clases).index(target_class)
+                y_true_bin = np.array([1 if yt == target_class else 0 for yt in y_test])
+
+                ppb_x, ppb_y = calibration_curve(y_true_bin, proba_base[:, idx], n_bins=10, strategy='uniform')
+                plt.plot(ppb_x, ppb_y, marker='o', label=f"Sin calibrar '{target_class}'")
+
+                ppc_x, ppc_y = calibration_curve(y_true_bin, proba_calib[:, idx], n_bins=10, strategy='uniform')
+                plt.plot(ppc_x, ppc_y, marker='o', linestyle='--', label=f"Calibrado '{target_class}'")
+
+            fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            plt.plot([0, 1], [0, 1], 'k--', label='Perfectamente calibrado')
+            plt.xlabel('Probabilidad predicha por el modelo')
+            plt.ylabel('Proporción real de acierto')
+            plt.title(f'Gráfico de calibración: sin calibrar vs calibrado\nEntrenado: {fecha_actual}')
+            plt.legend();
+            plt.grid();
+            plt.show()
+
+        # Guardar en self
+        self.base_model = base_model
+        self.feature_importance_ = feature_importance
+        self.classes_ = classes_cal
+        self.model_tag_ = model_tag
+
+        return self.model
+
+
+    def create_predictive_mode_original(self, display_graphic=False, N_KEEP=40000):
         if self.data is None:
             print("No hay datos para entrenar el modelo")
             return
@@ -3123,13 +3985,13 @@ class StochasticAnalyzer:
 
         # 7) Filtro de “fake” señales con EMA_10 (mantengo tu lógica original)
         close = float(last_meta['close'])
-        ema_10 = float(last_meta['EMA_10'])
+        ema_15 = float(last_meta['EMA_15'])
 
         pred = pred_class
-        if pred_class == 'bullish' and close < ema_10 and probabilities.get('bullish', 0) < self.umbral_strong:
+        if pred_class == 'bullish' and close < ema_15:
             print(f"Fake bullish (cierre < EMA10 y prob<0.84): {probabilities.get('bullish')}")
             pred = 'lateral'
-        elif pred_class == 'bearish' and close > ema_10 and probabilities.get('bearish', 0) < self.umbral_strong:
+        elif pred_class == 'bearish' and close > ema_15:
             print(f"Fake bearish (cierre > EMA10 y prob<0.84): {probabilities.get('bearish')}")
             pred = 'lateral'
 
@@ -3439,28 +4301,28 @@ class StochasticAnalyzer:
             # === Recalcula 'now' aquí también antes de ventanas de reinicio ===
             now = datetime.now()
 
-            # Ventanas de reinicio
-            if (now.hour in {RESTART_HOUR_1 - 1, RESTART_HOUR_2 - 1, RESTART_HOUR_3 - 1, RESTART_HOUR_4 - 1} and now.minute == 56):
-                break
+            # # Ventanas de reinicio
+            # if (now.hour in {RESTART_HOUR_1 - 1} and now.minute == 56):
+            #     break
 
-            if now.hour == 0 and now.minute == 59:
-                today_str_ = f"{now.day:02d}"
-                tomorrow_ = now + timedelta(days=1)
-                tomorrow_day_ = f"{tomorrow_.day:02d}"
-                mont_str_ = f"{now.month:02d}"
-                filename_ = f'AVAXUSDT_5m_2024-01-01_2025-{mont_str_}-{today_str_}.csv'
-                if os.path.exists(filename_):
-                    name, extension_ = os.path.splitext(filename_)
-                    new_name_ = name[:-2] + tomorrow_day_ + extension_
-                    os.rename(filename_, new_name_)
-                    print("Nuevo nombre de archivo:", new_name_)
+            # if now.hour == 0 and now.minute == 59:
+            #     today_str_ = f"{now.day:02d}"
+            #     tomorrow_ = now + timedelta(days=1)
+            #     tomorrow_day_ = f"{tomorrow_.day:02d}"
+            #     mont_str_ = f"{now.month:02d}"
+            #     filename_ = f'AVAXUSDT_5m_2024-01-01_2025-{mont_str_}-{today_str_}.csv'
+            #     if os.path.exists(filename_):
+            #         name, extension_ = os.path.splitext(filename_)
+            #         new_name_ = name[:-2] + tomorrow_day_ + extension_
+            #         os.rename(filename_, new_name_)
+            #         print("Nuevo nombre de archivo:", new_name_)
 
     def start_order(self, pred, symbol, interval, bogota_time, proba, resultado, atr, close_price, real_account, trade_id=None):
         if atr is not None and atr > 0:
             if (pred == "bullish") or (pred == "bearish"):
                 response = {}
                 profit_factor = self.atr_mult
-                loss_factor = self.atr_stop
+                loss_factor = 3.1
                 take_profit = close_price + (profit_factor * atr) if pred == "bullish" else close_price - (
                         profit_factor * atr)
                 stop_loss = close_price - (loss_factor * atr) if pred == "bullish" else close_price + (
@@ -3498,7 +4360,7 @@ class StochasticAnalyzer:
                     # Se envia a la cuenta real y demo
                     try:
                         response = requests.post(
-                            "http://52.67.38.220:80/hook-demo",
+                            "http://52.67.38.220:80/webhook",
                             json=payload,
                             timeout=10
                         )
@@ -3871,6 +4733,13 @@ class StochasticAnalyzer:
 
             plt.tight_layout()
             plt.show()
+
+        resumen, trades_df = summarize_backtest(trades_df,
+                                                equity_curve=equity_df['equity'] if equity_df is not None else None)
+
+        print("\n=== Resumen Backtest ===")
+        for k, v in summary.items():
+            print(f"{k:>16}: {v}")
 
         return trades_df, resumen
 
@@ -4279,6 +5148,33 @@ class StochasticAnalyzer:
 
 
 
+class LabeledCalibratedModel:
+    """
+    Envuelve un CalibratedClassifierCV entrenado con y numérico (0..K-1)
+    y expone predict/predict_proba con clases en texto.
+    """
+    def __init__(self, calibrated_model, label_encoder: LabelEncoder):
+        self._calib = calibrated_model
+        self.le = label_encoder
+        # Exponer clases en texto, no numéricas
+        self.classes_ = self.le.classes_
+
+    def predict_proba(self, X):
+        return self._calib.predict_proba(X)
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        idx = np.argmax(proba, axis=1)
+        return self.le.inverse_transform(idx)
+
+    # opcional: acceder al estimador base si lo necesitas
+    @property
+    def base_estimator(self):
+        return self._calib.base_estimator
+
+
+
+
 def is_allowed_time():
     now = datetime.now()
     weekday = now.weekday()
@@ -4320,61 +5216,74 @@ if __name__ == "__main__":
             end_date=end_date,
             interval="5"
         )
-
-        # simulacion
-        df = analyzer.data
-
-
-        def logger(event, payload):
-            if event == "progress":
-                print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
-                      f"equity={payload['equity']:.2f} | trades={payload['trades']}")
-            elif event == "open":
-                print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
-                      f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | proba={payload['prob'] * 100:.1f}")
-            elif event == "close":
-                dur = payload.get("duration")
-                print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
-                      f"PnL={payload['pnl']:.2f} | fees={payload['fees']:.2f} | "
-                      f"equity={payload['equity']:.2f} | "
-                      f"in={payload['entry_time']} out={payload['time']} "
-                      f"dur={dur}")
-
-        sim = TradeSimulator(
-            analyzer,
-            df,
-            initial_equity=2000,
-            leverage=19,
-            risk_fraction=0.02,
-            on_event=logger,  # <— activar callback
-            verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
-            log_every_bars=250,
-            proba_threshold_day=0.79,
-            proba_threshold_night=0.80,
-            n_keep_for_fit=30000,
-            atr_mult_tp=4,
-            atr_mult_sl=2.7
-        )
-
-        results = sim.run(test_start="2025-08-13", test_end="2025-08-17")
-        print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
+        #
+        # # simulacion
+        # df = analyzer.data
+        # #
+        # #
+        # def logger(event, payload):
+        #     if event == "progress":
+        #         print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
+        #               f"equity={payload['equity']:.2f} | trades={payload['trades']}")
+        #     elif event == "open":
+        #         print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
+        #               f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
+        #               f"proba={payload['prob'] * 100:.1f} | "
+        #               f"margin={payload['margin']:.2f} | ")
+        #     elif event == "close":
+        #         dur = payload.get("duration")
+        #         print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
+        #               f"PnL={payload['pnl']:.2f} | fees={payload['fees']:.2f} | "
+        #               f"equity={payload['equity']:.2f} | "
+        #               f"in={payload['entry_time']} out={payload['time']} "
+        #               f"dur={dur}")
+        #
+        # sim = TradeSimulator(
+        #     analyzer,
+        #     df,
+        #     initial_equity=2000,
+        #     leverage=19,
+        #     risk_fraction=0.02,
+        #     on_event=logger,  # <— activar callback
+        #     verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
+        #     log_every_bars=250,
+        #     proba_threshold_day=0.84,
+        #     proba_threshold_night=0.85,
+        #     n_keep_for_fit=70000,
+        #     atr_mult_tp=4,
+        #     atr_mult_sl=3.1,
+        #     retrain_each_bar=False,
+        #     retrain_every_bars=2880,
+        #     min_margin=0.03,
+        #     suppress_fit_stdout=False
+        # )
+        #
+        # results = sim.run(test_start="2025-08-01", test_end="2025-08-16")
+        # print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
 
         #     # Guardar resultados
         # results_df = analyzer.save_results("avax_stochastic_analysis_cached.csv")
 
         # analyzer.get_best_calibration_model(display_graphic=True)
 
-
-        # analyzer.create_predictive_model(display_graphic=True)  # entrena y guarda scaler/modelo
-
-
-
-        # analyzer.monitor_predictions()
-        # print("Cierre de primer loop en monitor_predictions()")
         #
+        analyzer.create_predictive_model(display_graphic=True, model_type="xgb", calibrate_method="sigmoid",  N_KEEP=70000,
+                                              model_kwargs={
+                                                  "n_estimators": 700,
+                                                  "learning_rate": 0.05,
+                                                  "subsample": 0.9,
+                                                  "colsample_bytree": 0.9,
+                                                  "max_depth": 8,
+                                                  "random_state": 42,
+                                                  "n_jobs": 6,
+                                                  "tree_method": "hist",
+                                                  "objective": "multi:softprob"
+                                              })
+
+        analyzer.monitor_predictions()
         # while True:
         #     now = datetime.now()
-        #     if (now.hour == RESTART_HOUR_1 or now.hour == RESTART_HOUR_2 or now.hour == RESTART_HOUR_3 or now.hour == RESTART_HOUR_4) and now.minute == 0:
+        #     if (now.hour == RESTART_HOUR_1) and now.minute == 0:
         #         print("Reiniciando script programado a las ", now.hour, " horas")
         #         print("KPIs:", analyzer.tradelogger.compute_stats(False, True))
         #         today_str = f"{datetime.now().day:02d}"
@@ -4392,7 +5301,7 @@ if __name__ == "__main__":
         #                 end_date=end_date,
         #                 interval="5"
         #             )
-        #             analyzer.create_predictive_model()
+        #             analyzer.create_predictive_model(N_KEEP=60000)
         #             analyzer.monitor_predictions()
         #         else:
         #             print(f"El archivo {filename_tomorrow} no existe")
