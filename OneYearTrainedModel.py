@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dotenv import load_dotenv
 import pandas as pd
+from pandas.api.types import is_datetime64_any_dtype
 import numpy as np
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
@@ -79,6 +80,142 @@ RESTART_HOUR_3 = 17
 RESTART_HOUR_4 = 22
 
 warnings.filterwarnings('ignore')
+
+
+def add_sr_features(
+    df: pd.DataFrame,
+    datetime_col: str = "datetime",
+    high_col: str = "high",
+    low_col: str = "low",
+    close_col: str = "close",
+    atr_window: int = 14,
+    fractal_window: int = 20,
+    near_pct: float = 0.005,     # 0.5% del precio
+    near_k_atr: float = 0.5,     # 0.5 * ATR
+    use_daily_pivots: bool = True,
+    session_day_start: str | None = None,  # ej. "08:00" para partir el “día” a esa hora local
+    tz_for_session: str | None = None,     # ej. "America/Bogota"
+) -> pd.DataFrame:
+    """
+    Agrega features de Soporte/Resistencia:
+      - Pivotes diarios PP, S1, R1, S2, R2 del día PREVIO.
+      - Distancias relativas a PP/S1/R1/S2/R2 + flags 'near' por % y por ATR.
+      - Soporte/Resistencia rolling (fractales) con shift(1) + distancias/flags.
+      - ATR (si no existe).
+
+    Requisitos: columnas OHLC y datetime.
+    No provoca fuga de información: todos los niveles se basan en datos previos (shift o día previo).
+    """
+    df = df.copy()
+
+    # -------- Validaciones mínimas --------
+    for c in (datetime_col, high_col, low_col, close_col):
+        if c not in df.columns:
+            raise ValueError(f"Falta la columna requerida: '{c}'")
+    if not is_datetime64_any_dtype(df[datetime_col]):
+        df[datetime_col] = pd.to_datetime(df[datetime_col], utc=True, errors="coerce")
+    # -------- Ordenar por tiempo --------
+    df.sort_values(datetime_col, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # -------- ATR (si no existe) --------
+    if "ATR" not in df.columns:
+        h = df[high_col].astype(float)
+        l = df[low_col].astype(float)
+        c = df[close_col].astype(float)
+        prev_c = c.shift(1)
+        tr = pd.concat([(h - l).abs(),
+                        (h - prev_c).abs(),
+                        (l - prev_c).abs()], axis=1).max(axis=1)
+        df["ATR"] = tr.rolling(atr_window, min_periods=1).mean()
+
+    # -------- Construcción de “día” para pivotes --------
+    # Opción A: día calendario (UTC/local) usando floor("D").
+    # Opción B: día de sesión con hora de cambio personalizada (session_day_start).
+    if tz_for_session:
+        # si tu datetime ya tiene tz, convierto; si no, localizo
+        if df[datetime_col].dt.tz is None:
+            df[datetime_col] = df[datetime_col].dt.tz_localize(tz_for_session)
+        else:
+            df[datetime_col] = df[datetime_col].dt.tz_convert(tz_for_session)
+    # marca de día
+    if session_day_start:
+        # definimos el “día de sesión” como bloques rolling de 24h que empiezan en HH:MM local
+        hh, mm = map(int, session_day_start.split(":"))
+        # desplazamos la hora para “cortar” el día en HH:MM
+        shifted = df[datetime_col] - pd.to_timedelta(hh, unit="h") - pd.to_timedelta(mm, unit="m")
+        day_key = shifted.dt.floor("D")  # día de sesión
+    else:
+        day_key = df[datetime_col].dt.floor("D")
+
+    df["_day"] = day_key
+
+    # -------- Pivotes diarios clásicos del DÍA PREVIO --------
+    if use_daily_pivots:
+        daily = df.groupby("_day").agg(
+            day_high=(high_col, "max"),
+            day_low=(low_col, "min"),
+            day_close=(close_col, "last"),
+        )
+
+        piv = pd.DataFrame(index=daily.index)
+        piv["PP"] = (daily["day_high"] + daily["day_low"] + daily["day_close"]) / 3.0
+        piv["R1"] = 2 * piv["PP"] - daily["day_low"]
+        piv["S1"] = 2 * piv["PP"] - daily["day_high"]
+        rng = (daily["day_high"] - daily["day_low"]).astype(float)
+        piv["R2"] = piv["PP"] + rng
+        piv["S2"] = piv["PP"] - rng
+
+        # Usar pivotes del día previo
+        piv_prev = piv.shift(1).reset_index(names="_day")
+
+        # Merge con intradía
+        df = df.merge(piv_prev[["_day", "PP", "R1", "S1", "R2", "S2"]], on="_day", how="left")
+
+        # Distancias relativas al close
+        close = df[close_col].astype(float).replace(0, np.nan)
+        eps = 1e-12
+        for lvl in ["PP", "S1", "R1", "S2", "R2"]:
+            df[f"dist_{lvl}"] = (df[lvl] - close) / (close + eps)
+
+        # Flags de cercanía por % y por ATR
+        for lvl in ["PP", "S1", "R1", "S2", "R2"]:
+            df[f"near_{lvl}_pct"] = (df[f"dist_{lvl}"].abs() <= float(near_pct)).astype(int)
+            df[f"near_{lvl}_atr"] = ((df[lvl] - close).abs() <= float(near_k_atr) * df["ATR"]).astype(int)
+
+    # -------- Soporte/Resistencia rolling (fractales) --------
+    df["resist_rl"] = df[high_col].rolling(fractal_window, min_periods=1).max().shift(1)
+    df["support_rl"] = df[low_col].rolling(fractal_window, min_periods=1).min().shift(1)
+
+    close = df[close_col].astype(float).replace(0, np.nan)
+    df["dist_resist_rl"] = (df["resist_rl"] - close) / (close + 1e-12)
+    df["dist_support_rl"] = (close - df["support_rl"]) / (close + 1e-12)
+
+    df["near_resist_rl_pct"] = (df["dist_resist_rl"].abs() <= float(near_pct)).astype(int)
+    df["near_support_rl_pct"] = (df["dist_support_rl"].abs() <= float(near_pct)).astype(int)
+
+    df["near_resist_rl_atr"] = ((df["resist_rl"] - close).abs() <= float(near_k_atr) * df["ATR"]).astype(int)
+    df["near_support_rl_atr"] = ((close - df["support_rl"]).abs() <= float(near_k_atr) * df["ATR"]).astype(int)
+
+    # -------- Limpieza: rellenar NaNs iniciales / flags --------
+    # Rellena forward niveles continuos y pone 0 en flags
+    def _ffill_if_exists(cols):
+        for c in cols:
+            if c in df.columns:
+                df[c] = df[c].ffill()
+
+    cont_cols = ["PP", "S1", "R1", "S2", "R2", "resist_rl", "support_rl",
+                 "dist_PP", "dist_S1", "dist_R1", "dist_S2", "dist_R2",
+                 "dist_resist_rl", "dist_support_rl"]
+    _ffill_if_exists(cont_cols)
+
+    for c in df.columns:
+        if c.startswith("near_"):
+            df[c] = df[c].fillna(0).astype(int)
+
+    return df
+
+
 
 def _trades_to_df(self) -> pd.DataFrame:
     """Convierte self.trades (lista de Trade) en DataFrame listo para estadísticas."""
@@ -2052,6 +2189,20 @@ class StochasticAnalyzer:
 
         df['rsi_14'] = compute_rsi(df['close'], 14)
         df['rsi_50'] = compute_rsi(df['close'], 50)
+
+        # Zonas de soporte y resistencia
+        df = add_sr_features(
+            df,
+            high_col="high",
+            low_col="low",
+            close_col="close",
+            datetime_col="datetime",
+            atr_window=14,
+            fractal_window=20,
+            near_pct=0.005,  # 0.5%
+            near_k_atr=0.5,  # 0.5 * ATR
+            use_daily_pivots=True
+        )
 
         # Tendencia
         df['ema_10'] = df['close'].ewm(span=10, adjust=False).mean()
@@ -4775,6 +4926,11 @@ class StochasticAnalyzer:
             'ema_ratio'
         ]
 
+        # Soporte y Resistencia
+        support_resistance = [
+            "dist_PP", "dist_S1", "dist_R1", "dist_S2", "dist_R2", "dist_resist_rl", "dist_support_rl"
+        ]
+
         dummy_cols_base = ['trend_ema200', 'trend_vwap']
         dummy_expected = [
             'trend_ema200_up', 'trend_vwap_up'
@@ -4795,7 +4951,7 @@ class StochasticAnalyzer:
 
         # === Lista final de features: actuales + lags ===
         lag_feature_names = [f'{col}_lag{lag}' for col in base_features for lag in lags]
-        features_final = base_features + no_lag_features + lag_feature_names + features_testing
+        features_final = base_features + no_lag_features + lag_feature_names + features_testing + support_resistance
 
         # === Reemplazar infinitos y eliminar NaNs solo en las columnas de interés ===
         df[features_final] = df[features_final].replace([np.inf, -np.inf], np.nan)
