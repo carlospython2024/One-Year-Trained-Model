@@ -19,17 +19,15 @@ from sklearn.metrics import classification_report, confusion_matrix, ConfusionMa
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.preprocessing import StandardScaler, label_binarize, LabelEncoder
 from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LinearRegression
 from betacal import BetaCalibration
 
 import os, json, uuid, time
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, List, Literal, Tuple, Callable
-
-
-
+from pathlib import Path
 from math import sqrt
-
 import warnings
 import smtplib
 from email.mime.text import MIMEText
@@ -39,13 +37,8 @@ import pytz
 _HAS_LGBM, _HAS_XGB = False, False
 try:
     from lightgbm import LGBMClassifier
-    _HAS_LGBM = True
-except Exception:
-    pass
 
-try:
-    from xgboost import XGBClassifier
-    _HAS_XGB = True
+    _HAS_LGBM = True
 except Exception:
     pass
 
@@ -53,11 +46,10 @@ except Exception:
 _HAS_BETACAL = False
 try:
     from betacal import BetaCalibration
+
     _HAS_BETACAL = True
 except Exception:
     pass
-
-
 
 load_dotenv()
 
@@ -73,7 +65,6 @@ EMAIL_SMTP = "smtp.gmail.com"
 EMAIL_PORT = 587
 EMAIL_RECEIVER = "candrelosolaz@gmail.com"
 
-
 RESTART_HOUR_1 = 8
 RESTART_HOUR_2 = 12
 RESTART_HOUR_3 = 17
@@ -81,20 +72,143 @@ RESTART_HOUR_4 = 22
 
 warnings.filterwarnings('ignore')
 
+params_to_features = {
+    "version": "v3.1-traderlike+day-features",  # cambia esto si modificas reglas de features
+    "lags": [1],
+    "trend_windows": [20, 50, 100],
+    "channel_window": 50,
+    "tz": "UTC-5",
+    "sessions": {"NY": [(8, 30), (10, 30)], "LDN": [(2, 0), (4, 0)], "ASIA": [(18, 0), (20, 0)]},
+    "sr_threshold_frac": 0.25
+}
+
+
+def feature_signature(params: dict) -> str:
+    """
+    Crea un hash estable con los parámetros/versión de tu pipeline de features.
+    Ej: ventanas trend, lags, sesiones, umbrales, versión de código.
+    """
+    key = json.dumps(params, sort_keys=True, default=str)
+    return hashlib.sha1(key.encode()).hexdigest()[:10]
+
+
+def feature_cache_path(base_dir: str, sig: str) -> Path:
+    Path(base_dir).mkdir(parents=True, exist_ok=True)
+    return Path(base_dir) / f"features_{sig}.parquet"
+
+
+def prepare_features_incremental(
+        raw_df: pd.DataFrame,
+        preparar_features_fn,  # tu función actual
+        params: dict,  # lags, trend_windows, sesiones, versión, etc.
+        cache_dir: str = "feature_cache",
+        datetime_col: str = "datetime",
+        warmup_bars: int = 200  # ≈ max(lags, ventanas rolling, canal)
+):
+    """
+    Devuelve (df_features, feature_list, cache_path).
+    - Si hay cache y está alineado, actualiza sólo lo nuevo.
+    - Si no hay cache, crea desde cero.
+    """
+    sig = feature_signature(params)
+    path = feature_cache_path(cache_dir, sig)
+
+    raw_df = raw_df.sort_values(datetime_col).reset_index(drop=True)
+
+    if path.exists():
+        # Carga cache existente
+        cached = pd.read_parquet(path)
+        # Verifica columnas mínimas
+        _, expected_cols = preparar_features_fn(raw_df.iloc[:warmup_bars + 1].copy())
+        cols_ok = all(c in cached.columns for c in expected_cols)
+        # Último timestamp procesado
+        last_ts = cached[datetime_col].iloc[-1]
+        new_part = raw_df[raw_df[datetime_col] > last_ts]
+
+        if not cols_ok or new_part.empty:
+            # 1) Si cambió el esquema (nuevas columnas), re-procesa (parcial) desde last_ts - warmup
+            # 2) Si no hay datos nuevos, retorna cache
+            if new_part.empty and cols_ok:
+                return cached, expected_cols, path
+            # recalcular parcial
+            start_idx = max(0, raw_df.index[raw_df[datetime_col] <= last_ts].max() - (warmup_bars - 1))
+            slice_df = raw_df.iloc[start_idx:].copy()
+            df_new, feats = preparar_features_fn(slice_df)
+            # Empalmar: conserva filas <= last_ts del cache, luego concatena lo nuevo
+            merged = pd.concat([
+                cached[cached[datetime_col] < df_new[datetime_col].min()],
+                df_new
+            ], axis=0, ignore_index=True).drop_duplicates(subset=[datetime_col], keep="last")
+            merged.to_parquet(path, index=False)
+            return merged, feats, path
+        else:
+            # Hay datos nuevos y esquema ok: recalcular sólo la cola con warmup
+            start_idx = max(0, raw_df.index[raw_df[datetime_col] <= last_ts].max() - (warmup_bars - 1))
+            slice_df = raw_df.iloc[start_idx:].copy()
+            df_new, feats = preparar_features_fn(slice_df)
+            merged = pd.concat([
+                cached[cached[datetime_col] < df_new[datetime_col].min()],
+                df_new
+            ], axis=0, ignore_index=True).drop_duplicates(subset=[datetime_col], keep="last")
+            merged.to_parquet(path, index=False)
+            return merged, feats, path
+    else:
+        # No hay cache: construir completo
+        df_feat, feats = preparar_features_fn(raw_df.copy())
+        _save_parquet_fallback(df_feat, path)
+        return df_feat, feats, path
+
+
+def _save_parquet_fallback(df, path):
+    """
+    Guarda df en parquet si hay engine, si no cae a CSV.
+    """
+    try:
+        df.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
+    except Exception as e1:
+        try:
+            df.to_parquet(path, index=False, engine="fastparquet", compression="snappy")
+        except Exception as e2:
+            warnings.warn(
+                f"[feature_cache] No hay soporte Parquet (pyarrow/fastparquet). "
+                f"Fallo con {e1} y {e2}. Guardando en CSV como fallback."
+            )
+            csv_path = str(path).replace(".parquet", ".csv")
+            df.to_csv(csv_path, index=False)
+            return csv_path
+    return path
+
+
+def _load_parquet_fallback(path):
+    """
+    Intenta leer parquet, si no existe o no hay engine, prueba CSV.
+    """
+    try:
+        return pd.read_parquet(path)
+    except Exception as e:
+        csv_path = str(path).replace(".parquet", ".csv")
+        if Path(csv_path).exists():
+            warnings.warn(
+                f"[feature_cache] No se pudo leer {path} ({e}). Usando fallback CSV {csv_path}"
+            )
+            return pd.read_csv(csv_path, parse_dates=["datetime"])
+        else:
+            raise
+
 
 def add_sr_features(
-    df: pd.DataFrame,
-    datetime_col: str = "datetime",
-    high_col: str = "high",
-    low_col: str = "low",
-    close_col: str = "close",
-    atr_window: int = 14,
-    fractal_window: int = 20,
-    near_pct: float = 0.005,     # 0.5% del precio
-    near_k_atr: float = 0.5,     # 0.5 * ATR
-    use_daily_pivots: bool = True,
-    session_day_start: str | None = None,  # ej. "08:00" para partir el “día” a esa hora local
-    tz_for_session: str | None = None,     # ej. "America/Bogota"
+        df: pd.DataFrame,
+        datetime_col: str = "datetime",
+        high_col: str = "high",
+        low_col: str = "low",
+        close_col: str = "close",
+        atr_window: int = 14,
+        fractal_window: int = 20,
+        near_pct: float = 0.005,  # 0.5% del precio
+        near_k_atr: float = 0.5,  # 0.5 * ATR
+        use_daily_pivots: bool = True,
+        session_day_start: str | None = None,  # ej. "08:00" para partir el “día” a esa hora local
+        tz_for_session: str | None = None,  # ej. "America/Bogota"
 ) -> pd.DataFrame:
     """
     Agrega features de Soporte/Resistencia:
@@ -216,6 +330,89 @@ def add_sr_features(
     return df
 
 
+def add_sr_features_8h(df: pd.DataFrame, freq: str = "8H",
+                       near_k_atr: float = 0.25) -> pd.DataFrame:
+    """
+    Calcula pivots de 'sesiones' de 8h usando SOLO la sesión anterior (evita lookahead).
+    Añade columnas: P_8h, R1_8h..R3_8h, S1_8h..S3_8h, distancias normalizadas por ATR y
+    flags near_res_8h / near_sup_8h.
+    """
+    out = df.copy()
+
+    # 1) Índice temporal
+    idx = out["datetime"]
+    out = out.set_index("datetime")
+
+    # 2) Resample por 8h para construir OHLC de la sesión
+    ses = out.resample(freq).agg({"high": "max", "low": "min", "close": "last"})
+
+    # 3) Usar la SESIÓN ANTERIOR para los pivots (shift(1) evita mirar el futuro)
+    prev = ses.shift(1).dropna()
+    P = (prev["high"] + prev["low"] + prev["close"]) / 3.0
+    R1 = 2 * P - prev["low"]
+    S1 = 2 * P - prev["high"]
+    R2 = P + (prev["high"] - prev["low"])
+    S2 = P - (prev["high"] - prev["low"])
+    R3 = prev["high"] + 2 * (P - prev["low"])
+    S3 = prev["low"] - 2 * (prev["high"] - P)
+
+    piv = pd.DataFrame({
+        "P_8h": P, "R1_8h": R1, "S1_8h": S1,
+        "R2_8h": R2, "S2_8h": S2,
+        "R3_8h": R3, "S3_8h": S3,
+    })
+
+    # 4) Mapear pivots de la sesión previa a TODAS las velas de la sesión actual
+    #    (cada 5m dentro de la ventana de 8h usa los mismos pivots calculados con la sesión anterior)
+    #   - Creamos una marca de sesión para cada vela
+    out["session"] = out.index.floor(freq)
+    piv["session"] = piv.index  # pivots correspondientes a "inicio de una sesión", pero son de la previa
+
+    # merge y ffill dentro de la sesión actual
+    out = out.reset_index().merge(piv, on="session", how="left").set_index("datetime")
+    out[["P_8h", "R1_8h", "S1_8h", "R2_8h", "S2_8h", "R3_8h", "S3_8h"]] = \
+        out[["P_8h", "R1_8h", "S1_8h", "R2_8h", "S2_8h", "R3_8h", "S3_8h"]].groupby(out["session"]).ffill()
+
+    # 5) Distancias normalizadas por ATR (si no hay ATR, lo calculamos rápido)
+    if "ATR" not in out.columns:
+        tr = (out["high"] - out["low"]).to_frame("hl")
+        tr["hc"] = (out["high"] - out["close"].shift(1)).abs()
+        tr["lc"] = (out["low"] - out["close"].shift(1)).abs()
+        out["ATR"] = tr.max(axis=1).rolling(14).mean()
+
+    eps = 1e-12
+    atr = out["ATR"].replace(0, eps).fillna(method="ffill")
+
+    # Distancias absolutas / ATR
+    for lvl in ["P_8h", "R1_8h", "R2_8h", "R3_8h", "S1_8h", "S2_8h", "S3_8h"]:
+        out[f"dist_{lvl}_atr"] = (out[lvl] - out["close"]).abs() / atr
+
+    # “Cerca” de resistencia/soporte (a <= near_k_atr * ATR de cualquiera de R1..R3 o S1..S3)
+    res_dists = out[[f"dist_{l}_atr" for l in ["R1_8h", "R2_8h", "R3_8h"]]].min(axis=1)
+    sup_dists = out[[f"dist_{l}_atr" for l in ["S1_8h", "S2_8h", "S3_8h"]]].min(axis=1)
+    out["near_res_8h"] = (res_dists <= near_k_atr).astype(int)
+    out["near_sup_8h"] = (sup_dists <= near_k_atr).astype(int)
+
+    # restaurar columnas
+    out = out.drop(columns=["session"], errors="ignore").reset_index()
+    return out
+
+
+def add_stoch_extreme_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    k = out.get("STO_K") or out.get("%K") or out.get("k100")
+    d = out.get("STO_D") or out.get("%D") or out.get("d100")
+    if k is None or d is None:
+        return out  # ya lo calculas en otra parte
+
+    out["stoch_overbought_80"] = (k >= 80).astype(int)
+    out["stoch_overbought_90"] = (k >= 90).astype(int)
+    out["stoch_oversold_20"] = (k <= 20).astype(int)
+    out["stoch_oversold_10"] = (k <= 10).astype(int)
+    out["stoch_k_slope"] = k.diff()
+    out["stoch_k_above_d"] = (k > d).astype(int)
+    return out
+
 
 def _trades_to_df(self) -> pd.DataFrame:
     """Convierte self.trades (lista de Trade) en DataFrame listo para estadísticas."""
@@ -224,7 +421,7 @@ def _trades_to_df(self) -> pd.DataFrame:
         rows.append({
             "entry_time": t.entry_time,
             "exit_time": t.exit_time,
-            "side": getattr(t, "side", None),                     # "long"/"short"
+            "side": getattr(t, "side", None),  # "long"/"short"
             "entry_price": getattr(t, "entry_price", np.nan),
             "exit_price": getattr(t, "exit_price", np.nan),
             "qty": getattr(t, "qty", np.nan),
@@ -241,16 +438,13 @@ def _trades_to_df(self) -> pd.DataFrame:
     return df
 
 
-
-
-
-
 # === Multi-class Beta Calibration (uno-vs-rest) ===
 class MultiClassBetaCalibrator:
     """
     Aplica BetaCalibration por clase (uno-vs-rest) y renormaliza.
     Úsalo con probabilidades (n, K). Requiere betacal instalado.
     """
+
     def __init__(self, parameters: str = "abm", classes_=None, label_encoder=None):
         if not _HAS_BETACAL:
             raise ImportError("Requiere betacal. Instala con: pip install betacal")
@@ -267,10 +461,10 @@ class MultiClassBetaCalibrator:
         n, K = proba.shape
         self._per_class = []
         for k in range(K):
-            yk = (y_idx == k).astype(int)             # binario 0/1
-            pk = proba[:, k].reshape(-1)              # vector 1D
+            yk = (y_idx == k).astype(int)  # binario 0/1
+            pk = proba[:, k].reshape(-1)  # vector 1D
             beta = BetaCalibration(parameters=self.parameters)
-            beta.fit(pk, yk)                          # <- binario correcto
+            beta.fit(pk, yk)  # <- binario correcto
             self._per_class.append(beta)
         self.n_classes_ = K
         return self
@@ -296,14 +490,13 @@ class MultiClassBetaCalibrator:
         return out
 
 
-
-
 class BetaMultiWrapper:
     """
     Wrapper para exponer API similar a CalibratedClassifierCV pero con MultiClassBetaCalibrator.
     - Para RF/LGBM: classes_ son las de base_model.
     - Para XGB + LabelEncoder: devuelve etiquetas en texto.
     """
+
     def __init__(self, base_model, mc_beta: MultiClassBetaCalibrator, classes_, label_encoder=None):
         self.base_model = base_model
         self.mc_beta = mc_beta
@@ -324,6 +517,7 @@ class BetaMultiWrapper:
 
 class BetaWrapper:
     """Calibrador beta para RF/LGBM con etiquetas en texto."""
+
     def __init__(self, base_model, beta_cal, classes_):
         self.base_model = base_model
         self.beta_cal = beta_cal
@@ -338,8 +532,10 @@ class BetaWrapper:
         idx = np.argmax(proba, axis=1)
         return self.classes_[idx]
 
+
 class LabeledBetaWrapper:
     """Calibrador beta para XGB entrenado con y codificado (0..K-1), devolviendo etiquetas en texto."""
+
     def __init__(self, base_model, beta_cal, label_encoder):
         self.base_model = base_model
         self.beta_cal = beta_cal
@@ -355,17 +551,14 @@ class LabeledBetaWrapper:
         idx = np.argmax(proba, axis=1)
         return self.le.inverse_transform(idx)
 
+
 @dataclass
 class Fees:
     """Estructura de comisiones. Todas en proporción (p.ej., 0.00055 = 0.055%)."""
-    # taker_open: float = 0.00055
-    # taker_close: float = 0.00055
-    # maker_open: float = 0.0002
-    # maker_close: float = 0.0002
-    taker_open: float = 0.00005
-    taker_close: float = 0.00005
-    maker_open: float = 0.00002
-    maker_close: float = 0.00002
+    taker_open: float = 0.00055
+    taker_close: float = 0.00055
+    maker_open: float = 0.0002
+    maker_close: float = 0.0002
 
 
 @dataclass
@@ -382,9 +575,9 @@ class Trade:
 
     exit_time: Optional[pd.Timestamp] = None
     exit_price: Optional[float] = None
-    exit_reason: Optional[Literal["tp", "sl", "close"]] = None
-    entry_proba: Optional[float] = None   # 0..1
-    entry_pred: Optional[str] = None      # 'bullish' | 'bearish' | 'lateral'
+    exit_reason: Optional[Literal["tp", "sl", "close", "early_opposite"]] = None
+    entry_proba: Optional[float] = None  # 0..1
+    entry_pred: Optional[str] = None  # 'bullish' | 'bearish' | 'lateral'
 
     def is_open(self) -> bool:
         return self.exit_time is None
@@ -428,55 +621,56 @@ class TradeSimulator:
     """
 
     def __init__(
-        self,
-        analyzer,  # instancia de StochasticAnalyzer (ya creada por el usuario)
-        candles: pd.DataFrame,
-        symbol: str = "AVAXUSDT",
-        interval: str = "5",
-        initial_equity: float = 1000.0,
-        leverage: float = 10.0,
-        risk_fraction: float = 0.01,
-        bybit_fees: Fees = Fees(),
-        proba_threshold_day: float = 0.56,
-        proba_threshold_night: float = 0.60,
-        day_hours: Tuple[dtime, dtime] = (dtime(8, 0), dtime(20, 0)),
-        order_conflict_policy: Literal["worst", "best", "tp_first", "sl_first"] = "worst",
-        position_mode: Literal["fixed_risk", "fixed_notional"] = "fixed_risk",
-        fixed_notional_usdt: float = 100.0,
-        use_adapter_tp_sl_when_missing: bool = True,
-        atr_period: int = 14,
-        atr_mult_tp: float = 4,
-        atr_mult_sl: float = 2.7,
-        retrain_each_bar: bool = False,
-        retrain_every_bars: int | None = None,
-        suppress_fit_stdout: bool = True,
-        suppress_predict_stdout: bool = True,
-        use_offline_predictor: bool = True,
-        offline_lookback_bars: int = 200,
-        thresholds: Optional[Dict[str, float]] = None,
-        n_keep_for_fit: int = 40000,
-        close_trades_at_test_end: bool = True,
-        on_event: Optional[Callable[[str, dict], None]] = None,
-        verbose: int = 1,
-        log_every_bars: int = 250,
-        use_tqdm: bool = False,
-        min_margin: float = 0.03,
-        announce_fit: bool = True
+            self,
+            analyzer,  # instancia de StochasticAnalyzer (ya creada por el usuario)
+            candles: pd.DataFrame,
+            symbol: str = "AVAXUSDT",
+            interval: str = "5",
+            initial_equity: float = 1000.0,
+            leverage: float = 10.0,
+            risk_fraction: float = 0.01,
+            bybit_fees: Fees = Fees(),
+            proba_threshold_day: float = 0.56,
+            proba_threshold_night: float = 0.60,
+            day_hours: Tuple[dtime, dtime] = (dtime(8, 0), dtime(20, 0)),
+            order_conflict_policy: Literal["worst", "best", "tp_first", "sl_first"] = "worst",
+            position_mode: Literal["fixed_risk", "fixed_notional"] = "fixed_risk",
+            fixed_notional_usdt: float = 100.0,
+            use_adapter_tp_sl_when_missing: bool = True,
+            atr_period: int = 14,
+            atr_mult_tp: float = 4,
+            atr_mult_sl: float = 2.7,
+            retrain_each_bar: bool = False,
+            retrain_every_bars: int | None = None,
+            suppress_fit_stdout: bool = True,
+            suppress_predict_stdout: bool = True,
+            use_offline_predictor: bool = True,
+            offline_lookback_bars: int = 200,
+            thresholds: Optional[Dict[str, float]] = None,
+            early_exit_on_opposite_signal: bool = True,
+            early_exit_threshold: float = 0.60,
+            n_keep_for_fit: int = 40000,
+            close_trades_at_test_end: bool = True,
+            on_event: Optional[Callable[[str, dict], None]] = None,
+            verbose: int = 1,
+            log_every_bars: int = 250,
+            use_tqdm: bool = False,
     ):
         assert {"datetime", "open", "high", "low", "close"}.issubset(candles.columns), \
             "El DataFrame de velas debe contener: datetime, open, high, low, close"
         self.analyzer = analyzer
         self.df = candles.reset_index(drop=True).copy()
-        if not pd.api.types.is_datetime64_any_dtype(self.df["datetime"]):
-            # si viene como string/epoch, parsea; si ya trae tz, pandas la conserva
-            self.df["datetime"] = pd.to_datetime(self.df["datetime"], utc=True)  # o utc=False si lo prefieres
 
-        # si quedó naive (sin tz), localiza; si ya tiene tz, no hace nada
+        if not is_datetime64_any_dtype(self.df["datetime"]):
+            # Si viniera como string/epoch, parsea y asume UTC (luego podrás convertir)
+            self.df["datetime"] = pd.to_datetime(self.df["datetime"], utc=True)
+
+        # Si quedó naive (sin tz), localiza como UTC (tu pipeline ya la convierte a Bogota antes)
         if getattr(self.df["datetime"].dt, "tz", None) is None:
             self.df["datetime"] = self.df["datetime"].dt.tz_localize("UTC")
 
-        # si quieres ver/imprimir en Bogotá:
-        self.df["datetime"] = self.df["datetime"].dt.tz_convert("America/Bogota")
+        # Guarda la tz para usarla en run()
+        self.tz = self.df["datetime"].dt.tz
 
         self.symbol = symbol
         self.interval = interval
@@ -501,6 +695,8 @@ class TradeSimulator:
         self.use_offline_predictor = bool(use_offline_predictor)
         self.offline_lookback_bars = int(offline_lookback_bars)
         self.thresholds = thresholds or {"bearish": 0.55, "bullish": 0.55, "lateral": 0.40}
+        self.early_exit_on_opposite_signal = bool(early_exit_on_opposite_signal)
+        self.early_exit_threshold = float(early_exit_threshold)
         self.n_keep_for_fit = int(n_keep_for_fit)
         self.close_trades_at_test_end = bool(close_trades_at_test_end)
         # Verbosidad y callback de eventos
@@ -508,7 +704,6 @@ class TradeSimulator:
         self.verbose = int(verbose)
         self.log_every_bars = int(log_every_bars)
         self.use_tqdm = bool(use_tqdm)
-        self.min_margin = float(min_margin)
 
         global fees
         fees = bybit_fees
@@ -519,47 +714,17 @@ class TradeSimulator:
 
         self.trades: List[Trade] = []
         self.logs: List[str] = []
-        self.announce_fit = bool(announce_fit)
 
     # --------------------------
     # ADAPTERS / INTEGRACIONES
     # --------------------------
 
     def fit_model(self, train_df: pd.DataFrame):
+        """Entrena el modelo del usuario **solo** con `train_df`.
+        Seteamos `analyzer.data = train_df` y llamamos `create_predictive_model` con N_KEEP capado.
         """
-        Entrena el modelo del usuario solo con train_df.
-        Capamos a las últimas n_keep_for_fit filas para asegurar ventana rodante.
-        Además, imprimimos la ventana (from → to) con la que se entrena.
-        """
-        # Ventana efectiva: últimas n_keep_for_fit antes de la vela a analizar
-        effective_df = train_df.tail(self.n_keep_for_fit).copy() if self.n_keep_for_fit else train_df.copy()
-
-        # Anuncio claro de la ventana de fit
-        if self.announce_fit and not effective_df.empty:
-            t0 = effective_df["datetime"].iloc[0]
-            t1 = effective_df["datetime"].iloc[-1]
-            n = len(effective_df)
-            tzinfo = getattr(effective_df["datetime"].dt, "tz", None)
-            tzname = tzinfo if tzinfo is not None else "naive"
-            msg = f"[FIT] n={n} window: {t0} → {t1} (tz={tzname})"
-            # si tienes callback:
-            if getattr(self, "on_event", None):
-                try:
-                    self.on_event("fit_window", {"n": n, "from": t0, "to": t1, "tz": str(tzname)})
-                except Exception:
-                    pass
-            # y/o a consola si usas verbose
-            if getattr(self, "verbose", 0) >= 1:
-                print(msg)
-
-        # Asignar datos al analyzer y entrenar con N_KEEP consistente
-        self.analyzer.data = effective_df
-        N_KEEP = len(effective_df)
-
-        # rf, lgbm, xgb
-        model = 'xgb'
-        # isotonic, sigmoid, beta
-        method_calibration = 'beta'
+        self.analyzer.data = train_df.copy()
+        N_KEEP = min(len(train_df), self.n_keep_for_fit)
         if self.suppress_fit_stdout:
             import io, contextlib
             buf = io.StringIO()
@@ -612,13 +777,13 @@ class TradeSimulator:
         else:
 
             # # RF con beta # isotonic, sigmoid, beta
-            # self.analyzer.create_predictive_model(model_type="rf", calibrate_method="isotonic",  N_KEEP=N_KEEP,
-            #                                       model_kwargs={
-            #                                           "n_estimators":700,
-            #                                           "max_features":"sqrt",
-            #                                           "n_jobs":-1,
-            #                                           "random_state":42
-            #                                       })
+            self.analyzer.create_predictive_model(model_type="rf", calibrate_method="isotonic", N_KEEP=N_KEEP,
+                                                  model_kwargs={
+                                                      "n_estimators": 700,
+                                                      "max_features": "sqrt",
+                                                      "n_jobs": 4,
+                                                      "random_state": 42
+                                                  })
             #
             # # LGBM con beta
             # self.analyzer.create_predictive_model(model_type="lgbm", calibrate_method="beta",  N_KEEP=N_KEEP,
@@ -631,19 +796,19 @@ class TradeSimulator:
             #                                  "n_jobs":-1
             #                              })
 
-            # XGB con beta (usa LabelEncoder interno)
-            self.analyzer.create_predictive_model(model_type="xgb", calibrate_method="isotonic", N_KEEP=N_KEEP,
-                                         model_kwargs={
-                                             "n_estimators": 700,
-                                             "learning_rate": 0.05,
-                                             "subsample": 0.9,
-                                             "colsample_bytree": 0.9,
-                                             "max_depth": 8,
-                                             "random_state": 42,
-                                             "n_jobs": -1,
-                                             "tree_method": "hist",
-                                             "objective": "multi:softprob"
-                                         })
+            # # XGB con beta (usa LabelEncoder interno)
+            # self.analyzer.create_predictive_model(model_type="xgb", calibrate_method="isotonic", N_KEEP=N_KEEP,
+            #                              model_kwargs={
+            #                                  "n_estimators": 700,
+            #                                  "learning_rate": 0.05,
+            #                                  "subsample": 0.9,
+            #                                  "colsample_bytree": 0.9,
+            #                                  "max_depth": 8,
+            #                                  "random_state": 42,
+            #                                  "n_jobs": -1,
+            #                                  "tree_method": "hist",
+            #                                  "objective": "multi:softprob"
+            #                              })
 
     def _extract_proba_for_monitor(self, sig: Dict, return_margin: bool = False):
         """
@@ -654,46 +819,23 @@ class TradeSimulator:
         - Si no hay 'prediction', usa la mayor del dict.
         """
         if sig is None:
-            return (None, None) if return_margin else None
-
-        # 1) Campo directo 'proba'
+            return None
         if "proba" in sig and sig["proba"] is not None:
             try:
-                top_prob = float(sig["proba"])
-                return (top_prob, None) if return_margin else top_prob
+                return float(sig["proba"])
             except Exception:
                 pass
-
-        # 2) Probabilidades por clase (dict)
         probs = sig.get("probabilities") or sig.get("probs")
         pred = sig.get("prediction")
-
-        if isinstance(probs, dict) and probs:
-            # Asegurar valores numéricos
+        if probs and isinstance(probs, dict):
+            if pred in probs:
+                return float(probs[pred])
+            # si no hay pred, usa la mayor
             try:
-                probs_num = {k: float(v) for k, v in probs.items()}
+                return float(max(probs.values()))
             except Exception:
-                return (None, None) if return_margin else None
-
-            if pred in probs_num:
-                top_prob = probs_num[pred]
-                # segunda mejor EXCLUYENDO la clase predicha
-                others = [v for k, v in probs_num.items() if k != pred]
-                second = max(others) if others else None
-            else:
-                # ordenar por valor para hallar top-1 y top-2
-                vals = sorted(probs_num.values(), reverse=True)
-                top_prob = vals[0]
-                second = vals[1] if len(vals) > 1 else None
-
-            if return_margin:
-                margin = (top_prob - second) if (second is not None) else None
-                return top_prob, margin
-            else:
-                return top_prob
-
-        # 3) Si no hay nada utilizable
-        return (None, None) if return_margin else None
+                return None
+        return None
 
     def offline_predict_at_index(self, i: int) -> Optional[Dict]:
         """Replica `predict_realtime` pero **offline** usando el dataset local.
@@ -732,7 +874,7 @@ class TradeSimulator:
         if hasattr(self.analyzer, "_apply_thresholds"):
             pred_class = self.analyzer._apply_thresholds(
                 proba_vec, classes, self.thresholds,
-                default_class="lateral", global_floor=0.51, min_margin=self.min_margin
+                default_class="lateral", global_floor=0.51, min_margin=0.03
             )
         else:
             # fallback simple
@@ -740,16 +882,12 @@ class TradeSimulator:
             pred_class = classes[best_idx]
 
         # filtro de “fake” señales como en tu predict_realtime
-        ema_20 = float(last_meta.get("EMA_15", np.nan))
+        ema_15 = float(last_meta.get("EMA_15", np.nan))
         close_px = float(last_meta["close"])
-        open_px = float(last_meta["open"])
-
-        # umbral_strong = getattr(self.analyzer, "umbral_strong", 0.84)
-        umbral_strong = 0.84
         pred = pred_class
-        if pred_class == 'bullish' and (not np.isnan(ema_20)) and close_px < ema_20  and probabilities.get('bullish', 0):
+        if pred_class == 'bullish' and (not np.isnan(ema_15)) and close_px < ema_15:
             pred = 'lateral'
-        elif pred_class == 'bearish' and (not np.isnan(ema_20)) and close_px > ema_20  and probabilities.get('bearish', 0):
+        elif pred_class == 'bearish' and (not np.isnan(ema_15)) and close_px > ema_15:
             pred = 'lateral'
 
         return {
@@ -791,6 +929,7 @@ class TradeSimulator:
         start, end = self.day_hours
         in_day = start <= ts.time() <= end
         thresh = self.proba_threshold_day if in_day else self.proba_threshold_night
+        # return proba is not None and thresh <= float(proba) < 0.89
         return proba is not None and float(proba) >= thresh
 
     def _tp_sl_from_adapter_or_atr(self, i: int, side: Literal["long", "short"],
@@ -856,20 +995,24 @@ class TradeSimulator:
         Por defecto **entrena una sola vez** con el histórico previo a `test_start`.
         Si `retrain_each_bar=True`, reentrena en cada barra antes de predecir.
         """
+        # Alinear test_start / test_end a la misma tz que el DataFrame
+        tz = getattr(self, "tz", None)
 
-        def _to_same_tz(ts, tz):
-            t = pd.to_datetime(ts)
-            if t.tzinfo is None:
-                return t.tz_localize(tz)  # agrega tz
-            return t.tz_convert(tz)  # cambia tz
+        start = pd.to_datetime(test_start)
+        if tz is not None:
+            start = start.tz_localize(tz) if start.tzinfo is None else start.tz_convert(tz)
 
-        tz = self.df["datetime"].dt.tz
-        start = _to_same_tz(test_start, tz)
-        end = _to_same_tz(test_end, tz) if test_end is not None else None
+        end = None
+        if test_end is not None:
+            end = pd.to_datetime(test_end)
+            if tz is not None:
+                end = end.tz_localize(tz) if end.tzinfo is None else end.tz_convert(tz)
 
-        mask = self.df["datetime"] >= start
+        # Filtrado con tipos compatibles
         if end is not None:
-            mask &= self.df["datetime"] <= end
+            mask = self.df["datetime"].between(start, end)
+        else:
+            mask = (self.df["datetime"] >= start)
 
         idxs = self.df.index[mask].tolist()
         if not idxs:
@@ -891,24 +1034,46 @@ class TradeSimulator:
             # Heartbeat de progreso
             ts_here = self.df.loc[i, "datetime"]
             if self.on_event and (pos == 0 or (pos + 1) % self.log_every_bars == 0 or pos == len(idxs) - 1):
-                self.on_event("progress", {"i": pos+1, "total": len(idxs), "time": ts_here,
-                                            "equity": self.equity, "trades": len(self.trades)})
+                self.on_event("progress", {"i": pos + 1, "total": len(idxs), "time": ts_here,
+                                           "equity": self.equity, "trades": len(self.trades)})
             elif self.verbose >= 1 and (pos == 0 or (pos + 1) % self.log_every_bars == 0 or pos == len(idxs) - 1):
-                print(f"[{pos+1}/{len(idxs)}] {ts_here} | equity={self.equity:.2f} | trades={len(self.trades)}")
+                print(f"[{pos + 1}/{len(idxs)}] {ts_here} | equity={self.equity:.2f} | trades={len(self.trades)}")
             # (Opcional) reentrenar por barra
             if self.retrain_each_bar:
-                # cada 1 vela (comportamiento antiguo)
+                # reentrena en cada vela (modo antiguo)
                 train_slice = self.df.loc[: i - 1]
+                if self.n_keep_for_fit:
+                    train_slice = train_slice.tail(self.n_keep_for_fit)
                 if len(train_slice) >= 200:
+                    # (opcional) anunciar ventana
+                    if getattr(self, "announce_fit", False):
+                        n = len(train_slice);
+                        t0 = train_slice["datetime"].iloc[0];
+                        t1 = train_slice["datetime"].iloc[-1]
+                        if self.on_event: self.on_event("fit_start",
+                                                        {"phase": "each_bar", "pos": pos + 1, "n": n, "from": t0,
+                                                         "to": t1})
                     self.fit_model(train_slice)
+                    if getattr(self, "announce_fit", False):
+                        if self.on_event: self.on_event("fit_end", {"phase": "each_bar", "pos": pos + 1})
+
             elif self.retrain_every_bars is not None and self.retrain_every_bars > 0:
-                # cada N velas (p.ej., 144). Evita pos==0 porque ya hicimos un fit inicial antes del test.
+                # reentrena cada N velas del período de test (p.ej., cada 144)
                 if (pos > 0) and ((pos + 1) % self.retrain_every_bars == 0):
-                    # ventana rodante: últimas n_keep_for_fit filas hasta i-1
-                    start_idx = max(0, i - self.n_keep_for_fit) if self.n_keep_for_fit else 0
+                    # Ventana rodante: últimas n_keep_for_fit velas hasta i-1
+                    start_idx = max(0, i - (self.n_keep_for_fit or len(self.df)))
                     train_slice = self.df.iloc[start_idx: i]
                     if len(train_slice) >= 200:
+                        if getattr(self, "announce_fit", False):
+                            n = len(train_slice);
+                            t0 = train_slice["datetime"].iloc[0];
+                            t1 = train_slice["datetime"].iloc[-1]
+                            if self.on_event: self.on_event("fit_start",
+                                                            {"phase": "periodic", "pos": pos + 1, "n": n, "from": t0,
+                                                             "to": t1})
                         self.fit_model(train_slice)
+                        if getattr(self, "announce_fit", False):
+                            if self.on_event: self.on_event("fit_end", {"phase": "periodic", "pos": pos + 1})
 
             # Si hay trade abierto, intentar cierre en esta barra
             if current_trade is not None and current_trade.is_open():
@@ -919,18 +1084,95 @@ class TradeSimulator:
                     self.equity += pnl - fees_paid
                     # Evento de cierre ANTES de limpiar la variable
                     if self.on_event:
-                        dur = (current_trade.exit_time - current_trade.entry_time) if (current_trade.exit_time and current_trade.entry_time) else None
+                        dur = (current_trade.exit_time - current_trade.entry_time) if (
+                                    current_trade.exit_time and current_trade.entry_time) else None
                         self.on_event("close", {"time": current_trade.exit_time, "reason": current_trade.exit_reason,
-                                                 "price": current_trade.exit_price, "pnl": pnl, "fees": fees_paid,
-                                                 "equity": self.equity, "entry_time": current_trade.entry_time,
-                                                 "duration": dur})
+                                                "price": current_trade.exit_price, "pnl": pnl, "fees": fees_paid,
+                                                "equity": self.equity, "entry_time": current_trade.entry_time,
+                                                "duration": dur})
                     if self.verbose >= 2:
-                        print(f"CLOSE {current_trade.side} @ {current_trade.exit_price:.4f} ({current_trade.exit_reason}) | PnL={pnl:.2f} | fees={fees_paid:.2f} | equity={self.equity:.2f}")
+                        print(
+                            f"CLOSE {current_trade.side} @ {current_trade.exit_price:.4f} ({current_trade.exit_reason}) | PnL={pnl:.2f} | fees={fees_paid:.2f} | equity={self.equity:.2f}")
                     self.trades.append(current_trade)
                     current_trade = None
 
             if just_closed:
                 continue
+            # Early exit por señal opuesta con ganancia asegurada
+            if (current_trade is not None and current_trade.is_open() and self.early_exit_on_opposite_signal):
+                sig_cur = self.get_signal(i)
+                pnl_gross = current_trade.pnl_usdt()
+                if sig_cur:
+                    probs = sig_cur.get("probabilities") or {}
+                    try:
+                        px_now = float(self.df.loc[i, "close"])
+                    except Exception:
+                        px_now = float(current_trade.entry_price)
+                    prob_used = None
+                    bear_l = probs.get("lateral")
+                    if current_trade.side == "long":
+                        bear_p = probs.get("bearish")
+                        if (bear_p is not None) and ((float(bear_p) >= self.early_exit_threshold) or (
+                                float(bear_l) >= self.early_exit_threshold + 0.2)) and (
+                                px_now > current_trade.entry_price):
+                            current_trade.exit_time = self.df.loc[i, "datetime"]
+                            current_trade.exit_price = px_now
+                            current_trade.exit_reason = "early_opposite"
+                            prob_used = max(float((probs or {}).get("bearish", 0)), float((probs or {}).get("lateral", 0)))
+                            if self.on_event:
+                                dur = (current_trade.exit_time - current_trade.entry_time) if (
+                                        current_trade.exit_time and current_trade.entry_time) else None
+                                self.on_event("early_opposite", {
+                                    "side": current_trade.side,
+                                    "time": current_trade.exit_time,
+                                    "price": current_trade.exit_price,
+                                    "prob": prob_used,
+                                    "threshold": self.early_exit_threshold,
+                                    "entry_time": current_trade.entry_time,
+                                    "duration": dur,
+                                    "pnl_gross": pnl_gross
+                                })
+                    elif current_trade.side == "short":
+                        bull_p = probs.get("bullish")
+                        if (bull_p is not None) and ((float(bull_p) >= self.early_exit_threshold) or (
+                                float(bear_l) >= self.early_exit_threshold + 0.2)) and (
+                                px_now < current_trade.entry_price):
+                            current_trade.exit_time = self.df.loc[i, "datetime"]
+                            current_trade.exit_price = px_now
+                            current_trade.exit_reason = "early_opposite"
+                            prob_used = max(float((probs or {}).get("bullish", 0)),
+                                            float((probs or {}).get("lateral", 0)))
+                            if self.on_event:
+                                dur = (current_trade.exit_time - current_trade.entry_time) if (
+                                        current_trade.exit_time and current_trade.entry_time) else None
+                                self.on_event("early_opposite", {
+                                    "side": current_trade.side,
+                                    "time": current_trade.exit_time,
+                                    "price": current_trade.exit_price,
+                                    "prob": prob_used,
+                                    "threshold": self.early_exit_threshold,
+                                    "entry_time": current_trade.entry_time,
+                                    "duration": dur,
+                                    "pnl_gross": pnl_gross
+                                })
+
+                if current_trade is not None and not current_trade.is_open():
+                    pnl = current_trade.pnl_usdt()
+                    fees_paid = current_trade.fees_usdt()
+                    self.equity += pnl - fees_paid
+                    if self.on_event:
+                        dur = (current_trade.exit_time - current_trade.entry_time) if (
+                                    current_trade.exit_time and current_trade.entry_time) else None
+                        self.on_event("close", {"time": current_trade.exit_time, "reason": current_trade.exit_reason,
+                                                "price": current_trade.exit_price, "pnl": pnl, "fees": fees_paid,
+                                                "equity": self.equity, "entry_time": current_trade.entry_time,
+                                                "duration": dur})
+                    if self.verbose >= 2:
+                        print(
+                            f"CLOSE {current_trade.side} @ {current_trade.exit_price:.4f} ({current_trade.exit_reason}) | PnL={pnl:.2f} | fees={fees_paid:.2f} | equity={self.equity:.2f}")
+                    self.trades.append(current_trade)
+                    current_trade = None
+                    continue
 
             # Si no hay trade, evaluar nueva señal
             if current_trade is None:
@@ -938,10 +1180,12 @@ class TradeSimulator:
                 if not sig:
                     continue
                 pred = sig.get("prediction")
-                proba, margin = self._extract_proba_for_monitor(sig, return_margin=True)
+                proba = self._extract_proba_for_monitor(sig)
                 if pred not in {"bullish", "bearish"}:
                     continue
                 ts = self.df.loc[i, "datetime"]
+                # current_e100 = self.df.loc[i, "e100"]
+                # is_near_sup8h = self.df.loc[i, "near_sup_8h"]
                 if not self._passes_monitor(ts, proba):
                     continue
 
@@ -952,9 +1196,7 @@ class TradeSimulator:
                     continue
                 side = "long" if pred == "bullish" else "short"
                 tp, sl = self._tp_sl_from_adapter_or_atr(i, side, sig.get("take_profit") or sig.get("tp"),
-                                                          sig.get("stop_loss") or sig.get("sl"))
-
-                proba_sel = self._extract_proba_for_monitor(sig)  # ya existe en el simulador
+                                                         sig.get("stop_loss") or sig.get("sl"))
                 current_trade = Trade(
                     side=side,
                     entry_time=ts,
@@ -965,20 +1207,20 @@ class TradeSimulator:
                     leverage=self.leverage,
                     opened_with="taker",
                     closed_with="taker",
-                    entry_proba=proba_sel,
+                    entry_proba=proba,
                     entry_pred=pred,
                 )
                 # comisión de entrada
-                entry_fee = px * qty * (self.fees.taker_open if current_trade.opened_with == "taker" else self.fees.maker_open)
+                entry_fee = px * qty * (
+                    self.fees.taker_open if current_trade.opened_with == "taker" else self.fees.maker_open)
                 self.equity -= entry_fee
                 # Evento de apertura y log
                 if self.on_event:
-                    self.on_event("open", {
-                        "time": ts, "side": side, "price": px, "tp": float(tp), "sl": float(sl), "qty": float(qty),
-                        "prob": proba, "margin": float(margin)
-                    })
+                    self.on_event("open", {"time": ts, "side": side, "price": px, "tp": float(tp), "sl": float(sl),
+                                           "qty": float(qty), "prob": proba})
                 if self.verbose >= 2:
-                    print(f"OPEN  {side} @ {px:.4f} | tp={tp:.4f} sl={sl:.4f} | qty={qty:.4f} | proba={proba * 100:.1f}")
+                    print(
+                        f"OPEN  {side} @ {px:.4f} | tp={tp:.4f} sl={sl:.4f} | qty={qty:.4f} | proba={proba * 100:.1f}")
 
             # Avanzar para cierre, pero no más allá de `test_end` si se pidió
             j_limit = last_allowed_index if self.close_trades_at_test_end else len(self.df) - 1
@@ -990,13 +1232,15 @@ class TradeSimulator:
                     fees_paid = current_trade.fees_usdt()
                     self.equity += pnl - fees_paid
                     if self.on_event:
-                        dur = (current_trade.exit_time - current_trade.entry_time) if (current_trade.exit_time and current_trade.entry_time) else None
+                        dur = (current_trade.exit_time - current_trade.entry_time) if (
+                                    current_trade.exit_time and current_trade.entry_time) else None
                         self.on_event("close", {"time": current_trade.exit_time, "reason": current_trade.exit_reason,
-                                                 "price": current_trade.exit_price, "pnl": pnl, "fees": fees_paid,
-                                                 "equity": self.equity, "entry_time": current_trade.entry_time,
-                                                 "duration": dur})
+                                                "price": current_trade.exit_price, "pnl": pnl, "fees": fees_paid,
+                                                "equity": self.equity, "entry_time": current_trade.entry_time,
+                                                "duration": dur})
                     if self.verbose >= 2:
-                        print(f"CLOSE {current_trade.side} @ {current_trade.exit_price:.4f} ({current_trade.exit_reason}) | PnL={pnl:.2f} | fees={fees_paid:.2f} | equity={self.equity:.2f}")
+                        print(
+                            f"CLOSE {current_trade.side} @ {current_trade.exit_price:.4f} ({current_trade.exit_reason}) | PnL={pnl:.2f} | fees={fees_paid:.2f} | equity={self.equity:.2f}")
                     self.trades.append(current_trade)
                     current_trade = None
                     break
@@ -1012,13 +1256,15 @@ class TradeSimulator:
             fees_paid = current_trade.fees_usdt()
             self.equity += pnl - fees_paid
             if self.on_event:
-                dur = (current_trade.exit_time - current_trade.entry_time) if (current_trade.exit_time and current_trade.entry_time) else None
+                dur = (current_trade.exit_time - current_trade.entry_time) if (
+                            current_trade.exit_time and current_trade.entry_time) else None
                 self.on_event("close", {"time": current_trade.exit_time, "reason": current_trade.exit_reason,
-                                         "price": current_trade.exit_price, "pnl": pnl, "fees": fees_paid,
-                                         "equity": self.equity, "entry_time": current_trade.entry_time,
-                                         "duration": dur})
+                                        "price": current_trade.exit_price, "pnl": pnl, "fees": fees_paid,
+                                        "equity": self.equity, "entry_time": current_trade.entry_time,
+                                        "duration": dur})
             if self.verbose >= 2:
-                print(f"FORCE CLOSE @ period end {current_trade.exit_price:.4f} | PnL={pnl:.2f} | fees={fees_paid:.2f} | equity={self.equity:.2f}")
+                print(
+                    f"FORCE CLOSE @ period end {current_trade.exit_price:.4f} | PnL={pnl:.2f} | fees={fees_paid:.2f} | equity={self.equity:.2f}")
             self.trades.append(current_trade)
 
         wins = sum(1 for t in self.trades if t.exit_reason == "tp")
@@ -1114,11 +1360,16 @@ class TradeSimulator:
 
         # Resultado si no existe
         if 'result' not in df.columns:
-            # si tienes exit_reason con 'tp'/'sl'
             if 'exit_reason' in df.columns:
-                df['result'] = np.where(df['exit_reason'] == 'tp', 'win',
-                                        np.where(df['exit_reason'] == 'sl', 'loss',
-                                                 np.where(df.get('pnl', 0) == 0, 'breakeven', 'other')))
+                reason = df['exit_reason'].astype(str).str.lower()
+                # Cuenta 'tp' y 'early_opposite' como 'win'; 'sl' como 'loss'
+                df['result'] = np.select(
+                    [reason.eq('tp'),
+                     reason.eq('early_opposite'),
+                     reason.eq('sl')],
+                    ['win', 'win', 'loss'],
+                    default=np.where(df.get('pnl', 0) == 0, 'breakeven', 'other')
+                )
             else:
                 df['result'] = np.where(df.get('pnl', 0) > 0, 'win',
                                         np.where(df.get('pnl', 0) < 0, 'loss', 'breakeven'))
@@ -1170,7 +1421,7 @@ class TradeSimulator:
         avg_win = df.loc[df['pnl_net'] > 0, 'pnl_net'].mean()
         avg_loss = df.loc[df['pnl_net'] < 0, 'pnl_net'].mean()  # negativo
         payoff_ratio = (avg_win / abs(avg_loss)) if (
-                    pd.notna(avg_win) and pd.notna(avg_loss) and avg_loss != 0) else np.nan
+                pd.notna(avg_win) and pd.notna(avg_loss) and avg_loss != 0) else np.nan
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (np.inf if gross_profit > 0 else np.nan)
         expectancy_val = net_profit / n_closed if n_closed > 0 else np.nan
 
@@ -1226,6 +1477,7 @@ def _now_iso():
     # guardamos en UTC con marca ISO + guardamos hora local aparte
     return datetime.now(timezone.utc).isoformat()
 
+
 class TradeLogger:
     """
     Logger de trading estilo 'journal':
@@ -1233,6 +1485,7 @@ class TradeLogger:
     - Mantiene un estado de posiciones abiertas en memoria para control rápido.
     - Permite calcular estadísticas a partir del log.
     """
+
     def __init__(self, log_path="trade_log.jsonl"):
         self.log_path = log_path
         # open_positions: key=(symbol), value=dict con datos de la posición abierta
@@ -1251,7 +1504,8 @@ class TradeLogger:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # -------- Señales y órdenes --------
-    def log_signal(self, *, symbol, timeframe, side, prob, margin_pp, probs_dict, kelly, rr, take_profit, stop_loss, price, reason, gate):
+    def log_signal(self, *, symbol, timeframe, side, prob, margin_pp, probs_dict, kelly, rr, take_profit, stop_loss,
+                   price, reason, gate):
         """
         Registra la señal que gatilla la operación (antes de enviar orden).
         Devuelve un trade_id para seguir la trazabilidad.
@@ -1262,17 +1516,17 @@ class TradeLogger:
             "trade_id": trade_id,
             "symbol": symbol,
             "timeframe": timeframe,
-            "side": side,                 # 'long'/'short'
+            "side": side,  # 'long'/'short'
             "prob": prob,
-            "margin_pp": margin_pp,       # top1-top2 en puntos porcentuales
+            "margin_pp": margin_pp,  # top1-top2 en puntos porcentuales
             "probs": probs_dict,
             "kelly": kelly,
             "reward_risk": rr,
             "entry_price": price,
             "take_profit": take_profit,
             "stop_loss": stop_loss,
-            "gate": gate,                 # 'soft' / 'strong'
-            "reason": reason              # texto libre: p.ej. "u_soft >= 0.80 & margin_ok"
+            "gate": gate,  # 'soft' / 'strong'
+            "reason": reason  # texto libre: p.ej. "u_soft >= 0.80 & margin_ok"
         }
         self._write(rec)
         return trade_id
@@ -1345,7 +1599,7 @@ class TradeLogger:
             "exit_reason": exit_reason,  # 'tp'/'sl'/'manual'/'error'
             "exit_price": exit_price,
             "pnl_usdt": pnl_usdt,
-            "pnl_r": pnl_r,              # PnL en múltiplos de riesgo (R)
+            "pnl_r": pnl_r,  # PnL en múltiplos de riesgo (R)
             "order_id": order_id
         }
         self._write(rec)
@@ -1381,6 +1635,7 @@ class TradeLogger:
 
         Requisitos: pandas, numpy.
         """
+
         def _to_dt(x):
             try:
                 return datetime.fromisoformat(str(x).replace("Z", "+00:00"))
@@ -2061,14 +2316,14 @@ class StochasticAnalyzer:
         y clasifica la tendencia futura usando un umbral absoluto basado en ATR.
         """
         # Estocástico con período K=100
-        k100_raw, _ = self.calculate_stochastic(df['high'], df['low'], df['close'], 100, 1)
-        df['k100'] = k100_raw.rolling(window=1).mean()
-        df['d100'] = df['k100'].rolling(window=3).mean()
-        df['e100'] = df['d100'].rolling(window=57).mean()
-
-        # Estocástico estándar
-        df['k'], df['d'] = self.calculate_stochastic(df['high'], df['low'], df['close'], 14, 3)
-        df['e'] = df['d'].rolling(window=40).mean()
+        # k100_raw, _ = self.calculate_stochastic(df['high'], df['low'], df['close'], 100, 1)
+        # df['k100'] = k100_raw.rolling(window=1).mean()
+        # df['d100'] = df['k100'].rolling(window=3).mean()
+        # df['e100'] = df['d100'].rolling(window=57).mean()
+        #
+        # # Estocástico estándar
+        # df['k'], df['d'] = self.calculate_stochastic(df['high'], df['low'], df['close'], 14, 3)
+        # df['e'] = df['d'].rolling(window=40).mean()
 
         # ATR clásico (ya lo tienes, pero aseguramos consistencia)
         atr_period = 10
@@ -2083,114 +2338,115 @@ class StochasticAnalyzer:
             df[f'EMA_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
             df[f'trend_ema{period}'] = np.where(df['close'] > df[f'EMA_{period}'], 'up', 'down')
 
-
-        # ADX (Average Directional Index) (14 periodos)
-        adx_period = 14
-        up_move = df['high'].diff()
-        down_move = df['low'].diff() * -1
-
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-        tr = pd.concat([
-            (df['high'] - df['low']),
-            (df['high'] - df['close'].shift()).abs(),
-            (df['low'] - df['close'].shift()).abs()
-        ], axis=1).max(axis=1)
-        atr = tr.rolling(window=adx_period).mean()
-
-        plus_di = 100 * pd.Series(plus_dm).rolling(window=adx_period).mean() / atr
-        minus_di = 100 * pd.Series(minus_dm).rolling(window=adx_period).mean() / atr
-        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-        df['ADX_14'] = dx.rolling(window=adx_period).mean()
-
-        # --- d) Porcentaje de velas verdes/rojas en los últimos N periodos ---
-        n_bars = 12  # Puedes ajustar el número de velas
-        df['candle_green'] = (df['close'] > df['open']).astype(int)
-        df['candle_red'] = (df['close'] < df['open']).astype(int)
-        df['pct_green_last_n'] = df['candle_green'].rolling(window=n_bars).mean()
-        df['pct_red_last_n'] = df['candle_red'].rolling(window=n_bars).mean()
-
-        # --- e) Volumen promedio/cambio en los últimos N periodos ---
-        df['avg_volume_last_n'] = df['volume'].rolling(window=n_bars).mean()
-        df['pct_volume_change'] = df['volume'].pct_change(periods=n_bars)
-
-        # VWAP Trend
+        # # VWAP Trend
         # VWAP tradicional: suma acumulada de (precio*vol) / suma acumulada de volumen
         vwap = (df['close'] * df['volume']).cumsum() / df['volume'].cumsum()
         df['VWAP'] = vwap
         df[f'trend_vwap'] = np.where(df['close'] > df[f'VWAP'], 'up', 'down')
+        #
+        #
+        # # ADX (Average Directional Index) (14 periodos)
+        # adx_period = 14
+        # up_move = df['high'].diff()
+        # down_move = df['low'].diff() * -1
+        #
+        # plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        # minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        # tr = pd.concat([
+        #     (df['high'] - df['low']),
+        #     (df['high'] - df['close'].shift()).abs(),
+        #     (df['low'] - df['close'].shift()).abs()
+        # ], axis=1).max(axis=1)
+        # atr = tr.rolling(window=adx_period).mean()
+        #
+        # plus_di = 100 * pd.Series(plus_dm).rolling(window=adx_period).mean() / atr
+        # minus_di = 100 * pd.Series(minus_dm).rolling(window=adx_period).mean() / atr
+        # dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+        # df['ADX_14'] = dx.rolling(window=adx_period).mean()
+        #
+        # # --- d) Porcentaje de velas verdes/rojas en los últimos N periodos ---
+        # n_bars = 12  # Puedes ajustar el número de velas
+        # df['candle_green'] = (df['close'] > df['open']).astype(int)
+        # df['candle_red'] = (df['close'] < df['open']).astype(int)
+        # df['pct_green_last_n'] = df['candle_green'].rolling(window=n_bars).mean()
+        # df['pct_red_last_n'] = df['candle_red'].rolling(window=n_bars).mean()
+        #
+        # # --- e) Volumen promedio/cambio en los últimos N periodos ---
+        # df['avg_volume_last_n'] = df['volume'].rolling(window=n_bars).mean()
+        # df['pct_volume_change'] = df['volume'].pct_change(periods=n_bars)
+        #
 
-        # --- f) Tamaño de la vela actual ---
-        df['candle_body_size'] = (df['close'] - df['open']).abs()
-        df['candle_total_size'] = (df['high'] - df['low']).abs()
-
-        # Dirección de e100 y e14
-        df['e100_direction'] = np.where(df['e100'].diff() > 0, 'ascending', 'descending')
-        df['e14_direction'] = np.where(df['e'].diff() > 0, 'ascending', 'descending')
-
-        # Hora, minuto y dia, tiempo ciclico
-        df['hour'] = df['datetime'].dt.hour  # Extraer la hora
-        df['minute'] = df['datetime'].dt.minute  # Extraer el minuto
-        df['time_combined'] = df['hour'] * 100 + df['minute']
-        df['day_of_week'] = df['datetime'].dt.weekday
-        df['minute_of_day'] = df['hour'] * 60 + df['minute']
-        df['minute_sin'] = np.sin(2 * np.pi * df['minute_of_day'] / 1440)
-        df['minute_cos'] = np.cos(2 * np.pi * df['minute_of_day'] / 1440)
-        # Day of the week
-        df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
-        df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+        # # --- f) Tamaño de la vela actual ---
+        # df['candle_body_size'] = (df['close'] - df['open']).abs()
+        # df['candle_total_size'] = (df['high'] - df['low']).abs()
+        #
+        # # Dirección de e100 y e14
+        # df['e100_direction'] = np.where(df['e100'].diff() > 0, 'ascending', 'descending')
+        # df['e14_direction'] = np.where(df['e'].diff() > 0, 'ascending', 'descending')
+        #
+        # # Hora, minuto y dia, tiempo ciclico
+        # df['hour'] = df['datetime'].dt.hour  # Extraer la hora
+        # df['minute'] = df['datetime'].dt.minute  # Extraer el minuto
+        # df['time_combined'] = df['hour'] * 100 + df['minute']
+        # df['day_of_week'] = df['datetime'].dt.weekday
+        # df['minute_of_day'] = df['hour'] * 60 + df['minute']
+        # df['minute_sin'] = np.sin(2 * np.pi * df['minute_of_day'] / 1440)
+        # df['minute_cos'] = np.cos(2 * np.pi * df['minute_of_day'] / 1440)
+        # # Day of the week
+        # df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+        # df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
 
         df['volatility'] = df['close'].pct_change().rolling(window=20).std()
 
-
-        # New Features test
-        eps = 1e-9  # para evitar divisiones por cero
-
-        # Retornos (versiones seguras)
-        df['return_1'] = np.log(df['close'] / (df['close'].shift(1) + eps))
-        df['return_5'] = np.log(df['close'] / (df['close'].shift(5) + eps))
-        df['hl_pct'] = (df['high'] - df['low']) / (np.abs(df['close']) + eps)
-        df['ch_pct'] = (df['close'] - df['open']) / (np.abs(df['open']) + eps)
-
-        # pct_change seguro (si t-1 es 0, evita inf)
-        def safe_pct_change(s, periods=1):
-            prev = s.shift(periods)
-            return (s - prev) / (np.abs(prev) + eps)
-
-        df['vol_chg'] = safe_pct_change(df['volume'], 1)
-        df['roc_10'] = safe_pct_change(df['close'], 10)
-        df['roc_30'] = safe_pct_change(df['close'], 30)
-
-        # Volatilidad
-        df['return_1_raw'] = df['close'].pct_change().replace([np.inf, -np.inf], np.nan)
-        df['volatility_10'] = df['return_1_raw'].rolling(10).std()
-        df['volatility_50'] = df['return_1_raw'].rolling(50).std()
-        df.drop(columns=['return_1_raw'], inplace=True)
-
-        df['tr'] = np.maximum(df['high'] - df['low'],
-                              np.maximum(np.abs(df['high'] - df['close'].shift(1)),
-                                         np.abs(df['low'] - df['close'].shift(1))))
-        df['atr_14'] = df['tr'].rolling(14).mean()
-        df['atr_norm'] = df['atr_14'] / (np.abs(df['close']) + eps)
-
-        # Momentum
-        df['momentum_diff'] = df['roc_10'] - df['roc_30']
-
-        # RSI robusto
-        def compute_rsi(series, window):
-            delta = series.diff()
-            up = delta.clip(lower=0)
-            down = -delta.clip(upper=0)
-            ma_up = up.rolling(window).mean()
-            ma_down = down.rolling(window).mean()
-            rs = ma_up / (ma_down + eps)
-            rsi = 100 - (100 / (1 + rs))
-            return rsi
-
-        df['rsi_14'] = compute_rsi(df['close'], 14)
-        df['rsi_50'] = compute_rsi(df['close'], 50)
-
-        # Zonas de soporte y resistencia
+        #
+        # # New Features test
+        # eps = 1e-9  # para evitar divisiones por cero
+        #
+        # # Retornos (versiones seguras)
+        # df['return_1'] = np.log(df['close'] / (df['close'].shift(1) + eps))
+        # df['return_5'] = np.log(df['close'] / (df['close'].shift(5) + eps))
+        # df['hl_pct'] = (df['high'] - df['low']) / (np.abs(df['close']) + eps)
+        # df['ch_pct'] = (df['close'] - df['open']) / (np.abs(df['open']) + eps)
+        #
+        # # pct_change seguro (si t-1 es 0, evita inf)
+        # def safe_pct_change(s, periods=1):
+        #     prev = s.shift(periods)
+        #     return (s - prev) / (np.abs(prev) + eps)
+        #
+        # df['vol_chg'] = safe_pct_change(df['volume'], 1)
+        # df['roc_10'] = safe_pct_change(df['close'], 10)
+        # df['roc_30'] = safe_pct_change(df['close'], 30)
+        #
+        # # Volatilidad
+        # df['return_1_raw'] = df['close'].pct_change().replace([np.inf, -np.inf], np.nan)
+        # df['volatility_10'] = df['return_1_raw'].rolling(10).std()
+        # df['volatility_50'] = df['return_1_raw'].rolling(50).std()
+        # df.drop(columns=['return_1_raw'], inplace=True)
+        #
+        # df['tr'] = np.maximum(df['high'] - df['low'],
+        #                       np.maximum(np.abs(df['high'] - df['close'].shift(1)),
+        #                                  np.abs(df['low'] - df['close'].shift(1))))
+        # df['atr_14'] = df['tr'].rolling(14).mean()
+        # df['atr_norm'] = df['atr_14'] / (np.abs(df['close']) + eps)
+        #
+        # # Momentum
+        # df['momentum_diff'] = df['roc_10'] - df['roc_30']
+        #
+        # # RSI robusto
+        # def compute_rsi(series, window):
+        #     delta = series.diff()
+        #     up = delta.clip(lower=0)
+        #     down = -delta.clip(upper=0)
+        #     ma_up = up.rolling(window).mean()
+        #     ma_down = down.rolling(window).mean()
+        #     rs = ma_up / (ma_down + eps)
+        #     rsi = 100 - (100 / (1 + rs))
+        #     return rsi
+        #
+        # df['rsi_14'] = compute_rsi(df['close'], 14)
+        # df['rsi_50'] = compute_rsi(df['close'], 50)
+        #
+        # # Zonas de soporte y resistencia
         df = add_sr_features(
             df,
             high_col="high",
@@ -2203,12 +2459,15 @@ class StochasticAnalyzer:
             near_k_atr=0.5,  # 0.5 * ATR
             use_daily_pivots=True
         )
-
-        # Tendencia
-        df['ema_10'] = df['close'].ewm(span=10, adjust=False).mean()
-        df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
-        df['ema_ratio'] = df['ema_10'] / (df['ema_50'] + eps)
-        df['price_above_ema50'] = (df['close'] > df['ema_50']).astype(int)
+        #
+        # ← NUEVO
+        #
+        #
+        # # Tendencia
+        # df['ema_10'] = df['close'].ewm(span=10, adjust=False).mean()
+        # df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
+        # df['ema_ratio'] = df['ema_10'] / (df['ema_50'] + eps)
+        # df['price_above_ema50'] = (df['close'] > df['ema_50']).astype(int)
 
         # Tendencia simple (siguiente vela)
         df['price_change'] = df['close'].shift(-1) - df['close']
@@ -2981,24 +3240,6 @@ class StochasticAnalyzer:
             defaults.update(model_kwargs)
             return LGBMClassifier(**defaults), "lgbm"
 
-        if model_type in ("xgb", "xgboost"):
-            if not _HAS_XGB:
-                raise ImportError("XGBoost no está instalado. Ejecuta: pip install xgboost")
-            # uso del wrapper scikit; eval_metric gestiona multiclase automáticamente en proba
-            defaults = dict(
-                n_estimators=700,
-                learning_rate=0.05,
-                subsample=0.9,
-                colsample_bytree=0.9,
-                max_depth=8,
-                random_state=random_state,
-                n_jobs=-1,
-                tree_method="hist",
-                objective="multi:softprob"  # scikit wrapper usa esto para multiclase con predict_proba
-            )
-            defaults.update(model_kwargs)
-            return XGBClassifier(**defaults), "xgb"
-
         raise ValueError(f"model_type desconocido: {model_type}. Usa: 'rf', 'lgbm' o 'xgb'.")
 
     def _safe_feature_importance(self, model, X_tr, y_tr, feature_names):
@@ -3037,14 +3278,23 @@ class StochasticAnalyzer:
             N_KEEP: int = 40000,
             model_type: str = "rf",
             model_kwargs: Optional[Dict] = None,
-            calibrate_method: str = "isotonic"  # "isotonic" o "sigmoid"
+            calibrate_method: str = "isotonic",  # "isotonic" o "sigmoid"
+            return_metrics: bool = False
     ):
         if self.data is None:
             print("No hay datos para entrenar el modelo")
             return
 
         # Preparación de dataset y features (tu función existente)
-        df_model, features = self.preparar_features(self.data)
+        df_model, features, _ = prepare_features_incremental(
+            raw_df=self.data,
+            preparar_features_fn=self.preparar_features,  # tu propia función
+            params=params_to_features,
+            cache_dir="feature_cache",
+            datetime_col="datetime",
+            warmup_bars=150
+        )
+        # df_model, features = self.preparar_features(self.data)
 
         L = getattr(self, "lookahead", 25)  # usa self.lookahead o 25 por defecto
 
@@ -3205,7 +3455,6 @@ class StochasticAnalyzer:
             print("STRONG:", info_strong)
             print("SOFT:", info_soft)
 
-
             # Gráficas de calibración
             if display_graphic:
                 proba_base = proba_vanilla
@@ -3287,11 +3536,17 @@ class StochasticAnalyzer:
         preds_cal = self.model.predict(X_test_scaled)
         classes_cal = getattr(self.model, "classes_", base_model.classes_)
 
+        # --------- MÉTRICAS CALIBRADAS (DEVUELTAS) ----------
+        report_calib = classification_report(y_test, preds_cal, labels=classes_cal, output_dict=True)
+        brier_calib = multiclass_brier(y_test, proba_cal, classes_cal)
+        logloss_calib = log_loss(y_test, proba_cal, labels=classes_cal)
+        ece_calib = ece_maxprob(y_test, proba_cal, classes_cal)
+
         print("Reporte de clasificación de modelo CALIBRADO:")
         print(classification_report(y_test, preds_cal, labels=classes_cal))
-        print(f"Brier (multiclase): {multiclass_brier(y_test, proba_cal, classes_cal):.6f}")
-        print(f"Log loss: {log_loss(y_test, proba_cal, labels=classes_cal):.6f}")
-        print(f"ECE: {ece_maxprob(y_test, proba_cal, classes_cal):.6f}")
+        print(f"Brier (multiclase): {brier_calib:.6f}")
+        print(f"Log loss: {logloss_calib:.6f}")
+        print(f"ECE: {ece_calib:.6f}")
 
         # Selector de umbrales (tu función)
         u_strong, info_strong, u_soft, info_soft, df_bands = self.select_thresholds_by_band_precision(
@@ -3352,198 +3607,140 @@ class StochasticAnalyzer:
         self.classes_ = classes_cal
         self.model_tag_ = model_tag
 
-        return self.model
-
-
-    def create_predictive_mode_original(self, display_graphic=False, N_KEEP=40000):
-        if self.data is None:
-            print("No hay datos para entrenar el modelo")
-            return
-
-        df_model, features = self.preparar_features(self.data)
-
-        L = self.lookahead  # o fija 25 si prefieres
-
-        n_total = len(df_model)
-        if n_total <= L:
-            raise RuntimeError(f"No hay suficientes filas para excluir lookahead={L} (n={n_total}).")
-
-        # Si hay más de 40k filas, recorta a las últimas 40k
-        if n_total > N_KEEP:
-            df_model = df_model.iloc[-N_KEEP:].copy()
-            n_total = len(df_model)  # ahora n_total == N_KEEP
-
-        # Verificación: tras excluir L debe quedar algo de train
-        if n_total - L < 1000:
-            # umbral a tu gusto; evita entrenar con muy pocas filas
-            print(f"Advertencia: solo {n_total - L} filas de train tras recorte y lookahead. "
-                  f"Considera reducir L o N_KEEP.")
-
-        # === Excluir las últimas L velas (lookahead) del entrenamiento ===
-        df_train = df_model.iloc[:-L].copy()
-
-        # Si ya marcaste NaN en future_trend para las últimas L, bastaría con notna();
-        # aquí hacemos ambas cosas por seguridad:
-        df_train = df_train[df_train["future_trend"].notna()]
-
-        # Quita filas con NaN en features (por rolling, etc.)
-        df_train = df_train.dropna(subset=features + ["future_trend"])
-
-        # (Opcional) guarda las últimas L para auditoría / live
-        # self._holdout_future_window = df_model.iloc[-L:].copy()
-
-        X = df_train[features]
-        y = df_train["future_trend"]
-
-        # === Split, escalado y entrenamiento ===
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
-        )
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
-
-        # 1) split para calibración (no uses el test!)
-        X_tr, X_cal, y_tr, y_cal = train_test_split(
-            X_train_scaled, y_train, test_size=0.2, stratify=y_train, random_state=42
-        )
-
-        # 2) entrena una sola vez
-        def expected_calibration_error(y_true, y_prob, n_bins=10):
-            """ECE clásico sobre la confianza máxima."""
-            bins = np.linspace(0.0, 1.0, n_bins + 1)
-            conf_max = np.max(y_prob, axis=1)
-            pred_cls = np.argmax(y_prob, axis=1)
-            # Mapear y_true a índices 0..K-1 según el orden de clases que uses afuera
-            return_pred = None  # placeholder para consistencia, no se usa
-
-        def multiclass_brier(y_true, y_prob, classes):
-            """
-            Brier multiclase: promedio sobre muestras de sum_k (p_k - y_k)^2.
-            y_true: iterable de labels (no one-hot)
-            y_prob: ndarray shape (n_samples, n_classes)
-            classes: iterable con el orden de columnas de y_prob (model.classes_)
-            """
-            class_to_idx = {c: i for i, c in enumerate(classes)}
-            y_idx = np.array([class_to_idx[y] for y in y_true])
-            Y = np.zeros_like(y_prob)
-            Y[np.arange(len(y_true)), y_idx] = 1.0
-            return float(np.mean(np.sum((y_prob - Y) ** 2, axis=1)))
-
-        def ece_maxprob(y_true, y_prob, classes, n_bins=10):
-            """ECE usando la confianza máxima."""
-            class_to_idx = {c: i for i, c in enumerate(classes)}
-            y_idx = np.array([class_to_idx[y] for y in y_true])
-
-            conf = np.max(y_prob, axis=1)
-            pred = np.argmax(y_prob, axis=1)
-
-            bins = np.linspace(0.0, 1.0, n_bins + 1)
-            binids = np.digitize(conf, bins) - 1
-
-            ece = 0.0
-            n = len(y_true)
-            for i in range(n_bins):
-                mask = binids == i
-                if np.any(mask):
-                    acc = np.mean(pred[mask] == y_idx[mask])
-                    avg_conf = np.mean(conf[mask])
-                    ece += (np.sum(mask) / n) * abs(acc - avg_conf)
-            return float(ece)
-
-        # ===============================
-        # Entrenamiento modelo base
-        # ===============================
-        base_model = RandomForestClassifier(
-            n_estimators=700, max_features="sqrt", n_jobs=-1, random_state=42
-        )
-        base_model.fit(X_tr, y_tr)
-
-        # ==== Sin calibrar ====
-        preds_vanilla = base_model.predict(X_test_scaled)
-        proba_vanilla = base_model.predict_proba(X_test_scaled)
-        classes = base_model.classes_
-
-        print("Reporte de clasificación de modelo SIN calibrar:")
-        print(classification_report(y_test, preds_vanilla))
-        print(f"Brier (multiclase): {multiclass_brier(y_test, proba_vanilla, classes):.6f}")
-        print(f"Log loss: {log_loss(y_test, proba_vanilla, labels=classes):.6f}")
-        print(f"ECE: {ece_maxprob(y_test, proba_vanilla, classes):.6f}")
-        print("=" * 50)
-
-        # ==== Con calibración ====
-        self.model = CalibratedClassifierCV(base_model, method='isotonic', cv='prefit')
-        self.model.fit(X_cal, y_cal)
-
-        preds_cal = self.model.predict(X_test_scaled)
-        proba_cal = self.model.predict_proba(X_test_scaled)
-        classes_cal = self.model.classes_  # puede coincidir, pero toma el del calibrado
-
-        print("Reporte de clasificación de modelo CALIBRADO:")
-        print(classification_report(y_test, preds_cal))
-        print(f"Brier (multiclase): {multiclass_brier(y_test, proba_cal, classes_cal):.6f}")
-        print(f"Log loss: {log_loss(y_test, proba_cal, labels=classes_cal):.6f}")
-        print(f"ECE: {ece_maxprob(y_test, proba_cal, classes_cal):.6f}")
-
-        u_strong, info_strong, u_soft, info_soft, df_bands = self.select_thresholds_by_band_precision(
-            X_hold=X_test_scaled, y_hold=y_test,
-            band_step=0.1, u_min=0.55, u_max=0.95,
-            min_margin=0.03,
-            min_n_soft=1000,
-            min_n_strong=1200,
-            min_trade_rate_soft=0.10,
-            min_trade_rate_strong=0.03,
-            soft_range=(0.83, 0.865),
-            strong_range=(0.89, 0.96),
-            soft_start=0.60,
-            strong_start=0.80,
-            use_ci_lower=True,
-            prefer_center_soft=True
-        )
-
-        feature_importance = pd.DataFrame({
-            'feature': features,
-            'importance': base_model.feature_importances_
-        }).sort_values('importance', ascending=False)
-        print("\nImportancia de características:")
-        print(feature_importance)
-
-        print("u_strong:", u_strong, "| u_soft:", u_soft)
-        print("STRONG:", info_strong)
-        print("SOFT:", info_soft)
-
-        # === Curvas de calibración por clase ===
-        if display_graphic:
-            proba_base = base_model.predict_proba(X_test_scaled)
-            proba_calib = self.model.predict_proba(X_test_scaled)
-            clases = base_model.classes_
-
-            plt.figure(figsize=(7, 5))
-            for target_class in clases:
-                idx = list(clases).index(target_class)
-                y_true_bin = np.array([1 if yt == target_class else 0 for yt in y_test])
-
-                # Modelo sin calibrar
-                prob_pred_base, prob_true_base = calibration_curve(
-                    y_true_bin, proba_base[:, idx], n_bins=10, strategy='uniform'
-                )
-                plt.plot(prob_pred_base, prob_true_base, marker='o', label=f"Sin calibrar '{target_class}'")
-
-                # # Modelo calibrado
-                prob_pred_cal, prob_true_cal = calibration_curve(
-                    y_true_bin, proba_calib[:, idx], n_bins=10, strategy='uniform'
-                )
-                plt.plot(prob_pred_cal, prob_true_cal, marker='o', linestyle='--', label=f"Calibrado '{target_class}'")
-
-            fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            plt.plot([0, 1], [0, 1], 'k--', label='Perfectamente calibrado')
-            plt.xlabel('Probabilidad predicha por el modelo')
-            plt.ylabel('Proporción real de acierto')
-            plt.title(f'Gráfico de calibración: sin calibrar vs calibrado\nEntrenado: {fecha_actual}')
-            plt.legend()
-            plt.grid()
-            plt.show()
+        if return_metrics:
+            metrics_dict = {
+                "classes": list(classes_cal),
+                "report_calib": report_calib,  # dict completo por clase + macro/weighted
+                "brier_calib": float(brier_calib),
+                "logloss_calib": float(logloss_calib),
+                "ece_calib": float(ece_calib),
+                "N_KEEP": N_KEEP,
+                "model_tag": model_tag,
+                "calibrate_method": calibrate_method,
+                "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            return self.model, metrics_dict
 
         return self.model
+
+    def _flatten_report(self, report_dict: dict, prefix: str = "") -> dict:
+        """
+        Aplana el classification_report (output_dict=True) a un solo nivel.
+        Mantiene claves útiles como:
+          - precision/recall/f1-score de cada clase ('bearish','bullish','lateral' si aplica)
+          - 'macro avg' y 'weighted avg'
+        """
+        flat = {}
+        for k, v in report_dict.items():
+            key = f"{prefix}{k}"
+            if isinstance(v, dict):
+                for mk, mv in v.items():
+                    flat[f"{key}_{mk}"] = mv
+            else:
+                flat[key] = v
+        return flat
+
+    def sweep_nkeep(self,
+                    start: int = 10_000,
+                    stop: int = 160_000,
+                    step: int = 10_000,
+                    model_type: str = "rf",
+                    model_kwargs: Optional[Dict] = None,
+                    calibrate_method: str = "isotonic",
+                    export_csv_path: Optional[str] = None,
+                    sort_by: str = "macro_f1",  # opciones: 'macro_f1', 'logloss', 'brier', 'ece'
+                    ascending: Optional[bool] = None):
+        """
+        Ejecuta entrenamiento y evaluación calibrada para N_KEEP en [start, stop] con 'step'.
+        Devuelve un DataFrame con:
+          - N_KEEP, brier_calib, logloss_calib, ece_calib
+          - precision/recall/f1 por clase (si existen)
+          - macro avg y weighted avg
+        """
+
+        rows = []
+        errs = []
+
+        # Orden de sort por defecto coherente con la métrica:
+        if ascending is None:
+            # f1 mayor es mejor; logloss/brier/ece menor es mejor
+            ascending = (sort_by in ["logloss", "brier", "ece"])
+
+        for nkeep in range(start, stop + 1, step):
+            try:
+                _model, metrics = self.create_predictive_model(
+                    display_graphic=False,
+                    N_KEEP=nkeep,
+                    model_type=model_type,
+                    model_kwargs=(model_kwargs or {}),
+                    calibrate_method=calibrate_method,
+                    return_metrics=True
+                )
+                if metrics is None:
+                    errs.append((nkeep, "Sin métricas devueltas"))
+                    continue
+
+                flat_rep = self._flatten_report(metrics["report_calib"], prefix="rep_")
+                row = {
+                    "N_KEEP": nkeep,
+                    "model_tag": metrics.get("model_tag"),
+                    "calibrate_method": metrics.get("calibrate_method"),
+                    "brier_calib": metrics.get("brier_calib"),
+                    "logloss_calib": metrics.get("logloss_calib"),
+                    "ece_calib": metrics.get("ece_calib"),
+                    "trained_at": metrics.get("trained_at"),
+                    # Atajos útiles:
+                    "macro_precision": flat_rep.get("rep_macro avg_precision"),
+                    "macro_recall": flat_rep.get("rep_macro avg_recall"),
+                    "macro_f1": flat_rep.get("rep_macro avg_f1-score"),
+                    "weighted_f1": flat_rep.get("rep_weighted avg_f1-score"),
+                }
+                # Si quieres por-clase (si existen):
+                for cls in metrics["classes"]:
+                    for m in ["precision", "recall", "f1-score", "support"]:
+                        key = f"rep_{cls}_{m}"
+                        if key in flat_rep:
+                            row[key] = flat_rep[key]
+
+                rows.append(row)
+
+            except Exception as e:
+                errs.append((nkeep, str(e)))
+
+        df = pd.DataFrame(rows)
+
+        # Renombres amigables (opcional)
+        if "macro_f1" not in df.columns and "rep_macro avg_f1-score" in df.columns:
+            df["macro_f1"] = df["rep_macro avg_f1-score"]
+
+        # Ordenar según preferencia
+        if sort_by == "macro_f1":
+            df = df.sort_values(by="macro_f1", ascending=False).reset_index(drop=True)
+        elif sort_by == "logloss":
+            df = df.sort_values(by="logloss_calib", ascending=True).reset_index(drop=True)
+        elif sort_by == "brier":
+            df = df.sort_values(by="brier_calib", ascending=True).reset_index(drop=True)
+        elif sort_by == "ece":
+            df = df.sort_values(by="ece_calib", ascending=True).reset_index(drop=True)
+        else:
+            # Fallback: macro_f1
+            df = df.sort_values(by="macro_f1", ascending=False).reset_index(drop=True)
+
+        # Exportar si se pide
+        if export_csv_path:
+            try:
+                df.to_csv(export_csv_path, index=False)
+                print(f"[OK] Resultados exportados a: {export_csv_path}")
+            except Exception as e:
+                print(f"[WARN] No se pudo exportar CSV: {e}")
+
+        # Log de errores (si hubo)
+        if errs:
+            print("\n[Resumen de errores en el barrido]:")
+            for nkeep, msg in errs:
+                print(f"  N_KEEP={nkeep}: {msg}")
+
+        return df
 
     def get_best_calibration_model(self, display_graphic=False,
                                    methods=("isotonic", "sigmoid", "beta", "histbin")):
@@ -3672,7 +3869,15 @@ class StochasticAnalyzer:
             print("No hay datos para entrenar el modelo")
             return
 
-        df_model, features = self.preparar_features(self.data)
+        # df_model, features = self.preparar_features(self.data)
+        df_model, features, _ = prepare_features_incremental(
+            raw_df=self.data,
+            preparar_features_fn=self.preparar_features,  # tu propia función
+            params=params_to_features,
+            cache_dir="feature_cache",
+            datetime_col="datetime",
+            warmup_bars=150
+        )
 
         L = self.lookahead
         if len(df_model) <= L:
@@ -4114,6 +4319,16 @@ class StochasticAnalyzer:
 
         # 3) Preparar features
         df_ready, features = self.preparar_features(df_new)
+
+        # df_ready, features, _ = prepare_features_incremental(
+        #     raw_df=df_new,
+        #     preparar_features_fn=self.preparar_features,  # tu propia función
+        #     params=params_to_features,
+        #     cache_dir="feature_cache",
+        #     datetime_col="datetime",
+        #     warmup_bars=150
+        # )
+
         if df_ready.empty:
             raise RuntimeError("No hay suficientes datos para calcular todas las features necesarias (lags, etc).")
 
@@ -4153,7 +4368,7 @@ class StochasticAnalyzer:
             "timestamp": last_meta['datetime'],
             "last_row_atr": float(last_meta['ATR']),
             "last_row_close": float(last_meta['close']),
-            "raw_df": df_new[["datetime","open","high","low","close","volume"]].copy()
+            "raw_df": df_new[["datetime", "open", "high", "low", "close", "volume"]].copy()
         }
         return result
 
@@ -4369,17 +4584,17 @@ class StochasticAnalyzer:
                 atr_ok = (atr is not None) and (atr > 0)
 
                 # Evita asignar 'short' por defecto cuando es lateral
-                side = "long" if pred == "bullish" else ("short" if pred == "bearish" else None)
+                side_prediction = "long" if pred == "bullish" else ("short" if pred == "bearish" else None)
                 margin_pp = margin * 100.0
 
                 # Calcula TP/SL solo si es operable
                 take_profit = stop_loss = reward_risk = kelly_fraction = None
-                eligible = (side is not None) and margin_ok and atr_ok
+                eligible = (side_prediction is not None) and margin_ok and atr_ok
 
                 if eligible:
                     profit_factor = self.atr_mult
                     loss_factor = self.atr_stop
-                    if side == "long":
+                    if side_prediction == "long":
                         take_profit = close_price + (profit_factor * atr)
                         stop_loss = close_price - (loss_factor * atr)
                     else:
@@ -4394,6 +4609,9 @@ class StochasticAnalyzer:
                     kelly_fraction = max(0.0, min(p - (q / reward_risk), 0.95))
 
                 # Gate sólo si es elegible
+                self.umbral_strong = 0.72
+                self.umbral_soft = 0.68
+
                 gate = None
                 if eligible:
                     gate = "strong" if proba_pred >= self.umbral_strong else (
@@ -4401,7 +4619,7 @@ class StochasticAnalyzer:
 
                 # 1) Log de señal (marca elegibilidad)
                 trade_id = self.tradelogger.log_signal(
-                    symbol=symbol, timeframe=interval, side=side, prob=proba_pred,
+                    symbol=symbol, timeframe=interval, side=side_prediction, prob=proba_pred,
                     margin_pp=margin_pp, probs_dict=probs, kelly=kelly_fraction, rr=reward_risk,
                     take_profit=take_profit, stop_loss=stop_loss, price=close_price,
                     reason="pred_change" if pred != last_prediction else "no_change_reentry",
@@ -4420,7 +4638,27 @@ class StochasticAnalyzer:
                     if eligible and gate in ("soft", "strong"):
                         if self.tradelogger.has_open_position(symbol):
                             self.tradelogger.log_info(note="Señal ignorada: ya hay posición abierta",
-                                                      symbol=symbol, side=side, trade_id=trade_id)
+                                                      symbol=symbol, side=side_prediction, trade_id=trade_id)
+                            info_positions = self.tradelogger.open_positions.get(symbol)
+                            entry_price = self.tradelogger.open_positions.get('price')
+                            side_position = info_positions.get("side")
+                            if (side_position != side_prediction) and proba_pred >= 0.65:
+                                counter_side = "short"
+                                if side_position == "long" and close_price > entry_price:
+                                    if pred == "lateral" and proba_pred >= 0.85:
+                                        self.close_order(counter_side)
+                                        self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+                                    elif pred == "short":
+                                        self.close_order(counter_side)
+                                        self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+                                elif side_position == "short" and close_price < entry_price:
+                                    counter_side = "long"
+                                    if pred == "lateral" and proba_pred >= 0.85:
+                                        self.close_order(counter_side)
+                                        self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+                                    elif pred == "long":
+                                        self.close_order(counter_side)
+                                        self.check_and_close_from_market(symbol, resultado.get("raw_df"))
                         else:
                             self.start_order(pred, symbol, interval, bogota_time, proba_pred, probs,
                                              atr, close_price, True, trade_id=trade_id)
@@ -4434,10 +4672,10 @@ class StochasticAnalyzer:
                     print(probs)
 
                     # Re-entrada solo si sube a strong y sigue elegible
-                    if eligible and proba_pred >= self.umbral_strong:
+                    if eligible and self.umbral_strong <= proba_pred < 0.88:
                         if self.tradelogger.has_open_position(symbol):
                             self.tradelogger.log_info(note="Señal ignorada: ya hay posición abierta",
-                                                      symbol=symbol, side=side, trade_id=trade_id)
+                                                      symbol=symbol, side=side_prediction, trade_id=trade_id)
                         else:
                             self.start_order(pred, symbol, interval, bogota_time, proba_pred, probs,
                                              atr, close_price, True, trade_id=trade_id)
@@ -4450,7 +4688,7 @@ class StochasticAnalyzer:
                 time.sleep(5)
 
             # === Recalcula 'now' aquí también antes de ventanas de reinicio ===
-            now = datetime.now()
+            # now = datetime.now()
 
             # # Ventanas de reinicio
             # if (now.hour in {RESTART_HOUR_1 - 1} and now.minute == 56):
@@ -4460,7 +4698,7 @@ class StochasticAnalyzer:
             #     today_str_ = f"{now.day:02d}"
             #     tomorrow_ = now + timedelta(days=1)
             #     tomorrow_day_ = f"{tomorrow_.day:02d}"
-            #     mont_str_ = f"{now.month:02d}"
+            #     mont_str_ = f"{now.month:02d}"å
             #     filename_ = f'AVAXUSDT_5m_2024-01-01_2025-{mont_str_}-{today_str_}.csv'
             #     if os.path.exists(filename_):
             #         name, extension_ = os.path.splitext(filename_)
@@ -4468,12 +4706,13 @@ class StochasticAnalyzer:
             #         os.rename(filename_, new_name_)
             #         print("Nuevo nombre de archivo:", new_name_)
 
-    def start_order(self, pred, symbol, interval, bogota_time, proba, resultado, atr, close_price, real_account, trade_id=None):
+    def start_order(self, pred, symbol, interval, bogota_time, proba, resultado, atr, close_price, real_account,
+                    trade_id=None):
         if atr is not None and atr > 0:
             if (pred == "bullish") or (pred == "bearish"):
                 response = {}
-                profit_factor = self.atr_mult
-                loss_factor = 3.1
+                profit_factor = 4
+                loss_factor = 3
                 take_profit = close_price + (profit_factor * atr) if pred == "bullish" else close_price - (
                         profit_factor * atr)
                 stop_loss = close_price - (loss_factor * atr) if pred == "bullish" else close_price + (
@@ -4482,7 +4721,7 @@ class StochasticAnalyzer:
                 ganancia = abs(take_profit - close_price)
                 perdida = abs(stop_loss - close_price)
                 reward_risk = ganancia / perdida if perdida != 0 else 0.0001  # protección para no dividir por 0
-                p = proba - 0.25
+                p = proba - 0.2 if proba >= 0.8 else proba
                 q = 1 - p
                 kelly_fraction = p - (q / reward_risk)
                 # Limitar valores extremos
@@ -4597,6 +4836,23 @@ class StochasticAnalyzer:
                         Json: {payload}
                         """
                         self.send_email(subject, body)
+
+    def close_order(self, side):
+
+        payload = {
+            "side": side,
+            "symbol": "AVAXUSDT",
+        }
+        try:
+            response = requests.post(
+                "http://52.67.38.220:80/webhook",
+                json=payload,
+                timeout=10
+            )
+            print("POST al webhook enviado:", payload)
+            print("Respuesta:", response.text)
+        except Exception as e:
+            print("Error enviando al webhook:", e)
 
     def append_new_data(self, new_df):
         """
@@ -4885,12 +5141,12 @@ class StochasticAnalyzer:
             plt.tight_layout()
             plt.show()
 
-        resumen, trades_df = summarize_backtest(trades_df,
-                                                equity_curve=equity_df['equity'] if equity_df is not None else None)
-
-        print("\n=== Resumen Backtest ===")
-        for k, v in summary.items():
-            print(f"{k:>16}: {v}")
+        # resumen, trades_df = self._summarize_backtest(trades_df,
+        #                                         equity_curve=equity_df['equity'] if equity_df is not None else None)
+        #
+        # print("\n=== Resumen Backtest ===")
+        # for k, v in resumen.items():
+        #     print(f"{k:>16}: {v}")
 
         return trades_df, resumen
 
@@ -4906,16 +5162,16 @@ class StochasticAnalyzer:
             self.data = pd.concat([self.data, new_df], ignore_index=True)
             self.data = self.data.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
 
-    def preparar_features(self, df, lags=[1]):
+    def preparar_features_backup(self, df, lags=[1]):
         df = df.copy()
 
         base_features = [
-            'd100', 'e100', 'e', 'volatility', 'ATR', 'ADX_14', 'avg_volume_last_n', 'pct_volume_change', 'k',
-            'd', 'close', 'high', 'low', 'volume'
+            'd100', 'e100', 'e', 'volatility', 'ATR', 'ADX_14', 'avg_volume_last_n',
+            'close', 'high', 'low'
         ]
 
         no_lag_features = [
-            'minute_sin', 'minute_cos', 'k100', 'dow_sin', 'dow_cos'
+            'minute_sin', 'minute_cos', 'k100', 'dow_sin', 'dow_cos', 'k', 'd', 'volume'
         ]
 
         features_testing = [
@@ -4929,6 +5185,16 @@ class StochasticAnalyzer:
         # Soporte y Resistencia
         support_resistance = [
             "dist_PP", "dist_S1", "dist_R1", "dist_S2", "dist_R2", "dist_resist_rl", "dist_support_rl"
+        ]
+
+        extra_feats = [
+            "dist_P_8h_atr", "dist_R1_8h_atr", "dist_R2_8h_atr", "dist_R3_8h_atr",
+            "dist_S1_8h_atr", "dist_S2_8h_atr", "dist_S3_8h_atr"
+        ]
+
+        sr_binaries = [
+            "near_res_8h", "near_sup_8h", "stoch_overbought_80", "stoch_overbought_90", "stoch_oversold_20",
+            "stoch_oversold_10", "stoch_k_slope", "stoch_k_above_d"
         ]
 
         dummy_cols_base = ['trend_ema200', 'trend_vwap']
@@ -4951,12 +5217,425 @@ class StochasticAnalyzer:
 
         # === Lista final de features: actuales + lags ===
         lag_feature_names = [f'{col}_lag{lag}' for col in base_features for lag in lags]
-        features_final = base_features + no_lag_features + lag_feature_names + features_testing + support_resistance
+        features_final = base_features + no_lag_features + lag_feature_names + features_testing + extra_feats + support_resistance + sr_binaries
 
         # === Reemplazar infinitos y eliminar NaNs solo en las columnas de interés ===
         df[features_final] = df[features_final].replace([np.inf, -np.inf], np.nan)
 
         return df, features_final
+
+    import pandas as pd
+    import numpy as np
+
+    def preparar_features(self, df, lags=[1]):
+        """
+        Feature set 'trader-like':
+          - Precio y lags básicos
+          - Volumen y volatilidad (ATR/volatility, atr_norm)
+          - Soporte/Resistencia (distancias continuas)
+          - Tiempo/Sesiones (sin/cos + flags de sesiones)
+          - Tendencia (EMA ratio + líneas de tendencia normalizadas + distancia)
+          - Momentum (RSI/ROC/momentum_diff)
+          - Patrones de velas (doji, pinbar, engulfing)
+          - Canales de tendencia (slopes high/low + ancho)
+          - Confluencias (RSI + cercanía a SR)
+        Retorna: (df, features_final)
+        """
+        dfx = df.copy()
+
+        eps = 1e-9
+
+        # =========================
+        # CONFIG (ajusta a tu mercado)
+        # =========================
+        # Ventanas para tendencia/canales
+        trend_windows = [20, 50, 100]
+        channel_window = 50
+
+        # Sesiones (UTC) — AJUSTA si tu dataset no está en UTC
+        # NY Open aproximada (13:30–15:30 UTC), London (07:00–09:00), Asia/Tokyo (23:00–01:00)
+        session_defs = {
+            "session_ny_open": [(8, 30), (10, 30)],  # 08:30–10:30 hora local NY
+            "session_london_open": [(2, 0), (4, 0)],  # 02:00–04:00 hora local NY
+            "session_asia_open": [(18, 0), (20, 0)]  # 18:00–20:00 hora local NY
+        }
+
+        # Confluencias (umbrales)
+        rsi_oversold = 30
+        rsi_overbought = 70
+        sr_threshold_frac = 0.25  # "cerca de SR" = distancia < 0.25*ATR (ejemplo)
+
+        # =========================
+        # Utilidades
+        # =========================
+        def _ensure_datetime(d):
+            if 'datetime' in d.columns and not pd.api.types.is_datetime64_any_dtype(d['datetime']):
+                d['datetime'] = pd.to_datetime(d['datetime'], utc=True, errors='coerce')
+            return d
+
+        def _safe_pct_change(s, periods=1):
+            prev = s.shift(periods)
+            return (s - prev) / (np.abs(prev) + eps)
+
+        def _rsi(series, window=14):
+            delta = series.diff()
+            up = delta.clip(lower=0)
+            down = -delta.clip(upper=0)
+            ma_up = up.rolling(window).mean()
+            ma_down = down.rolling(window).mean()
+            rs = ma_up / (ma_down + eps)
+            return 100 - (100 / (1 + rs))
+
+        def _trend_slope_norm(arr):
+            y = arr.reshape(-1, 1)
+            X = np.arange(len(arr), dtype=float).reshape(-1, 1)
+            reg = LinearRegression().fit(X, y)
+            slope = float(reg.coef_[0][0])
+            mean_price = float(np.mean(arr)) if np.isfinite(np.mean(arr)) else np.nan
+            return slope / (mean_price + eps)
+
+        def _trend_r2(arr):
+            y = arr.reshape(-1, 1)
+            X = np.arange(len(arr), dtype=float).reshape(-1, 1)
+            reg = LinearRegression().fit(X, y)
+            return float(reg.score(X, y))
+
+        def _trend_dist_pct(arr):
+            y = arr.reshape(-1, 1)
+            X = np.arange(len(arr), dtype=float).reshape(-1, 1)
+            reg = LinearRegression().fit(X, y)
+            y_hat_last = float(reg.predict(np.array([[len(arr) - 1]], dtype=float)))
+            y_last = float(arr[-1])
+            return (y_last - y_hat_last) / (abs(y_last) + eps)
+
+        def _linreg_line(arr):
+            """Devuelve (coef, intercept) de y ~ a*x + b sobre array 1-D."""
+            y = arr.reshape(-1, 1)
+            X = np.arange(len(arr), dtype=float).reshape(-1, 1)
+            reg = LinearRegression().fit(X, y)
+            return float(reg.coef_[0][0]), float(reg.intercept_)
+
+        dfx = _ensure_datetime(dfx)
+
+        # =========================
+        # Precio / Volumen / Volatilidad / ATR básicos (si faltan)
+        # =========================
+        # Asumimos close/high/low/volume existen en df fuente. Si no, fallará arriba en tu pipeline.
+        # volatility simple (si no existe)
+        if 'volatility' not in dfx.columns:
+            dfx['volatility'] = dfx['close'].pct_change().abs().rolling(20).mean()
+
+        # ATR clásico (si no existe)
+        if 'ATR' not in dfx.columns:
+            tr = np.maximum(dfx['high'] - dfx['low'],
+                            np.maximum(np.abs(dfx['high'] - dfx['close'].shift(1)),
+                                       np.abs(dfx['low'] - dfx['close'].shift(1))))
+            dfx['ATR'] = tr.rolling(14).mean()
+
+        if 'atr_norm' not in dfx.columns:
+            dfx['atr_norm'] = dfx['ATR'] / (np.abs(dfx['close']) + eps)
+
+        # Medias de volatilidad
+        if 'volatility_10' not in dfx.columns:
+            dfx['volatility_10'] = dfx['close'].pct_change().rolling(10).std()
+        if 'volatility_50' not in dfx.columns:
+            dfx['volatility_50'] = dfx['close'].pct_change().rolling(50).std()
+
+        # Volume promedio (si no existe)
+        if 'avg_volume_last_n' not in dfx.columns:
+            dfx['avg_volume_last_n'] = dfx['volume'].rolling(20).mean()
+
+        # RSI, ROC, momentum si faltan
+        if 'rsi_14' not in dfx.columns:
+            dfx['rsi_14'] = _rsi(dfx['close'], 14)
+        if 'rsi_50' not in dfx.columns:
+            dfx['rsi_50'] = _rsi(dfx['close'], 50)
+        if 'roc_10' not in dfx.columns:
+            dfx['roc_10'] = _safe_pct_change(dfx['close'], 10)
+        if 'roc_30' not in dfx.columns:
+            dfx['roc_30'] = _safe_pct_change(dfx['close'], 30)
+        if 'momentum_diff' not in dfx.columns:
+            dfx['momentum_diff'] = dfx['roc_10'] - dfx['roc_30']
+
+        # EMA ratio (si no existe)
+        if 'ema_ratio' not in dfx.columns:
+            ema_10 = dfx['close'].ewm(span=10, adjust=False).mean()
+            ema_50 = dfx['close'].ewm(span=50, adjust=False).mean()
+            dfx['ema_ratio'] = ema_10 / (ema_50 + eps)
+
+        # =========================
+        # Tiempo / Ciclos y Sesiones
+        # =========================
+        if 'datetime' in dfx.columns:
+            # sin/cos intradía
+            minutes = dfx['datetime'].dt.hour * 60 + dfx['datetime'].dt.minute
+            dfx['minute_sin'] = np.sin(2 * np.pi * minutes / 1440.0)
+            dfx['minute_cos'] = np.cos(2 * np.pi * minutes / 1440.0)
+            # sin/cos día de la semana (0–6)
+            dow = dfx['datetime'].dt.dayofweek
+            dfx['dow_sin'] = np.sin(2 * np.pi * dow / 7.0)
+            dfx['dow_cos'] = np.cos(2 * np.pi * dow / 7.0)
+
+            # Flags de sesiones
+            # Nota: si una sesión cruza medianoche, tratamos ese caso especial
+            def _in_interval(h, m, start, end):
+                sh, sm = start;
+                eh, em = end
+                start_min = sh * 60 + sm
+                end_min = eh * 60 + em
+                t = h * 60 + m
+                if start_min <= end_min:
+                    return (t >= start_min) & (t < end_min)
+                else:
+                    # cruza medianoche
+                    return (t >= start_min) | (t < end_min)
+
+            hh = dfx['datetime'].dt.hour
+            mm = dfx['datetime'].dt.minute
+            for flag, (start, end) in session_defs.items():
+                dfx[flag] = _in_interval(hh, mm, start, end).astype(int)
+        else:
+            # Si no hay datetime, crea columnas nulas para mantener el contrato
+            dfx['minute_sin'] = 0.0;
+            dfx['minute_cos'] = 0.0
+            dfx['dow_sin'] = 0.0;
+            dfx['dow_cos'] = 0.0
+            for flag in ["session_ny_open", "session_london_open", "session_asia_open"]:
+                dfx[flag] = 0
+
+        # =========================
+        # Soportes / Resistencias (se asume ya están en df):
+        # dist_PP, dist_S1, dist_R1, dist_S2, dist_R2, dist_resist_rl, dist_support_rl
+        # más dist_*_8h_atr: distancias normalizadas por ATR (ya en tu dataset)
+        # =========================
+        dfx = add_sr_features_8h(dfx)  # ← NUEVO (8h)
+        dfx = add_stoch_extreme_features(dfx)
+        # =========================
+        # Líneas de tendencia (close)
+        # =========================
+        for w in trend_windows:
+            dfx[f"trend_slope_norm_{w}"] = (
+                dfx["close"].rolling(window=w, min_periods=w)
+                .apply(lambda a: _trend_slope_norm(a), raw=True)
+            )
+            dfx[f"trend_r2_{w}"] = (
+                dfx["close"].rolling(window=w, min_periods=w)
+                .apply(lambda a: _trend_r2(a), raw=True)
+            )
+            dfx[f"trend_dist_pct_{w}"] = (
+                dfx["close"].rolling(window=w, min_periods=w)
+                .apply(lambda a: _trend_dist_pct(a), raw=True)
+            )
+
+        # =========================
+        # Canales de tendencia (regresión sobre highs/lows en ventana)
+        # =========================
+        def _channel_feats(high_series, low_series, w):
+            # slope_high, slope_low y ancho (línea_high - línea_low) en el último punto
+            hs = high_series.rolling(window=w, min_periods=w).apply(
+                lambda a: _linreg_line(a)[0], raw=True)
+            ls = low_series.rolling(window=w, min_periods=w).apply(
+                lambda a: _linreg_line(a)[0], raw=True)
+
+            # reconstruir predicciones al último punto para estimar ancho del canal
+            def _last_line_val(s, w):
+                # devuelve y_hat en x=w-1
+                return s.rolling(window=w, min_periods=w).apply(
+                    lambda a: _linreg_line(a)[0] * (w - 1) + _linreg_line(a)[1], raw=True)
+
+            high_last = _last_line_val(high_series, w)
+            low_last = _last_line_val(low_series, w)
+            width = (high_last - low_last) / (np.abs(dfx['close']) + eps)
+
+            return hs, ls, width
+
+        ch_w = channel_window
+        ch_high_slope, ch_low_slope, ch_width = _channel_feats(dfx['high'], dfx['low'], ch_w)
+        dfx['trend_channel_slope_high'] = ch_high_slope
+        dfx['trend_channel_slope_low'] = ch_low_slope
+        dfx['trend_channel_width'] = ch_width
+
+        # =========================
+        # Patrones de velas (simples y reproducibles)
+        # =========================
+        body = (dfx['close'] - dfx['open']).abs()
+        range_ = (dfx['high'] - dfx['low']).replace(0, eps)
+        upper_wick = dfx['high'] - dfx[['close', 'open']].max(axis=1)
+        lower_wick = dfx[['close', 'open']].min(axis=1) - dfx['low']
+
+        # Doji: cuerpo pequeño relativo al rango
+        dfx['candle_doji'] = (body / range_ < 0.1).astype(int)
+
+        # Pin bar: mecha larga en un lado
+        dfx['candle_pinbar'] = (
+                ((upper_wick / range_) > 0.6) | ((lower_wick / range_) > 0.6))
+        dfx['candle_pinbar'] = dfx['candle_pinbar'].astype(int)
+
+        # Engulfing: cuerpo actual envuelve al anterior (simplificado)
+        prev_open = dfx['open'].shift(1);
+        prev_close = dfx['close'].shift(1)
+        bull_engulf = (dfx['close'] > dfx['open']) & (prev_close < prev_open) & \
+                      (dfx['close'] >= prev_open) & (dfx['open'] <= prev_close)
+        bear_engulf = (dfx['close'] < dfx['open']) & (prev_close > prev_open) & \
+                      (dfx['open'] >= prev_close) & (dfx['close'] <= prev_open)
+        dfx['candle_engulfing'] = (bull_engulf | bear_engulf).astype(int)
+
+        # =========================
+        # Confluencias (RSI + cercanía a SR)
+        # =========================
+        # "Cerca" = distancia < sr_threshold_frac * ATR
+        near_S1 = (dfx['dist_S1'].abs() < sr_threshold_frac * (dfx['ATR'] + eps))
+        near_R1 = (dfx['dist_R1'].abs() < sr_threshold_frac * (dfx['ATR'] + eps))
+        dfx['rsi14_oversold_near_support'] = ((dfx['rsi_14'] < rsi_oversold) & near_S1).astype(int)
+        dfx['rsi14_overbought_near_resist'] = ((dfx['rsi_14'] > rsi_overbought) & near_R1).astype(int)
+
+        # =========================
+        # Dummies (si existen en tu dataset)
+        # =========================
+        # trend_ema200 / trend_vwap eran categóricas; conviértelas a dummies si están
+        dummy_cols_base = ['trend_ema200']
+        for col in dummy_cols_base:
+            if col in dfx.columns and dfx[col].dtype == 'object':
+                dfx = pd.get_dummies(dfx, columns=[col])
+        # aseguremos flags esperados si quieres forzar columnas
+        for col in ['trend_ema200_up']:
+            if col not in dfx.columns:
+                dfx[col] = 0
+
+        # =========================
+        # Lags básicos de OHLC
+        # =========================
+        for lag in lags:
+            dfx[f'close_lag{lag}'] = dfx['close'].shift(lag)
+            dfx[f'high_lag{lag}'] = dfx['high'].shift(lag)
+            dfx[f'low_lag{lag}'] = dfx['low'].shift(lag)
+
+        # =========================
+        # New day features
+        # =========================
+        dfx = self.add_new_day_features(dfx)
+
+        # =========================
+        # Lista final de features
+        # =========================
+        features_price = ['close', 'high', 'low', *(f'close_lag{l}' for l in lags),
+                          *(f'high_lag{l}' for l in lags), *(f'low_lag{l}' for l in lags)]
+        features_vol = ['volume', 'avg_volume_last_n', 'volatility', 'volatility_10', 'volatility_50', 'ATR',
+                        'atr_norm']
+        features_sr = ['dist_PP', 'dist_S1', 'dist_R1', 'dist_S2', 'dist_R2', 'dist_resist_rl', 'dist_support_rl',
+                       'dist_P_8h_atr', 'dist_S1_8h_atr', 'dist_R1_8h_atr', 'dist_S2_8h_atr', 'dist_R2_8h_atr']
+        features_time = ['minute_sin', 'minute_cos', 'dow_sin', 'dow_cos',
+                         'session_ny_open', 'session_london_open', 'session_asia_open']
+        features_trend = ['ema_ratio'] + \
+                         [f"trend_slope_norm_{w}" for w in trend_windows] + \
+                         [f"trend_r2_{w}" for w in trend_windows] + \
+                         [f"trend_dist_pct_{w}" for w in trend_windows] + \
+                         ['trend_channel_slope_high', 'trend_channel_slope_low', 'trend_channel_width']
+        features_momentum = ['rsi_14', 'rsi_50', 'roc_10', 'roc_30', 'momentum_diff']
+        features_candles = ['candle_doji', 'candle_pinbar', 'candle_engulfing']
+        features_conflu = ['rsi14_oversold_near_support', 'rsi14_overbought_near_resist']
+
+        new_day_feats = ['range_prev_day_abs', 'range_prev_day_pct', 'gap_open_abs', 'gap_open_pct',
+                         'overnight_range_abs', 'overnight_range_pct']
+        if 'ATR' in dfx.columns:
+            new_day_feats += ['range_prev_day_atr', 'overnight_range_atr']
+        # Dummies si existen (no obligatorias)
+        optional_dummies = [c for c in ['trend_ema200_up'] if c in dfx.columns]
+
+        features_final = features_price + features_vol + features_sr + features_time + \
+                         features_trend + features_momentum + features_candles + features_conflu + \
+                         optional_dummies + new_day_feats
+
+        # =========================
+        # Limpieza robusta
+        # =========================
+        # Reemplaza inf/-inf por NaN en las columnas de interés y deja que tu pipeline downstream dropee NaNs
+        dfx[features_final] = dfx[features_final].replace([np.inf, -np.inf], np.nan)
+
+        print("Datos preparados para el entrenamiento")
+
+        return dfx, features_final
+
+    def add_new_day_features(self, dfx):
+
+        eps = 1e-9
+
+        # 1) Asegurar datetime y clave de día
+        if 'datetime' in dfx.columns and not pd.api.types.is_datetime64_any_dtype(dfx['datetime']):
+            dfx['datetime'] = pd.to_datetime(dfx['datetime'], errors='coerce')  # asume tz ya aplicada aguas arriba
+        dfx['__date'] = dfx['datetime'].dt.floor('D')
+        dfx['__hour'] = dfx['datetime'].dt.hour
+        dfx['__minute'] = dfx['datetime'].dt.minute
+
+        # 2) Agregados diarios (día "regular", no overnight)
+        daily = (dfx
+                 .groupby('__date', as_index=True)
+                 .agg(day_open=('open', 'first'),
+                      day_high=('high', 'max'),
+                      day_low=('low', 'min'),
+                      day_close=('close', 'last'))
+                 .sort_index())
+
+        daily['range_prev_day_abs'] = (daily['day_high'] - daily['day_low']).shift(1)
+        daily['range_prev_day_pct'] = (daily['range_prev_day_abs'] /
+                                       (daily['day_close'].shift(1).abs() + eps))
+
+        # 3) Gap de apertura (del día actual respecto al cierre del día previo)
+        daily['gap_open_abs'] = daily['day_open'] - daily['day_close'].shift(1)
+        daily['gap_open_pct'] = daily['gap_open_abs'] / (daily['day_close'].shift(1).abs() + eps)
+
+        # 4) Volatilidad Overnight (20:00–07:00 hora local)
+        #    Definimos overnight_date = el "día" al que atribuimos el tramo overnight:
+        #    - Si la barra está entre 20:00 y 23:59, overnight_date = date + 1
+        #    - Si la barra está entre 00:00 y 06:59, overnight_date = date
+        overnight_flag = (dfx['__hour'] >= 20) | (dfx['__hour'] < 7)
+        overnight_date = np.where(dfx['__hour'] >= 20,
+                                  dfx['__date'] + pd.Timedelta(days=1),
+                                  dfx['__date'])
+        dfx['__overnight_date'] = pd.to_datetime(overnight_date)
+
+        overnight = (dfx[overnight_flag]
+                     .groupby('__overnight_date', as_index=True)
+                     .agg(overnight_high=('high', 'max'),
+                          overnight_low=('low', 'min'),
+                          overnight_close=('close', 'last'))  # no se usa, pero útil si luego quieres returns
+                     .sort_index())
+
+        overnight['overnight_range_abs'] = overnight['overnight_high'] - overnight['overnight_low']
+
+        # Normalización por close del día previo para evitar escalas
+        overnight = overnight.join(daily[['day_close']].shift(1).rename(columns={'day_close': 'prev_close'}),
+                                   how='left')
+        overnight['overnight_range_pct'] = overnight['overnight_range_abs'] / (overnight['prev_close'].abs() + eps)
+
+        # 5) Unimos todo al intradía por __date (rango previo/gap) y por __overnight_date (overnight→día actual)
+        dfx = dfx.merge(daily[['range_prev_day_abs', 'range_prev_day_pct', 'gap_open_abs', 'gap_open_pct']],
+                        left_on='__date', right_index=True, how='left')
+
+        dfx = dfx.merge(overnight[['overnight_range_abs', 'overnight_range_pct']],
+                        left_on='__date', right_index=True, how='left')
+
+        # 6) (Opcional) Normalización extra por ATR si la usas como escala operativa
+        if 'ATR' in dfx.columns:
+            dfx['range_prev_day_atr'] = dfx['range_prev_day_abs'] / (dfx['ATR'] + eps)
+            dfx['overnight_range_atr'] = dfx['overnight_range_abs'] / (dfx['ATR'] + eps)
+
+        # 7) Limpieza de auxiliares
+        dfx.drop(columns=['__date', '__hour', '__minute', '__overnight_date'], errors='ignore', inplace=True)
+
+        # 8) Añade estos nombres a tu lista de features
+        new_day_feats = ['range_prev_day_abs', 'range_prev_day_pct', 'gap_open_abs', 'gap_open_pct',
+                         'overnight_range_abs', 'overnight_range_pct']
+        if 'ATR' in dfx.columns:
+            new_day_feats += ['range_prev_day_atr', 'overnight_range_atr']
+
+        # Asegura reemplazo de infs/NaNs
+        for c in new_day_feats:
+            if c not in dfx.columns:
+                dfx[c] = np.nan
+        dfx[new_day_feats] = dfx[new_day_feats].replace([np.inf, -np.inf], np.nan)
+
+        return dfx
 
     def _apply_thresholds(self,
                           proba_row,
@@ -5302,13 +5981,12 @@ class StochasticAnalyzer:
         return u_strong, self.threshold_policy_["strong"], u_soft, self.threshold_policy_["soft"], dfb
 
 
-
-
 class LabeledCalibratedModel:
     """
     Envuelve un CalibratedClassifierCV entrenado con y numérico (0..K-1)
     y expone predict/predict_proba con clases en texto.
     """
+
     def __init__(self, calibrated_model, label_encoder: LabelEncoder):
         self._calib = calibrated_model
         self.le = label_encoder
@@ -5327,8 +6005,6 @@ class LabeledCalibratedModel:
     @property
     def base_estimator(self):
         return self._calib.base_estimator
-
-
 
 
 def is_allowed_time():
@@ -5372,11 +6048,26 @@ if __name__ == "__main__":
             end_date=end_date,
             interval="5"
         )
+        # Guardar resultados
+        # results_df = analyzer.save_results("avax_stochastic_analysis_cached.csv")
+
+        # # # #
+        # RF model production mode
         #
-        # # simulacion
+        analyzer.create_predictive_model(model_type="rf", calibrate_method="isotonic", N_KEEP=55000,
+                                         display_graphic=True,
+                                         model_kwargs={
+                                             "n_estimators": 700,
+                                             "max_features": "sqrt",
+                                             "n_jobs": -1,
+                                             "random_state": 42
+                                         })
+
+        analyzer.monitor_predictions()
+
+        #=====================TESTING======================#
+        # ==================== simulator
         # df = analyzer.data
-        # #
-        # #
         # def logger(event, payload):
         #     if event == "progress":
         #         print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
@@ -5384,59 +6075,61 @@ if __name__ == "__main__":
         #     elif event == "open":
         #         print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
         #               f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
-        #               f"proba={payload['prob'] * 100:.1f} | "
-        #               f"margin={payload['margin']:.2f} | ")
+        #               f"proba={payload['prob'] * 100:.1f} ")
         #     elif event == "close":
         #         dur = payload.get("duration")
         #         print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
-        #               f"PnL={payload['pnl']:.2f} | fees={payload['fees']:.2f} | "
+        #               f"PnL={payload['pnl']:.2f} | "
         #               f"equity={payload['equity']:.2f} | "
         #               f"in={payload['entry_time']} out={payload['time']} "
         #               f"dur={dur}")
-        #
+        #     elif event == "early_opposite":
+        #         print(
+        #             f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
+        #             f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
+        #             f"| in={payload['entry_time']} out={payload['time']} "
+        #             f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
+        #         )
         # sim = TradeSimulator(
         #     analyzer,
         #     df,
         #     initial_equity=2000,
-        #     leverage=19,
+        #     leverage=50,
         #     risk_fraction=0.02,
         #     on_event=logger,  # <— activar callback
         #     verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
         #     log_every_bars=250,
-        #     proba_threshold_day=0.84,
-        #     proba_threshold_night=0.85,
-        #     n_keep_for_fit=70000,
-        #     atr_mult_tp=4,
-        #     atr_mult_sl=3.1,
+        #     proba_threshold_day=0.68,
+        #     proba_threshold_night=0.68,
+        #     n_keep_for_fit=55000,
+        #     atr_mult_tp=3.8,
+        #     atr_mult_sl=3,
         #     retrain_each_bar=False,
         #     retrain_every_bars=2880,
-        #     min_margin=0.03,
-        #     suppress_fit_stdout=False
+        #     suppress_fit_stdout=False,
+        #     early_exit_threshold=0.65
         # )
-        #
-        # results = sim.run(test_start="2025-08-01", test_end="2025-08-16")
+        # #
+        # results = sim.run(test_start="2025-08-21", test_end="2025-08-24")
         # print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
 
-        #     # Guardar resultados
-        # results_df = analyzer.save_results("avax_stochastic_analysis_cached.csv")
-
+        #  =========== get_best_calibration_model
         # analyzer.get_best_calibration_model(display_graphic=True)
 
-        #
-        analyzer.create_predictive_model(display_graphic=True, model_type="xgb", calibrate_method="sigmoid",  N_KEEP=70000,
-                                              model_kwargs={
-                                                  "n_estimators": 700,
-                                                  "learning_rate": 0.05,
-                                                  "subsample": 0.9,
-                                                  "colsample_bytree": 0.9,
-                                                  "max_depth": 8,
-                                                  "random_state": 42,
-                                                  "n_jobs": 6,
-                                                  "tree_method": "hist",
-                                                  "objective": "multi:softprob"
-                                              })
+        # =============best dataset size:
+        # df_results = analyzer.sweep_nkeep(
+        #     start=20_000,
+        #     stop=70_000,
+        #     step=1_000,
+        #     model_type="rf",
+        #     model_kwargs={"n_estimators": 700, "max_features": "sqrt", "random_state": 42, "n_jobs": -1},
+        #     calibrate_method="isotonic",
+        #     export_csv_path="sweep_nkeep_isotonic_rf.csv",
+        #     sort_by="logloss"  # alternativas: 'logloss', 'brier', 'ece', 'macro_f1'
+        # )
+        # print(df_results.head(10))
 
-        analyzer.monitor_predictions()
+        # ==============Deprecated
         # while True:
         #     now = datetime.now()
         #     if (now.hour == RESTART_HOUR_1) and now.minute == 0:
