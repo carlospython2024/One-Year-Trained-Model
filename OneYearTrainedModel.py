@@ -730,13 +730,13 @@ class TradeSimulator:
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 # # RF con beta
-                # self.analyzer.create_predictive_model(model_type="rf", calibrate_method="beta",
-                #                                       model_kwargs={
-                #                                           "n_estimators":700,
-                #                                           "max_features":"sqrt",
-                #                                           "n_jobs":-1,
-                #                                           "random_state":42
-                #                                       })
+                self.analyzer.create_predictive_model(model_type="rf", calibrate_method="beta",
+                                                      model_kwargs={
+                                                          "n_estimators":700,
+                                                          "max_features":"sqrt",
+                                                          "n_jobs":-1,
+                                                          "random_state":42
+                                                      })
                 #
                 # # LGBM con beta
                 # self.analyzer.create_predictive_model(model_type="lgbm", calibrate_method="sigmoid",
@@ -762,26 +762,26 @@ class TradeSimulator:
                 #                                           "tree_method": "hist",
                 #                                           "objective": "multi:softprob"
                 #                                       })
-                self.analyzer.create_predictive_model(model_type="xgb", calibrate_method="beta", N_KEEP=N_KEEP,
-                                                      model_kwargs={
-                                                          "n_estimators": 700,
-                                                          "learning_rate": 0.05,
-                                                          "subsample": 0.9,
-                                                          "colsample_bytree": 0.9,
-                                                          "max_depth": 8,
-                                                          "random_state": 42,
-                                                          "n_jobs": -1,
-                                                          "tree_method": "hist",
-                                                          "objective": "multi:softprob"
-                                                      })
+                # self.analyzer.create_predictive_model(model_type="xgb", calibrate_method="beta", N_KEEP=N_KEEP,
+                #                                       model_kwargs={
+                #                                           "n_estimators": 700,
+                #                                           "learning_rate": 0.05,
+                #                                           "subsample": 0.9,
+                #                                           "colsample_bytree": 0.9,
+                #                                           "max_depth": 8,
+                #                                           "random_state": 42,
+                #                                           "n_jobs": -1,
+                #                                           "tree_method": "hist",
+                #                                           "objective": "multi:softprob"
+                #                                       })
         else:
 
             # # RF con beta # isotonic, sigmoid, beta
-            self.analyzer.create_predictive_model(model_type="rf", calibrate_method="isotonic", N_KEEP=N_KEEP,
+            self.analyzer.create_predictive_model(model_type="rf", calibrate_method="beta", N_KEEP=N_KEEP,
                                                   model_kwargs={
                                                       "n_estimators": 700,
                                                       "max_features": "sqrt",
-                                                      "n_jobs": 4,
+                                                      "n_jobs": -1,
                                                       "random_state": 42
                                                   })
             #
@@ -3904,7 +3904,7 @@ class StochasticAnalyzer:
 
         # Entrena RF base una sola vez (prefit)
         base_model = RandomForestClassifier(
-            n_estimators=900, max_features="sqrt", n_jobs=8, random_state=42
+            n_estimators=700, max_features="sqrt", n_jobs=-1, random_state=42
         )
         base_model.fit(X_tr, y_tr)
 
@@ -4750,7 +4750,7 @@ class StochasticAnalyzer:
                     # Se envia a la cuenta real y demo
                     try:
                         response = requests.post(
-                            "http://52.67.38.220:80/webhook",
+                            "http://52.67.38.220:80/hook-demo",
                             json=payload,
                             timeout=10
                         )
@@ -6054,80 +6054,82 @@ if __name__ == "__main__":
         # # # #
         # RF model production mode
         #
-        analyzer.create_predictive_model(model_type="rf", calibrate_method="isotonic", N_KEEP=55000,
-                                         display_graphic=True,
-                                         model_kwargs={
-                                             "n_estimators": 700,
-                                             "max_features": "sqrt",
-                                             "n_jobs": -1,
-                                             "random_state": 42
-                                         })
-
-        analyzer.monitor_predictions()
+        # analyzer.create_predictive_model(model_type="rf", calibrate_method="isotonic", N_KEEP=70000,
+        #                                  display_graphic=True,
+        #                                  model_kwargs={
+        #                                      "n_estimators": 700,
+        #                                      "max_features": "sqrt",
+        #                                      "n_jobs": -1,
+        #                                      "random_state": 42
+        #                                  })
+        #
+        # analyzer.monitor_predictions()
 
         #=====================TESTING======================#
-        # ==================== simulator
-        # df = analyzer.data
-        # def logger(event, payload):
-        #     if event == "progress":
-        #         print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
-        #               f"equity={payload['equity']:.2f} | trades={payload['trades']}")
-        #     elif event == "open":
-        #         print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
-        #               f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
-        #               f"proba={payload['prob'] * 100:.1f} ")
-        #     elif event == "close":
-        #         dur = payload.get("duration")
-        #         print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
-        #               f"PnL={payload['pnl']:.2f} | "
-        #               f"equity={payload['equity']:.2f} | "
-        #               f"in={payload['entry_time']} out={payload['time']} "
-        #               f"dur={dur}")
-        #     elif event == "early_opposite":
-        #         print(
-        #             f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
-        #             f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
-        #             f"| in={payload['entry_time']} out={payload['time']} "
-        #             f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
-        #         )
-        # sim = TradeSimulator(
-        #     analyzer,
-        #     df,
-        #     initial_equity=2000,
-        #     leverage=50,
-        #     risk_fraction=0.02,
-        #     on_event=logger,  # <— activar callback
-        #     verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
-        #     log_every_bars=250,
-        #     proba_threshold_day=0.68,
-        #     proba_threshold_night=0.68,
-        #     n_keep_for_fit=55000,
-        #     atr_mult_tp=3.8,
-        #     atr_mult_sl=3,
-        #     retrain_each_bar=False,
-        #     retrain_every_bars=2880,
-        #     suppress_fit_stdout=False,
-        #     early_exit_threshold=0.65
-        # )
-        # #
-        # results = sim.run(test_start="2025-08-21", test_end="2025-08-24")
-        # print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
 
-        #  =========== get_best_calibration_model
+        # ==================== simulator
+        df = analyzer.data
+        def logger(event, payload):
+            if event == "progress":
+                print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
+                      f"equity={payload['equity']:.2f} | trades={payload['trades']}")
+            elif event == "open":
+                print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
+                      f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
+                      f"proba={payload['prob'] * 100:.1f} ")
+            elif event == "close":
+                dur = payload.get("duration")
+                print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
+                      f"PnL={payload['pnl']:.2f} | "
+                      f"equity={payload['equity']:.2f} | "
+                      f"in={payload['entry_time']} out={payload['time']} "
+                      f"dur={dur}")
+            elif event == "early_opposite":
+                print(
+                    f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
+                    f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
+                    f"| in={payload['entry_time']} out={payload['time']} "
+                    f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
+                )
+        sim = TradeSimulator(
+            analyzer,
+            df,
+            initial_equity=2000,
+            leverage=50,
+            risk_fraction=0.02,
+            on_event=logger,  # <— activar callback
+            verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
+            log_every_bars=250,
+            proba_threshold_day=0.68,
+            proba_threshold_night=0.68,
+            n_keep_for_fit=68600,
+            atr_mult_tp=4.5,
+            atr_mult_sl=3,
+            retrain_each_bar=False,
+            retrain_every_bars=2880,
+            suppress_fit_stdout=False,
+            early_exit_threshold=0.65
+        )
+        #
+        results = sim.run(test_start="2025-08-20", test_end="2025-08-25")
+        print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
+
+        # # =========== get_best_calibration_model
         # analyzer.get_best_calibration_model(display_graphic=True)
 
         # =============best dataset size:
         # df_results = analyzer.sweep_nkeep(
-        #     start=20_000,
-        #     stop=70_000,
-        #     step=1_000,
+        #     start=65_000,
+        #     stop=75_000,
+        #     step=200,
         #     model_type="rf",
         #     model_kwargs={"n_estimators": 700, "max_features": "sqrt", "random_state": 42, "n_jobs": -1},
-        #     calibrate_method="isotonic",
-        #     export_csv_path="sweep_nkeep_isotonic_rf.csv",
+        #     calibrate_method="beta",
+        #     export_csv_path="bestDataset_65k-75k_beta.csv",
         #     sort_by="logloss"  # alternativas: 'logloss', 'brier', 'ece', 'macro_f1'
         # )
         # print(df_results.head(10))
+
 
         # ==============Deprecated
         # while True:
@@ -6157,3 +6159,7 @@ if __name__ == "__main__":
         #     time.sleep(60)
     else:
         print(f"El archivo {filename} no existe")
+
+# @todo probar calibracion beta,
+# @todo probar simulacion cambiando la restriccion de ema 15,
+# @todo hacer correccion de early opposite en start order
