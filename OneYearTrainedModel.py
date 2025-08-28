@@ -4609,8 +4609,8 @@ class StochasticAnalyzer:
                     kelly_fraction = max(0.0, min(p - (q / reward_risk), 0.95))
 
                 # Gate sólo si es elegible
-                self.umbral_strong = 0.72
-                self.umbral_soft = 0.68
+                self.umbral_strong = 0.68
+                self.umbral_soft = 0.72
 
                 gate = None
                 if eligible:
@@ -4645,18 +4645,22 @@ class StochasticAnalyzer:
                             if (side_position != side_prediction) and proba_pred >= 0.65:
                                 counter_side = "short"
                                 if side_position == "long" and close_price > entry_price:
-                                    if pred == "lateral" and proba_pred >= 0.85:
+                                    if pred == "lateral" and proba_pred >= 0.7:
+                                        print("lateral counter")
                                         self.close_order(counter_side)
                                         self.check_and_close_from_market(symbol, resultado.get("raw_df"))
                                     elif pred == "short":
+                                        print("short counter")
                                         self.close_order(counter_side)
                                         self.check_and_close_from_market(symbol, resultado.get("raw_df"))
                                 elif side_position == "short" and close_price < entry_price:
                                     counter_side = "long"
-                                    if pred == "lateral" and proba_pred >= 0.85:
+                                    if pred == "lateral" and proba_pred >= 0.7:
+                                        print("lateral counter")
                                         self.close_order(counter_side)
                                         self.check_and_close_from_market(symbol, resultado.get("raw_df"))
                                     elif pred == "long":
+                                        print("long counter")
                                         self.close_order(counter_side)
                                         self.check_and_close_from_market(symbol, resultado.get("raw_df"))
                         else:
@@ -4672,7 +4676,7 @@ class StochasticAnalyzer:
                     print(probs)
 
                     # Re-entrada solo si sube a strong y sigue elegible
-                    if eligible and self.umbral_strong <= proba_pred < 0.88:
+                    if eligible and proba_pred >= self.umbral_strong:
                         if self.tradelogger.has_open_position(symbol):
                             self.tradelogger.log_info(note="Señal ignorada: ya hay posición abierta",
                                                       symbol=symbol, side=side_prediction, trade_id=trade_id)
@@ -4721,7 +4725,7 @@ class StochasticAnalyzer:
                 ganancia = abs(take_profit - close_price)
                 perdida = abs(stop_loss - close_price)
                 reward_risk = ganancia / perdida if perdida != 0 else 0.0001  # protección para no dividir por 0
-                p = proba - 0.2 if proba >= 0.8 else proba
+                p = proba
                 q = 1 - p
                 kelly_fraction = p - (q / reward_risk)
                 # Limitar valores extremos
@@ -4750,7 +4754,7 @@ class StochasticAnalyzer:
                     # Se envia a la cuenta real y demo
                     try:
                         response = requests.post(
-                            "http://52.67.38.220:80/hook-demo",
+                            "http://52.67.38.220:80/webhook",
                             json=payload,
                             timeout=10
                         )
@@ -6054,7 +6058,7 @@ if __name__ == "__main__":
         # # # #
         # RF model production mode
         #
-        # analyzer.create_predictive_model(model_type="rf", calibrate_method="isotonic", N_KEEP=70000,
+        # analyzer.create_predictive_model(model_type="rf", calibrate_method="beta", N_KEEP=68600,
         #                                  display_graphic=True,
         #                                  model_kwargs={
         #                                      "n_estimators": 700,
@@ -6095,7 +6099,7 @@ if __name__ == "__main__":
             analyzer,
             df,
             initial_equity=2000,
-            leverage=50,
+            leverage=100,
             risk_fraction=0.02,
             on_event=logger,  # <— activar callback
             verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
@@ -6103,7 +6107,7 @@ if __name__ == "__main__":
             proba_threshold_day=0.68,
             proba_threshold_night=0.68,
             n_keep_for_fit=68600,
-            atr_mult_tp=4.5,
+            atr_mult_tp=4,
             atr_mult_sl=3,
             retrain_each_bar=False,
             retrain_every_bars=2880,
@@ -6111,7 +6115,7 @@ if __name__ == "__main__":
             early_exit_threshold=0.65
         )
         #
-        results = sim.run(test_start="2025-08-20", test_end="2025-08-25")
+        results = sim.run(test_start="2025-01-01", test_end="2025-01-03")
         print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
 
         # # =========== get_best_calibration_model
