@@ -4610,7 +4610,7 @@ class StochasticAnalyzer:
 
                 # Gate sólo si es elegible
                 self.umbral_strong = 0.72
-                self.umbral_soft = 0.68
+                self.umbral_soft = 0.7
 
                 gate = None
                 if eligible:
@@ -4672,7 +4672,7 @@ class StochasticAnalyzer:
                     print(probs)
 
                     # Re-entrada solo si sube a strong y sigue elegible
-                    if eligible and self.umbral_strong <= proba_pred < 0.88:
+                    if eligible and self.umbral_strong <= proba_pred:
                         if self.tradelogger.has_open_position(symbol):
                             self.tradelogger.log_info(note="Señal ignorada: ya hay posición abierta",
                                                       symbol=symbol, side=side_prediction, trade_id=trade_id)
@@ -4721,7 +4721,7 @@ class StochasticAnalyzer:
                 ganancia = abs(take_profit - close_price)
                 perdida = abs(stop_loss - close_price)
                 reward_risk = ganancia / perdida if perdida != 0 else 0.0001  # protección para no dividir por 0
-                p = proba - 0.2 if proba >= 0.8 else proba
+                p = proba
                 q = 1 - p
                 kelly_fraction = p - (q / reward_risk)
                 # Limitar valores extremos
