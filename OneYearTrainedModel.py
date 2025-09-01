@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dotenv import load_dotenv
 import pandas as pd
+from numpy.f2py.crackfortran import verbose
 from pandas.api.types import is_datetime64_any_dtype
 import numpy as np
 import matplotlib.pyplot as plt
@@ -1298,7 +1299,9 @@ class TradeSimulator:
             })
         trades_df = pd.DataFrame(trades_rows)
 
-        metrics, trades_df = self._summarize_backtest(trades_df)
+        # metrics, trades_df = self._summarize_backtest(trades_df)
+
+        metrics, trades_df = self._summarize_backtest(trades_df, equity_curve=None, initial_equity=self.equity)
 
         if self.verbose >= 1:
             print("\n=== Resumen Backtest ===")
@@ -1355,26 +1358,20 @@ class TradeSimulator:
         ordered = dict(sorted(summ.items(), key=lambda kv: kv[1]["wins"], reverse=True))
         return ordered
 
-    def _summarize_backtest(self, trades_df: pd.DataFrame, equity_curve: Optional[pd.Series] = None):
+    def _summarize_backtest(self,
+                            trades_df: pd.DataFrame,
+                            equity_curve: Optional[pd.Series] = None,
+                            initial_equity: Optional[float] = None,
+                            auto_build_equity: bool = True,
+                            build_r_multiple: bool = True):
         df = trades_df.copy()
 
-        # Resultado si no existe
-        if 'result' not in df.columns:
-            if 'exit_reason' in df.columns:
-                reason = df['exit_reason'].astype(str).str.lower()
-                # Cuenta 'tp' y 'early_opposite' como 'win'; 'sl' como 'loss'
-                df['result'] = np.select(
-                    [reason.eq('tp'),
-                     reason.eq('early_opposite'),
-                     reason.eq('sl')],
-                    ['win', 'win', 'loss'],
-                    default=np.where(df.get('pnl', 0) == 0, 'breakeven', 'other')
-                )
-            else:
-                df['result'] = np.where(df.get('pnl', 0) > 0, 'win',
-                                        np.where(df.get('pnl', 0) < 0, 'loss', 'breakeven'))
+        # --- Tiempos
+        if {'entry_time', 'exit_time'}.issubset(df.columns):
+            df['entry_time'] = pd.to_datetime(df['entry_time'])
+            df['exit_time'] = pd.to_datetime(df['exit_time'])
 
-        # Inferir PnL neto si no existe
+        # --- PnL bruto si falta
         if 'pnl' not in df.columns and {'entry_price', 'exit_price', 'qty', 'side'}.issubset(df.columns):
             side = df['side'].str.lower()
             pnl_raw = np.where(side.isin(['short', 'bearish']),
@@ -1382,17 +1379,37 @@ class TradeSimulator:
                                (df['exit_price'] - df['entry_price']) * df['qty'])
             df['pnl'] = pnl_raw
 
-        if 'fees' in df.columns:
-            df['pnl_net'] = df['pnl'] - df['fees']
-        else:
-            df['pnl_net'] = df['pnl']
+        # --- PnL neto
+        df['pnl_net'] = df['pnl'] - df['fees'] if 'fees' in df.columns else df['pnl']
 
-        # Duraciones
+        # --- r-multiple (si no existe y hay SL)
+        if build_r_multiple and 'r_multiple' not in df.columns:
+            if {'entry_price', 'sl_price', 'qty'}.issubset(df.columns):
+                risk = (df['entry_price'] - df['sl_price']).abs() * df['qty']
+                risk = risk.replace(0, np.nan)
+                df['r_multiple'] = df['pnl_net'] / risk
+
+        # --- Clasificación de resultado (usa exit_reason + pnl_net)
+        if 'exit_reason' in df.columns:
+            reason = df['exit_reason'].astype(str).str.lower()
+            df['result'] = np.select(
+                [reason.eq('tp'),
+                 reason.eq('early_opposite'),
+                 reason.eq('sl')],
+                ['win', 'win', 'loss'],
+                default=np.where(df['pnl_net'] > 0, 'win',
+                                 np.where(df['pnl_net'] < 0, 'loss', 'breakeven'))
+            )
+        else:
+            df['result'] = np.where(df['pnl_net'] > 0, 'win',
+                                    np.where(df['pnl_net'] < 0, 'loss', 'breakeven'))
+
+        # --- Duración
         if {'entry_time', 'exit_time'}.issubset(df.columns):
-            dur = (pd.to_datetime(df['exit_time']) - pd.to_datetime(df['entry_time'])).dt.total_seconds()
+            dur = (df['exit_time'] - df['entry_time']).dt.total_seconds()
             df['hold_minutes'] = dur / 60.0
 
-        # Conteos
+        # --- Conteos
         n_trades = len(df)
         n_closed = int((~df['pnl_net'].isna()).sum())
         wins = int((df['result'] == 'win').sum())
@@ -1400,12 +1417,12 @@ class TradeSimulator:
         breakeven = int((df['result'] == 'breakeven').sum())
         winrate = wins / n_closed if n_closed > 0 else np.nan
 
-        # Rachas
+        # --- Rachas
         def _streak(series, target):
             best = cur = 0
             for x in series:
                 if x == target:
-                    cur += 1
+                    cur += 1;
                     best = max(best, cur)
                 else:
                     cur = 0
@@ -1414,39 +1431,44 @@ class TradeSimulator:
         max_consec_wins = _streak(df['result'].tolist(), 'win')
         max_consec_losses = _streak(df['result'].tolist(), 'loss')
 
-        # PnL stats
+        # --- PnL stats
         gross_profit = df.loc[df['pnl_net'] > 0, 'pnl_net'].sum()
         gross_loss = -df.loc[df['pnl_net'] < 0, 'pnl_net'].sum()  # positivo
         net_profit = gross_profit - gross_loss
         avg_win = df.loc[df['pnl_net'] > 0, 'pnl_net'].mean()
         avg_loss = df.loc[df['pnl_net'] < 0, 'pnl_net'].mean()  # negativo
         payoff_ratio = (avg_win / abs(avg_loss)) if (
-                pd.notna(avg_win) and pd.notna(avg_loss) and avg_loss != 0) else np.nan
+                    pd.notna(avg_win) and pd.notna(avg_loss) and avg_loss != 0) else np.nan
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (np.inf if gross_profit > 0 else np.nan)
         expectancy_val = net_profit / n_closed if n_closed > 0 else np.nan
 
-        # SQN (si tienes r_multiple)
+        # --- SQN (si ya calculamos r_multiple arriba)
         if 'r_multiple' in df.columns and df['r_multiple'].notna().any():
             exp_R = float(df['r_multiple'].mean(skipna=True))
             std_R = float(df['r_multiple'].std(skipna=True))
             sqn = (exp_R / (std_R + 1e-12)) * np.sqrt(max(n_closed, 1))
         else:
-            exp_R, std_R, sqn = np.nan, np.nan, np.nan
+            exp_R = std_R = sqn = np.nan
 
-        # Curva de equity (opcional)
-        def _max_drawdown(series):
+        # --- Equity curve / MDD
+        def _max_drawdown(series: pd.Series):
             if series is None or len(series) == 0:
                 return np.nan
-            s = series.values.astype(float)
+            s = series.astype(float).values
             peak = np.maximum.accumulate(s)
             dd = (s - peak) / (peak + 1e-12)
             return float(dd.min())  # negativo
 
+        mdd = np.nan
         if equity_curve is not None:
             eq = equity_curve.dropna()
             mdd = _max_drawdown(eq)
-        else:
-            mdd = np.nan
+        elif auto_build_equity and initial_equity is not None and 'exit_time' in df.columns:
+            # reconstruir equity con los cierres en orden temporal
+            tmp = df.sort_values('exit_time')
+            eq = initial_equity + tmp['pnl_net'].cumsum()
+            eq.index = tmp['exit_time']
+            mdd = _max_drawdown(eq)
 
         summary = {
             "trades": int(n_trades),
@@ -5555,9 +5577,6 @@ class StochasticAnalyzer:
         # =========================
         # Reemplaza inf/-inf por NaN en las columnas de interés y deja que tu pipeline downstream dropee NaNs
         dfx[features_final] = dfx[features_final].replace([np.inf, -np.inf], np.nan)
-
-        print("Datos preparados para el entrenamiento")
-
         return dfx, features_final
 
     def add_new_day_features(self, dfx):
