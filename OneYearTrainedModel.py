@@ -1181,23 +1181,34 @@ class TradeSimulator:
                 if not sig:
                     continue
                 pred = sig.get("prediction")
+                probs = sig.get("probabilities") or {}
                 proba = self._extract_proba_for_monitor(sig)
                 if pred not in {"bullish", "bearish"}:
                     continue
                 ts = self.df.loc[i, "datetime"]
-                # current_e100 = self.df.loc[i, "e100"]
-                # is_near_sup8h = self.df.loc[i, "near_sup_8h"]
                 if not self._passes_monitor(ts, proba):
                     continue
 
                 px = float(self.df.loc[i, "close"])  # entrada al cierre de i
+                side = "long" if pred == "bullish" else "short"
+
+                # TP/SL concretos de esta señal
+                tp, sl = self._tp_sl_from_adapter_or_atr(
+                    i, side,
+                    sig.get("take_profit") or sig.get("tp"),
+                    sig.get("stop_loss") or sig.get("sl")
+                )
+
+                # ★ Kelly: si la señal no trae kelly_fraction, lo calculamos aquí
                 kelly = sig.get("kelly_fraction")
+                if (kelly is None):
+                    kelly = self._kelly_from_signal(probs, side, px, float(tp), float(sl))
+
+                # Sizing con Kelly (si kelly es None, _size_position usa 1.0 por defecto)
                 qty = self._size_position(px, kelly)
                 if qty <= 0:
                     continue
-                side = "long" if pred == "bullish" else "short"
-                tp, sl = self._tp_sl_from_adapter_or_atr(i, side, sig.get("take_profit") or sig.get("tp"),
-                                                         sig.get("stop_loss") or sig.get("sl"))
+
                 current_trade = Trade(
                     side=side,
                     entry_time=ts,
@@ -1211,17 +1222,23 @@ class TradeSimulator:
                     entry_proba=proba,
                     entry_pred=pred,
                 )
+
                 # comisión de entrada
                 entry_fee = px * qty * (
                     self.fees.taker_open if current_trade.opened_with == "taker" else self.fees.maker_open)
                 self.equity -= entry_fee
-                # Evento de apertura y log
+
+                # Log / evento (incluye Kelly)
                 if self.on_event:
-                    self.on_event("open", {"time": ts, "side": side, "price": px, "tp": float(tp), "sl": float(sl),
-                                           "qty": float(qty), "prob": proba})
+                    self.on_event("open", {
+                        "time": ts, "side": side, "price": px,
+                        "tp": float(tp), "sl": float(sl),
+                        "qty": float(qty), "prob": proba,
+                        "kelly": float(kelly) if kelly is not None else None
+                    })
                 if self.verbose >= 2:
-                    print(
-                        f"OPEN  {side} @ {px:.4f} | tp={tp:.4f} sl={sl:.4f} | qty={qty:.4f} | proba={proba * 100:.1f}")
+                    print(f"OPEN  {side} @ {px:.4f} | tp={tp:.4f} sl={sl:.4f} | qty={qty:.4f} "
+                          f"| prob={proba * 100:.1f} | kelly={kelly if kelly is not None else 1.0:.3f}")
 
             # Avanzar para cierre, pero no más allá de `test_end` si se pidió
             j_limit = last_allowed_index if self.close_trades_at_test_end else len(self.df) - 1
@@ -1319,6 +1336,43 @@ class TradeSimulator:
             "proba_summary": proba_summary,
             "metrics": metrics
         }
+
+    def _kelly_from_signal(self,
+                           probs: dict,
+                           side: str,
+                           entry: float,
+                           tp: float,
+                           sl: float,
+                           rr_min: float = 1e-6,
+                           rr_max: float = 100.0) -> Optional[float]:
+        """
+        Calcula kelly usando p (proba direccional) y b = reward/risk desde TP/SL reales.
+        side: 'long' o 'short'.
+        probs: dict con claves 'bullish'/'bearish' (calibradas).
+        """
+        if probs is None:
+            return None
+
+        if side == "long":
+            p = probs.get("bullish", None)
+            reward = max(tp - entry, 1e-12)
+            risk = max(entry - sl, 1e-12)
+        else:  # short
+            p = probs.get("bearish", None)
+            reward = max(entry - tp, 1e-12)
+            risk = max(sl - entry, 1e-12)
+
+        if p is None:
+            return None
+
+        # Sanitiza y limita
+        p = float(p)
+        p = min(max(p, 1e-3), 1 - 1e-3)
+        rr = reward / risk
+        rr = min(max(rr, rr_min), rr_max)
+
+        k = p - (1.0 - p) / rr  # Kelly clásica
+        return float(k)
 
     def _bucketize_proba(self, p: Optional[float], step: int = 10) -> Optional[int]:
         """Convierte p (0..1) a un bucket de porcentaje (0..100) según step (10 -> 0,10,20,...)."""
@@ -6112,7 +6166,8 @@ if __name__ == "__main__":
             elif event == "open":
                 print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
                       f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
-                      f"proba={payload['prob'] * 100:.1f} ")
+                      f"proba={payload['prob'] * 100:.1f} | "
+                      f"kelly={payload['kelly'] if payload['kelly'] is not None else 1.0:.3f}")
             elif event == "close":
                 dur = payload.get("duration")
                 print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
@@ -6147,7 +6202,7 @@ if __name__ == "__main__":
             early_exit_threshold=0.8
         )
         #
-        results = sim.run(test_start="2025-08-29", test_end="2025-08-31")
+        results = sim.run(test_start="2025-08-01", test_end="2025-09-01")
         print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
 
         # # =========== get_best_calibration_model
