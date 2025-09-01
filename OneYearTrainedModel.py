@@ -882,12 +882,12 @@ class TradeSimulator:
             pred_class = classes[best_idx]
 
         # filtro de “fake” señales como en tu predict_realtime
-        ema_15 = float(last_meta.get("EMA_15", np.nan))
+        ema_15 = float(last_meta.get("EMA_10", np.nan))
         close_px = float(last_meta["close"])
         pred = pred_class
-        if pred_class == 'bullish' and (not np.isnan(ema_15)) and close_px < ema_15:
+        if pred_class == 'bullish' and (not np.isnan(ema_15)) and close_px < ema_15  and probabilities.get('bullish', 0) < 0.80:
             pred = 'lateral'
-        elif pred_class == 'bearish' and (not np.isnan(ema_15)) and close_px > ema_15:
+        elif pred_class == 'bearish' and (not np.isnan(ema_15)) and close_px > ema_15  and probabilities.get('bearish', 0) < 0.80:
             pred = 'lateral'
 
         return {
@@ -4405,13 +4405,13 @@ class StochasticAnalyzer:
 
         # 7) Filtro de “fake” señales con EMA_10 (mantengo tu lógica original)
         close = float(last_meta['close'])
-        ema_15 = float(last_meta['EMA_15'])
+        ema_15 = float(last_meta['EMA_10'])
 
         pred = pred_class
-        if pred_class == 'bullish' and close < ema_15:
+        if pred_class == 'bullish' and close < ema_15 and probabilities.get('bullish') < 0.8:
             print(f"Fake bullish (cierre < EMA10 y prob<0.84): {probabilities.get('bullish')}")
             pred = 'lateral'
-        elif pred_class == 'bearish' and close > ema_15:
+        elif pred_class == 'bearish' and close > ema_15 and probabilities.get('bearish') < 0.8:
             print(f"Fake bearish (cierre > EMA10 y prob<0.84): {probabilities.get('bearish')}")
             pred = 'lateral'
 
@@ -6122,75 +6122,75 @@ if __name__ == "__main__":
         # # # #
         # RF model production mode
         #
-        # analyzer.create_predictive_model(model_type="rf", calibrate_method="beta", N_KEEP=68950,
-        #                                  display_graphic=True,
-        #                                  model_kwargs={
-        #                                      "n_estimators": 700,
-        #                                      "max_features": "sqrt",
-        #                                      "n_jobs": -1,
-        #                                      "random_state": 42
-        #                                  })
-        #
-        # analyzer.monitor_predictions()
+        analyzer.create_predictive_model(model_type="rf", calibrate_method="beta", N_KEEP=68880,
+                                         display_graphic=True,
+                                         model_kwargs={
+                                             "n_estimators": 700,
+                                             "max_features": "sqrt",
+                                             "n_jobs": -1,
+                                             "random_state": 42
+                                         })
+
+        analyzer.monitor_predictions()
 
         #=====================TESTING======================#
 
         # ==================== simulator
-        df = analyzer.data
-        def logger(event, payload):
-            if event == "progress":
-                print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
-                      f"equity={payload['equity']:.2f} | trades={payload['trades']}")
-            elif event == "open":
-                print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
-                      f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
-                      f"proba={payload['prob'] * 100:.1f} | "
-                      f"kelly={payload['kelly'] if payload['kelly'] is not None else 1.0:.3f}")
-            elif event == "close":
-                dur = payload.get("duration")
-                print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
-                      f"PnL={payload['pnl']:.2f} | "
-                      f"equity={payload['equity']:.2f} | "
-                      f"in={payload['entry_time']} out={payload['time']} "
-                      f"dur={dur}")
-            elif event == "early_opposite":
-                print(
-                    f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
-                    f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
-                    f"| in={payload['entry_time']} out={payload['time']} "
-                    f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
-                )
-        sim = TradeSimulator(
-            analyzer,
-            df,
-            initial_equity=2000,
-            leverage=50,
-            risk_fraction=0.02,
-            on_event=logger,  # <— activar callback
-            verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
-            log_every_bars=250,
-            proba_threshold_day=0.7,
-            proba_threshold_night=0.72,
-            n_keep_for_fit=68950,
-            atr_mult_tp=4,
-            atr_mult_sl=3,
-            retrain_each_bar=False,
-            retrain_every_bars=None,
-            suppress_fit_stdout=False,
-            early_exit_threshold=0.8
-        )
-        #
-        results = sim.run(test_start="2025-08-01", test_end="2025-09-01")
-        print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
+        # df = analyzer.data
+        # def logger(event, payload):
+        #     if event == "progress":
+        #         print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
+        #               f"equity={payload['equity']:.2f} | trades={payload['trades']}")
+        #     elif event == "open":
+        #         print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
+        #               f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
+        #               f"proba={payload['prob'] * 100:.1f} | "
+        #               f"kelly={payload['kelly'] if payload['kelly'] is not None else 1.0:.3f}")
+        #     elif event == "close":
+        #         dur = payload.get("duration")
+        #         print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
+        #               f"PnL={payload['pnl']:.2f} | "
+        #               f"equity={payload['equity']:.2f} | "
+        #               f"in={payload['entry_time']} out={payload['time']} "
+        #               f"dur={dur}")
+        #     elif event == "early_opposite":
+        #         print(
+        #             f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
+        #             f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
+        #             f"| in={payload['entry_time']} out={payload['time']} "
+        #             f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
+        #         )
+        # sim = TradeSimulator(
+        #     analyzer,
+        #     df,
+        #     initial_equity=2000,
+        #     leverage=50,
+        #     risk_fraction=0.02,
+        #     on_event=logger,  # <— activar callback
+        #     verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
+        #     log_every_bars=250,
+        #     proba_threshold_day=0.7,
+        #     proba_threshold_night=0.72,
+        #     n_keep_for_fit=68880,
+        #     atr_mult_tp=4,
+        #     atr_mult_sl=3,
+        #     retrain_each_bar=False,
+        #     retrain_every_bars=None,
+        #     suppress_fit_stdout=False,
+        #     early_exit_threshold=0.8
+        # )
+        # #
+        # results = sim.run(test_start="2025-08-24", test_end="2025-09-01")
+        # print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
 
         # # =========== get_best_calibration_model
         # analyzer.get_best_calibration_model(display_graphic=True)
 
         # =============best dataset size:
         # df_results = analyzer.sweep_nkeep(
-        #     start=65_000,
-        #     stop=75_000,
-        #     step=200,
+        #     start=68_500,
+        #     stop=69_500,
+        #     step=10,
         #     model_type="rf",
         #     model_kwargs={"n_estimators": 700, "max_features": "sqrt", "random_state": 42, "n_jobs": -1},
         #     calibrate_method="beta",
@@ -6198,7 +6198,7 @@ if __name__ == "__main__":
         #     sort_by="logloss"  # alternativas: 'logloss', 'brier', 'ece', 'macro_f1'
         # )
         # print(df_results.head(10))
-
+        #
 
         # ==============Deprecated
         # while True:
