@@ -871,7 +871,7 @@ class TradeSimulator:
         probabilities = {cls: float(round(p, 4)) for cls, p in zip(classes, proba_vec)}
 
         # aplicar thresholds del usuario (si tiene helper interno)
-        if hasattr(self.analyzer, "_apply_thresholds"):
+        if True:
             pred_class = self.analyzer._apply_thresholds(
                 proba_vec, classes, self.thresholds,
                 default_class="lateral", global_floor=0.51, min_margin=0.03
@@ -4645,7 +4645,7 @@ class StochasticAnalyzer:
                             if (side_position != side_prediction) and proba_pred >= 0.65:
                                 counter_side = "short"
                                 if side_position == "long" and close_price > entry_price:
-                                    if pred == "lateral" and proba_pred >= 0.85:
+                                    if pred == "lateral" and proba_pred >= 0.75:
                                         self.close_order(counter_side)
                                         self.check_and_close_from_market(symbol, resultado.get("raw_df"))
                                     elif pred == "short":
@@ -4653,7 +4653,7 @@ class StochasticAnalyzer:
                                         self.check_and_close_from_market(symbol, resultado.get("raw_df"))
                                 elif side_position == "short" and close_price < entry_price:
                                     counter_side = "long"
-                                    if pred == "lateral" and proba_pred >= 0.85:
+                                    if pred == "lateral" and proba_pred >= 0.75:
                                         self.close_order(counter_side)
                                         self.check_and_close_from_market(symbol, resultado.get("raw_df"))
                                     elif pred == "long":
@@ -4694,17 +4694,17 @@ class StochasticAnalyzer:
             # if (now.hour in {RESTART_HOUR_1 - 1} and now.minute == 56):
             #     break
 
-            # if now.hour == 0 and now.minute == 59:
-            #     today_str_ = f"{now.day:02d}"
-            #     tomorrow_ = now + timedelta(days=1)
-            #     tomorrow_day_ = f"{tomorrow_.day:02d}"
-            #     mont_str_ = f"{now.month:02d}"å
-            #     filename_ = f'AVAXUSDT_5m_2024-01-01_2025-{mont_str_}-{today_str_}.csv'
-            #     if os.path.exists(filename_):
-            #         name, extension_ = os.path.splitext(filename_)
-            #         new_name_ = name[:-2] + tomorrow_day_ + extension_
-            #         os.rename(filename_, new_name_)
-            #         print("Nuevo nombre de archivo:", new_name_)
+            if now.hour == 0 and now.minute == 59:
+                today_str_ = f"{now.day:02d}"
+                tomorrow_ = now + timedelta(days=1)
+                tomorrow_day_ = f"{tomorrow_.day:02d}"
+                mont_str_ = f"{now.month:02d}"
+                filename_ = f'AVAXUSDT_5m_2024-01-01_2025-{mont_str_}-{today_str_}.csv'
+                if os.path.exists(filename_):
+                    name, extension_ = os.path.splitext(filename_)
+                    new_name_ = name[:-2] + tomorrow_day_ + extension_
+                    os.rename(filename_, new_name_)
+                    print("Nuevo nombre de archivo:", new_name_)
 
     def start_order(self, pred, symbol, interval, bogota_time, proba, resultado, atr, close_price, real_account,
                     trade_id=None):
@@ -4750,7 +4750,7 @@ class StochasticAnalyzer:
                     # Se envia a la cuenta real y demo
                     try:
                         response = requests.post(
-                            "http://52.67.38.220:80/hook-demo",
+                            "http://52.67.38.220:80/webhook",
                             json=payload,
                             timeout=10
                         )
@@ -4806,6 +4806,20 @@ class StochasticAnalyzer:
                             trade_id=trade_id, symbol=symbol, side=side, qty=response_data.get("qty"),
                             broker_raw=response_data
                         )
+
+                    try:
+                        response = requests.post(
+                            "http://52.67.38.220:80/hook-demo",
+                            json=payload,
+                            timeout=10
+                        )
+                        print("POST al webhook enviado:", payload)
+                        print("Respuesta:", response.text)
+                    except Exception as e:
+                        print("Error enviando al webhook:", e)
+
+                    response_data = response.json()
+                    success = response_data.get('success')
 
                 else:
                     # Solo a cuenta demo
@@ -6054,7 +6068,7 @@ if __name__ == "__main__":
         # # # #
         # RF model production mode
         #
-        # analyzer.create_predictive_model(model_type="rf", calibrate_method="isotonic", N_KEEP=70000,
+        # analyzer.create_predictive_model(model_type="rf", calibrate_method="beta", N_KEEP=68950,
         #                                  display_graphic=True,
         #                                  model_kwargs={
         #                                      "n_estimators": 700,
@@ -6100,18 +6114,18 @@ if __name__ == "__main__":
             on_event=logger,  # <— activar callback
             verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
             log_every_bars=250,
-            proba_threshold_day=0.68,
-            proba_threshold_night=0.68,
-            n_keep_for_fit=68600,
-            atr_mult_tp=4.5,
+            proba_threshold_day=0.7,
+            proba_threshold_night=0.72,
+            n_keep_for_fit=68950,
+            atr_mult_tp=4,
             atr_mult_sl=3,
             retrain_each_bar=False,
-            retrain_every_bars=2880,
+            retrain_every_bars=None,
             suppress_fit_stdout=False,
-            early_exit_threshold=0.65
+            early_exit_threshold=0.8
         )
         #
-        results = sim.run(test_start="2025-08-20", test_end="2025-08-25")
+        results = sim.run(test_start="2025-08-29", test_end="2025-08-31")
         print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
 
         # # =========== get_best_calibration_model
