@@ -14,13 +14,14 @@ import os
 import hmac
 import hashlib
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, log_loss, brier_score_loss
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.preprocessing import StandardScaler, label_binarize, LabelEncoder
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LinearRegression
 from betacal import BetaCalibration
+from sklearn.base import clone
 
 import os, json, uuid, time
 from collections import defaultdict
@@ -3296,13 +3297,17 @@ class StochasticAnalyzer:
 
         raise ValueError(f"model_type desconocido: {model_type}. Usa: 'rf', 'lgbm' o 'xgb'.")
 
-    def _safe_feature_importance(self, model, X_tr, y_tr, feature_names):
+    def _safe_feature_importance(self, model, X_tr, y_tr, feature_names, plot=True, export_csv=None):
         """
-        Intenta obtener importancias nativas; si no hay, usa permutation importance.
-        Devuelve DataFrame con columnas ['feature', 'importance'].
+        Obtiene importancias de características (nativas o permutation importance).
+        Devuelve DataFrame con ['feature', 'importance'].
+
+        Parámetros:
+        - plot: bool -> si True, muestra un gráfico de barras horizontales.
+        - export_csv: str -> si no es None, guarda el DataFrame en un CSV con este nombre.
         """
         imp = None
-        # intentos comunes
+        # Intentos comunes
         for attr in ("feature_importances_",):
             if hasattr(model, attr):
                 vals = getattr(model, attr)
@@ -3310,21 +3315,83 @@ class StochasticAnalyzer:
                     imp = np.array(vals, dtype=float)
                     break
 
-        # XGBoost también permite importance por gain/weight; el wrapper scikit ya expone feature_importances_
-        # Si no se logró, usar permutation importance (más costoso).
+        # Si no se logró, usar permutation importance
         if imp is None:
             try:
                 pi = permutation_importance(model, X_tr, y_tr, n_repeats=5, random_state=42, n_jobs=-1)
                 imp = pi.importances_mean
             except Exception:
-                # último recurso: importancia cero
                 imp = np.zeros(len(feature_names), dtype=float)
 
-        return (
+        df_imp = (
             pd.DataFrame({"feature": feature_names, "importance": imp})
             .sort_values("importance", ascending=False)
             .reset_index(drop=True)
         )
+
+        # Exportar a CSV si se solicita
+        if export_csv:
+            df_imp.to_csv(export_csv, index=False)
+
+        # Mostrar gráfico
+        if plot:
+            plt.figure(figsize=(8, max(6, len(df_imp) * 0.25)))  # alto dinámico
+            plt.barh(df_imp["feature"][::-1], df_imp["importance"][::-1])
+            plt.title("Importancia de características (Random Forest)")
+            plt.xlabel("Importance")
+            plt.ylabel("Feature")
+            plt.tight_layout()
+            plt.show()
+
+        return df_imp
+
+    def _oof_probas_time_series(self, X_array, y_array, base_estimator, n_splits=5, clip_eps=1e-6):
+        """
+        Genera probabilidades OOF respetando el tiempo, usando TimeSeriesSplit.
+        Alinea columnas de probas a las clases globales (rellena con 0 si faltan en algún fold).
+        Devuelve: proba_oof (n_samples, K), y_oof (n_samples,), classes_global (list)
+        """
+        # Asegúrate de que X_array e y_array mantienen el ORDEN temporal
+        classes_global = list(pd.Index(y_array).unique().sort_values())
+        n_classes = len(classes_global)
+        class_to_idx = {c: i for i, c in enumerate(classes_global)}
+
+        proba_oof = np.zeros((len(y_array), n_classes), dtype=float)
+        filled = np.zeros(len(y_array), dtype=bool)
+
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        for fold, (tr_idx, val_idx) in enumerate(tscv.split(X_array)):
+            est = clone(base_estimator)
+            est.fit(X_array[tr_idx], y_array[tr_idx])
+
+            proba_fold = est.predict_proba(X_array[val_idx])  # (n_val, k_fold)
+            # Alinear columnas a clases_global
+            proba_aligned = np.zeros((len(val_idx), n_classes), dtype=float)
+            model_classes = list(est.classes_)
+            model_c2i = {c: i for i, c in enumerate(model_classes)}
+            for j, c in enumerate(classes_global):
+                if c in model_c2i:
+                    proba_aligned[:, j] = proba_fold[:, model_c2i[c]]
+                else:
+                    # Si una clase no aparece en este fold, queda 0 (sin info)
+                    proba_aligned[:, j] = 0.0
+
+            # Clipping de estabilidad
+            proba_aligned = np.clip(proba_aligned, clip_eps, 1.0 - clip_eps)
+            # Re-normaliza por si hubo columnas 0
+            proba_sum = proba_aligned.sum(axis=1, keepdims=True)
+            proba_sum[proba_sum == 0] = 1.0
+            proba_aligned = proba_aligned / proba_sum
+
+            proba_oof[val_idx] = proba_aligned
+            filled[val_idx] = True
+
+        # Por si algo quedó sin llenar (no debería)
+        if not filled.all():
+            missing = np.where(~filled)[0]
+            proba_oof[missing] = 1.0 / n_classes
+
+        return proba_oof, y_array, classes_global
 
     def create_predictive_model(
             self,
@@ -3333,7 +3400,8 @@ class StochasticAnalyzer:
             model_type: str = "rf",
             model_kwargs: Optional[Dict] = None,
             calibrate_method: str = "isotonic",  # "isotonic" o "sigmoid"
-            return_metrics: bool = False
+            return_metrics: bool = False,
+            display_feature_plot: bool = False
     ):
         if self.data is None:
             print("No hay datos para entrenar el modelo")
@@ -3470,7 +3538,11 @@ class StochasticAnalyzer:
             print(f"ECE: {ece_maxprob(y_test_labels, proba_cal, classes_text):.6f}")
 
             # Importancias
-            self.feature_importance_ = self._safe_feature_importance(base_model, X_tr, y_tr_enc, features)
+            self.feature_importance_ = self._safe_feature_importance(
+                base_model, X_tr, y_tr_enc, features,
+                plot=display_feature_plot,
+                export_csv="importancias_rf.csv"   # opcional
+            )
             self.classes_ = classes_text
             self.model_tag_ = model_tag
 
@@ -3572,15 +3644,28 @@ class StochasticAnalyzer:
             calibrate_method = "isotonic"
 
         if calibrate_method == "beta":
-            classes = list(base_model.classes_)
-            class_to_idx = {c: i for i, c in enumerate(classes)}
-            y_cal_idx = np.array([class_to_idx[v] for v in y_cal])  # enteros 0..K-1
+            # === NEW: OOF + Beta + clipping (time-series aware) ===
+            # 1) Generar OOF sobre el TRAIN (X_train_scaled, y_train)
+            proba_oof, y_oof, classes_global = self._oof_probas_time_series(
+                X_array=X_train_scaled,
+                y_array=y_train.to_numpy(),  # respeta orden temporal del df
+                base_estimator=base_model,
+                n_splits=5,
+                clip_eps=1e-6
+            )
+            class_to_idx = {c: i for i, c in enumerate(classes_global)}
+            y_oof_idx = np.array([class_to_idx[v] for v in y_oof], dtype=int)
 
-            proba_cal_in = base_model.predict_proba(X_cal)  # (n, K)
-            mc_beta = MultiClassBetaCalibrator(parameters="abm", classes_=classes)
-            mc_beta.fit(proba_cal_in, y_cal_idx)
+            # 2) Ajustar calibrador Beta sobre OOF (prueba 'ab'/'bm'/'abm')
+            mc_beta = MultiClassBetaCalibrator(parameters="abm", classes_=classes_global)
+            mc_beta.fit(proba_oof, y_oof_idx)
 
-            self.model = BetaMultiWrapper(base_model, mc_beta, classes_=classes, label_encoder=None)
+            # 3) Re-entrenar el modelo base en TODO el TRAIN y envolver con Beta
+            base_model_final = clone(base_model).fit(X_train_scaled, y_train)
+            self.model = BetaMultiWrapper(base_model_final, mc_beta, classes_=classes_global, label_encoder=None)
+
+            # 4) (Opcional) clipping en inferencia dentro del wrapper (si tu wrapper no lo hace)
+            #    Asegúrate que BetaMultiWrapper hace np.clip en predict_proba antes/después del calibrador.
         else:
             self.model = CalibratedClassifierCV(base_model, method=calibrate_method, cv='prefit')
             self.model.fit(X_cal, y_cal)
@@ -3620,7 +3705,12 @@ class StochasticAnalyzer:
         )
 
         # Importancias
-        feature_importance = self._safe_feature_importance(base_model, X_tr, y_tr, features)
+        # feature_importance = self._safe_feature_importance(base_model, X_tr, y_tr, features)
+        feature_importance = self._safe_feature_importance(
+            base_model, X_tr, y_tr, features,
+            plot=display_feature_plot,
+            export_csv="importancias_rf_lag.csv"  # opcional
+        )
         print("\nImportancia de características:")
         print(feature_importance)
 
@@ -4409,10 +4499,10 @@ class StochasticAnalyzer:
 
         pred = pred_class
         if pred_class == 'bullish' and close < ema_15 and probabilities.get('bullish') < 0.8:
-            print(f"Fake bullish (cierre < EMA10 y prob<0.84): {probabilities.get('bullish')}")
+            print(f"Fake bullish (cierre < EMA10 y prob < 0.8): {probabilities.get('bullish')}")
             pred = 'lateral'
         elif pred_class == 'bearish' and close > ema_15 and probabilities.get('bearish') < 0.8:
-            print(f"Fake bearish (cierre > EMA10 y prob<0.84): {probabilities.get('bearish')}")
+            print(f"Fake bearish (cierre > EMA10 y prob < 0.8): {probabilities.get('bearish')}")
             pred = 'lateral'
 
         result = {
@@ -5611,8 +5701,8 @@ class StochasticAnalyzer:
         optional_dummies = [c for c in ['trend_ema200_up'] if c in dfx.columns]
 
         features_final = features_price + features_vol + features_sr + features_time + \
-                         features_trend + features_momentum + features_candles + features_conflu + \
-                         optional_dummies + new_day_feats
+                         features_trend + features_momentum + features_candles + \
+                         optional_dummies + features_conflu + new_day_feats
 
         # =========================
         # Limpieza robusta
@@ -6122,16 +6212,21 @@ if __name__ == "__main__":
         # # # #
         # RF model production mode
         #
-        analyzer.create_predictive_model(model_type="rf", calibrate_method="beta", N_KEEP=68880,
-                                         display_graphic=True,
-                                         model_kwargs={
-                                             "n_estimators": 700,
-                                             "max_features": "sqrt",
-                                             "n_jobs": -1,
-                                             "random_state": 42
-                                         })
+        analyzer.create_predictive_model(
+            model_type="rf",
+            calibrate_method="beta",
+            N_KEEP=68880,
+            display_graphic=True,
+            model_kwargs={
+                "n_estimators": 600,
+                "max_features": "sqrt",
+                "n_jobs": -1,
+                "random_state": 42
+            },
+            display_feature_plot=True
+        )
 
-        analyzer.monitor_predictions()
+        # analyzer.monitor_predictions()
 
         #=====================TESTING======================#
 
@@ -6163,8 +6258,8 @@ if __name__ == "__main__":
         # sim = TradeSimulator(
         #     analyzer,
         #     df,
-        #     initial_equity=2000,
-        #     leverage=50,
+        #     initial_equity=155,
+        #     leverage=200,
         #     risk_fraction=0.02,
         #     on_event=logger,  # <— activar callback
         #     verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
@@ -6175,30 +6270,31 @@ if __name__ == "__main__":
         #     atr_mult_tp=4,
         #     atr_mult_sl=3,
         #     retrain_each_bar=False,
-        #     retrain_every_bars=None,
+        #     retrain_every_bars=1152,
         #     suppress_fit_stdout=False,
         #     early_exit_threshold=0.8
         # )
         # #
-        # results = sim.run(test_start="2025-08-24", test_end="2025-09-01")
+        # results = sim.run(test_start="2025-08-20", test_end="2025-09-03")
         # print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
+
 
         # # =========== get_best_calibration_model
         # analyzer.get_best_calibration_model(display_graphic=True)
 
         # =============best dataset size:
         # df_results = analyzer.sweep_nkeep(
-        #     start=68_500,
-        #     stop=69_500,
-        #     step=10,
+        #     start=67_500,
+        #     stop=70_500,
+        #     step=50,
         #     model_type="rf",
-        #     model_kwargs={"n_estimators": 700, "max_features": "sqrt", "random_state": 42, "n_jobs": -1},
+        #     model_kwargs={"n_estimators": 600, "max_features": "sqrt", "random_state": 42, "n_jobs": -1},
         #     calibrate_method="beta",
-        #     export_csv_path="bestDataset_65k-75k_beta.csv",
+        #     export_csv_path="bestDataset_67k-70k_beta_600trees.csv",
         #     sort_by="logloss"  # alternativas: 'logloss', 'brier', 'ece', 'macro_f1'
         # )
         # print(df_results.head(10))
-        #
+
 
         # ==============Deprecated
         # while True:
