@@ -4775,8 +4775,8 @@ class StochasticAnalyzer:
                     kelly_fraction = max(0.0, min(p - (q / reward_risk), 0.95))
 
                 # Gate sólo si es elegible
-                self.umbral_strong = 0.72
-                self.umbral_soft = 0.7
+                self.umbral_strong = 0.76
+                self.umbral_soft = 0.75
 
                 gate = None
                 if eligible:
@@ -4806,12 +4806,12 @@ class StochasticAnalyzer:
                             self.tradelogger.log_info(note="Señal ignorada: ya hay posición abierta",
                                                       symbol=symbol, side=side_prediction, trade_id=trade_id)
                             info_positions = self.tradelogger.open_positions.get(symbol)
-                            entry_price = self.tradelogger.open_positions.get('price')
+                            entry_price = info_positions.get("entry_price")
                             side_position = info_positions.get("side")
-                            if (side_position != side_prediction) and proba_pred >= 0.65:
+                            if (side_position != side_prediction) and proba_pred >= 0.7:
                                 counter_side = "short"
                                 if side_position == "long" and close_price > entry_price:
-                                    if pred == "lateral" and proba_pred >= 0.75:
+                                    if pred == "lateral" and proba_pred >= 0.8:
                                         self.close_order(counter_side)
                                         self.check_and_close_from_market(symbol, resultado.get("raw_df"))
                                     elif pred == "short":
@@ -4819,7 +4819,7 @@ class StochasticAnalyzer:
                                         self.check_and_close_from_market(symbol, resultado.get("raw_df"))
                                 elif side_position == "short" and close_price < entry_price:
                                     counter_side = "long"
-                                    if pred == "lateral" and proba_pred >= 0.75:
+                                    if pred == "lateral" and proba_pred >= 0.8:
                                         self.close_order(counter_side)
                                         self.check_and_close_from_market(symbol, resultado.get("raw_df"))
                                     elif pred == "long":
@@ -6237,10 +6237,10 @@ if __name__ == "__main__":
         analyzer.create_predictive_model(
             model_type="rf",
             calibrate_method="beta",
-            N_KEEP=68880,
+            N_KEEP=68600,
             display_graphic=True,
             model_kwargs={
-                "n_estimators": 600,
+                "n_estimators": 700,
                 "max_features": "sqrt",
                 "n_jobs": -1,
                 "random_state": 42
@@ -6248,7 +6248,7 @@ if __name__ == "__main__":
             display_feature_plot=True
         )
 
-        # analyzer.monitor_predictions()
+        analyzer.monitor_predictions()
 
         #=====================TESTING======================#
 
