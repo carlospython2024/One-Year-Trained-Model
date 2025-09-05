@@ -74,8 +74,18 @@ RESTART_HOUR_4 = 22
 
 warnings.filterwarnings('ignore')
 
+# params_to_features = {
+#     "version": "v3.1-traderlike+day-features",  # cambia esto si modificas reglas de features
+#     "lags": [1],
+#     "trend_windows": [20, 50, 100],
+#     "channel_window": 50,
+#     "tz": "UTC-5",
+#     "sessions": {"NY": [(8, 30), (10, 30)], "LDN": [(2, 0), (4, 0)], "ASIA": [(18, 0), (20, 0)]},
+#     "sr_threshold_frac": 0.25
+# }
+
 params_to_features = {
-    "version": "v3.1-traderlike+day-features",  # cambia esto si modificas reglas de features
+    "version": "v3.6-traderlike+e100+lags1",  # cambia esto si modificas reglas de features
     "lags": [1],
     "trend_windows": [20, 50, 100],
     "channel_window": 50,
@@ -2393,10 +2403,10 @@ class StochasticAnalyzer:
         y clasifica la tendencia futura usando un umbral absoluto basado en ATR.
         """
         # Estocástico con período K=100
-        # k100_raw, _ = self.calculate_stochastic(df['high'], df['low'], df['close'], 100, 1)
-        # df['k100'] = k100_raw.rolling(window=1).mean()
-        # df['d100'] = df['k100'].rolling(window=3).mean()
-        # df['e100'] = df['d100'].rolling(window=57).mean()
+        k100_raw, _ = self.calculate_stochastic(df['high'], df['low'], df['close'], 100, 1)
+        df['k100'] = k100_raw.rolling(window=1).mean()
+        df['d100'] = df['k100'].rolling(window=3).mean()
+        df['e100'] = df['d100'].rolling(window=57).mean()
         #
         # # Estocástico estándar
         # df['k'], df['d'] = self.calculate_stochastic(df['high'], df['low'], df['close'], 14, 3)
@@ -4504,26 +4514,54 @@ class StochasticAnalyzer:
 
         # 5) Escalar y obtener probabilidades
         last_scaled = self.scaler.transform(last_row)
-        proba = self.model.predict_proba(last_scaled)[0]
-        classes = list(self.model.classes_)
+
+        # Sanity: el modelo debe exponer classes_
+        if not hasattr(self.model, "classes_"):
+            raise RuntimeError("El modelo no expone 'classes_' y no se puede alinear proba↔clase.")
+
+        proba = self.model.predict_proba(last_scaled)[0]  # shape: (K,)
+        classes = list(self.model.classes_)  # orden fijo del modelo
+
+        # Checks de alineación
+        if len(proba) != len(classes):
+            raise RuntimeError(f"Dim mismatch: len(proba)={len(proba)} vs len(classes)={len(classes)}")
+
+        # Clipping + renormalización defensiva (por si algún calibrador devolvió extremos)
+        proba = np.clip(proba, 1e-9, 1.0)  # no bajo de 0
+        s = proba.sum()
+        if not np.isfinite(s) or s <= 0:
+            raise RuntimeError("Probabilidades no finitas o suma <= 0.")
+        proba = proba / s
+
+        # Mapeo clase→probabilidad (garantizado con el orden del modelo)
         probabilities = {cls: float(round(p, 4)) for cls, p in zip(classes, proba)}
 
-        # 6) Predicción con umbrales adaptativos
-        thr = thresholds or getattr(self, "thresholds_", {'bearish': 0.50, 'bullish': 0.50, 'lateral': 0.38})
+        # 6) Predicción con umbrales
+        thr = thresholds or getattr(self, "thresholds_", {"bearish": 0.50, "bullish": 0.50, "lateral": 0.38})
+
+        # Validar que las llaves de thresholds coincidan con las clases del modelo
+        missing = set(classes) - set(thr.keys())
+        if missing:
+            raise RuntimeError(f"Faltan umbrales para clases: {missing}. Clases del modelo: {classes}")
+
         pred_class = self._apply_thresholds(
-            proba, list(self.model.classes_), thr,
-            default_class="lateral", global_floor=0.51, min_margin=0.03
+            proba,
+            classes,
+            thr,
+            default_class=default_class,  # usa el parámetro de la función
+            global_floor=0.51,
+            min_margin=0.03
         )
 
-        # 7) Filtro de “fake” señales con EMA_10 (mantengo tu lógica original)
+        # 7) Filtro “fake” con EMA_10 (corrijo nombre de variable)
         close = float(last_meta['close'])
-        ema_15 = float(last_meta['EMA_10'])
+        ema_10 = float(last_meta['EMA_10'])
 
         pred = pred_class
-        if pred_class == 'bullish' and close < ema_15 and probabilities.get('bullish') < 0.8:
+        if pred_class == 'bullish' and close < ema_10 and probabilities.get('bullish', 0.0) < 0.8:
             print(f"Fake bullish (cierre < EMA10 y prob < 0.8): {probabilities.get('bullish')}")
             pred = 'lateral'
-        elif pred_class == 'bearish' and close > ema_15 and probabilities.get('bearish') < 0.8:
+        elif pred_class == 'bearish' and close > ema_10 and probabilities.get('bearish', 0.0) < 0.8:
             print(f"Fake bearish (cierre > EMA10 y prob < 0.8): {probabilities.get('bearish')}")
             pred = 'lateral'
 
@@ -4809,8 +4847,8 @@ class StochasticAnalyzer:
                             entry_price = info_positions.get("entry_price")
                             side_position = info_positions.get("side")
                             if (side_position != side_prediction) and proba_pred >= 0.7:
-                                counter_side = "short"
                                 if side_position == "long" and close_price > entry_price:
+                                    counter_side = "short"
                                     if pred == "lateral" and proba_pred >= 0.8:
                                         self.close_order(counter_side)
                                         self.check_and_close_from_market(symbol, resultado.get("raw_df"))
@@ -5689,6 +5727,8 @@ class StochasticAnalyzer:
             dfx[f'close_lag{lag}'] = dfx['close'].shift(lag)
             dfx[f'high_lag{lag}'] = dfx['high'].shift(lag)
             dfx[f'low_lag{lag}'] = dfx['low'].shift(lag)
+            dfx[f'e100_lag{lag}'] = dfx['e100'].shift(lag)
+
 
         # =========================
         # New day features
@@ -5698,8 +5738,22 @@ class StochasticAnalyzer:
         # =========================
         # Lista final de features
         # =========================
-        features_price = ['close', 'high', 'low', *(f'close_lag{l}' for l in lags),
-                          *(f'high_lag{l}' for l in lags), *(f'low_lag{l}' for l in lags)]
+        for lag in lags:
+            dfx[f'close_lag{lag}'] = dfx['close'].shift(lag)
+            dfx[f'high_lag{lag}'] = dfx['high'].shift(lag)
+            dfx[f'low_lag{lag}'] = dfx['low'].shift(lag)
+            dfx[f'e100_lag{lag}'] = dfx['e100'].shift(lag)
+
+
+        features_price = [
+            'close', 'high', 'low', 'e100'
+        ]
+        # === Generar lag features ===
+        for col in features_price:
+            for lag in lags:
+                df[f'{col}_lag{lag}'] = df[col].shift(lag)
+        lag_feature_names = [f'{col}_lag{lag}' for col in features_price for lag in lags]
+
         features_vol = ['volume', 'avg_volume_last_n', 'volatility', 'volatility_10', 'volatility_50', 'ATR',
                         'atr_norm']
         features_sr = ['dist_PP', 'dist_S1', 'dist_R1', 'dist_S2', 'dist_R2', 'dist_resist_rl', 'dist_support_rl',
@@ -5724,7 +5778,7 @@ class StochasticAnalyzer:
 
         features_final = features_price + features_vol + features_sr + features_time + \
                          features_trend + features_momentum + features_candles + \
-                         optional_dummies + features_conflu + new_day_feats
+                         optional_dummies + new_day_feats + features_conflu + lag_feature_names
 
         # =========================
         # Limpieza robusta
@@ -6233,14 +6287,14 @@ if __name__ == "__main__":
 
         # # # #
         # RF model production mode
-        #
+
         analyzer.create_predictive_model(
             model_type="rf",
             calibrate_method="beta",
-            N_KEEP=68600,
+            N_KEEP=83000,
             display_graphic=True,
             model_kwargs={
-                "n_estimators": 700,
+                "n_estimators": 1200,
                 "max_features": "sqrt",
                 "n_jobs": -1,
                 "random_state": 42
@@ -6306,11 +6360,11 @@ if __name__ == "__main__":
 
         # =============best dataset size:
         # df_results = analyzer.sweep_nkeep(
-        #     start=67_500,
-        #     stop=70_500,
-        #     step=50,
+        #     start=40_000,
+        #     stop=110_000,
+        #     step=1000,
         #     model_type="rf",
-        #     model_kwargs={"n_estimators": 600, "max_features": "sqrt", "random_state": 42, "n_jobs": -1},
+        #     model_kwargs={"n_estimators": 700, "max_features": "sqrt", "random_state": 42, "n_jobs": -1},
         #     calibrate_method="beta",
         #     export_csv_path="bestDataset_67k-70k_beta_600trees.csv",
         #     sort_by="logloss"  # alternativas: 'logloss', 'brier', 'ece', 'macro_f1'
