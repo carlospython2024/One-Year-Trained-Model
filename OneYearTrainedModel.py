@@ -1966,6 +1966,8 @@ class TradeLogger:
 
 class StochasticAnalyzer:
     def __init__(self, api_key=None, api_secret=None):
+        self.umbral_strong = None
+        self.umbral_soft = None
         self.min_margin = 0.05
         self.data = None
         self.results = []
@@ -3577,7 +3579,8 @@ class StochasticAnalyzer:
             )
             self.classes_ = classes_text
             self.model_tag_ = model_tag
-
+            u_soft = 0.75
+            u_strong = 0.76
             # ==== Selección de umbrales con fallback XGB (como ya lo dejaste) ====
             try:
                 u_strong, info_strong, u_soft, info_soft, df_bands = self.select_thresholds_by_band_precision(
@@ -3597,8 +3600,6 @@ class StochasticAnalyzer:
                 )
             except Exception as e:
                 print(f"[WARN] select_thresholds_by_band_precision falló con XGB: {e}")
-                u_soft = 0.84
-                u_strong = 0.90
                 self.umbral_soft = u_soft
                 self.umbral_strong = u_strong
                 info_soft = {"reason": "xgb_default_thresholds", "chosen": {"u": u_soft}}
@@ -4839,30 +4840,70 @@ class StochasticAnalyzer:
                     print(f"[{bogota_time.strftime('%Y-%m-%d %H:%M:%S')}] NUEVA PREDICCIÓN: {pred.upper()} "
                           f"(prob: {proba_pred * 100:.1f}%) | margen: {margin_pp:.1f} pp")
                     print("Detalle probabilidades:", probs)
+
+                    # =========================
+                    # (A) RUTAS DE CIERRE (independientes de eligible/gate)
+                    # =========================
+
+                    # A1) Cierre por LATERAL fuerte
+                    lateral_close_trigger = (pred == "lateral" and proba_pred >= 0.80)
+                    if lateral_close_trigger and self.tradelogger.has_open_position(symbol):
+                        info_positions = self.tradelogger.open_positions.get(symbol) or {}
+                        entry_price = info_positions.get("entry_price")
+                        side_position = info_positions.get("side")
+
+                        if side_position == "long" and entry_price is not None and close_price > entry_price:
+                            self.close_order("short")
+                            self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+                            self.tradelogger.log_info(event="closed_on_lateral", symbol=symbol, prob=proba_pred,
+                                                      note="Cierre por lateral>=0.80 con PnL favorable")
+                            last_prediction = pred
+                            last_minute_checked = minute
+                            continue
+
+                        if side_position == "short" and entry_price is not None and close_price < entry_price:
+                            self.close_order("long")
+                            self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+                            self.tradelogger.log_info(event="closed_on_lateral", symbol=symbol, prob=proba_pred,
+                                                      note="Cierre por lateral>=0.80 con PnL favorable")
+                            last_prediction = pred
+                            last_minute_checked = minute
+                            continue
+
+                    # A2) Cierre por SEÑAL OPUESTA con proba_pred >= 0.70 (sin gate)
+                    #     Sólo aplica si la nueva predicción es direccional (bullish/bearish).
+                    if pred in ("bullish", "bearish") and self.tradelogger.has_open_position(symbol):
+                        info_positions = self.tradelogger.open_positions.get(symbol) or {}
+                        entry_price = info_positions.get("entry_price")
+                        side_position = info_positions.get("side")
+
+                        # Qué lado implica la nueva señal
+                        new_side = "long" if pred == "bullish" else "short"
+                        is_opposite = (side_position is not None and side_position != new_side)
+
+                        if is_opposite and proba_pred >= 0.70:
+                            # Criterio de PnL favorable (tal como lo tenías):
+                            if side_position == "long" and entry_price is not None and close_price > entry_price:
+                                self.close_order("short")
+                                self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+                                self.tradelogger.log_info(event="closed_on_opposite", symbol=symbol, prob=proba_pred,
+                                                          note="Cierre por opuesto>=0.70 con PnL favorable")
+                                # No abrimos aún; dejamos que el flujo de entrada lo decida abajo (si aplica).
+                            elif side_position == "short" and entry_price is not None and close_price < entry_price:
+                                self.close_order("long")
+                                self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+                                self.tradelogger.log_info(event="closed_on_opposite", symbol=symbol, prob=proba_pred,
+                                                          note="Cierre por opuesto>=0.70 con PnL favorable")
+
+                    # =========================
+                    # (B) ENTRADA/RE-ENTRADA (requiere eligible + gate)
+                    # =========================
                     if eligible and gate in ("soft", "strong"):
                         if self.tradelogger.has_open_position(symbol):
                             self.tradelogger.log_info(note="Señal ignorada: ya hay posición abierta",
                                                       symbol=symbol, side=side_prediction, trade_id=trade_id)
-                            info_positions = self.tradelogger.open_positions.get(symbol)
-                            entry_price = info_positions.get("entry_price")
-                            side_position = info_positions.get("side")
-                            if (side_position != side_prediction) and proba_pred >= 0.7:
-                                if side_position == "long" and close_price > entry_price:
-                                    counter_side = "short"
-                                    if pred == "lateral" and proba_pred >= 0.8:
-                                        self.close_order(counter_side)
-                                        self.check_and_close_from_market(symbol, resultado.get("raw_df"))
-                                    elif pred == "short":
-                                        self.close_order(counter_side)
-                                        self.check_and_close_from_market(symbol, resultado.get("raw_df"))
-                                elif side_position == "short" and close_price < entry_price:
-                                    counter_side = "long"
-                                    if pred == "lateral" and proba_pred >= 0.8:
-                                        self.close_order(counter_side)
-                                        self.check_and_close_from_market(symbol, resultado.get("raw_df"))
-                                    elif pred == "long":
-                                        self.close_order(counter_side)
-                                        self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+                            # (Si quisieras “flippear” inmediatamente después de cerrar en A2, podrías chequear aquí
+                            #  si ya no hay posición y llamar start_order; por ahora conservamos tu comportamiento.)
                         else:
                             self.start_order(pred, symbol, interval, bogota_time, proba_pred, probs,
                                              atr, close_price, True, trade_id=trade_id)
@@ -4884,7 +4925,7 @@ class StochasticAnalyzer:
                             self.start_order(pred, symbol, interval, bogota_time, proba_pred, probs,
                                              atr, close_price, True, trade_id=trade_id)
                     else:
-                        print(f"Señal por debajo del umbral strong o no elegible — no trade.")
+                        print("Señal por debajo del umbral strong o no elegible — no trade.")
 
                 last_minute_checked = minute
 
