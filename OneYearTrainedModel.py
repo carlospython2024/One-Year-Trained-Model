@@ -84,10 +84,21 @@ warnings.filterwarnings('ignore')
 #     "sr_threshold_frac": 0.25
 # }
 
+# params_to_features = {
+#     "version": "v3.6-traderlike+e100+lags1",  # cambia esto si modificas reglas de features
+#     "lags": [1],
+#     "trend_windows": [20, 50, 100],
+#     "channel_window": 50,
+#     "tz": "UTC-5",
+#     "sessions": {"NY": [(8, 30), (10, 30)], "LDN": [(2, 0), (4, 0)], "ASIA": [(18, 0), (20, 0)]},
+#     "sr_threshold_frac": 0.25
+# }
+
+# Solo 47 features
 params_to_features = {
-    "version": "v3.6-traderlike+e100+lags1",  # cambia esto si modificas reglas de features
+    "version": "v3.7-traderlike_remove_low_features",  # cambia esto si modificas reglas de features
     "lags": [1],
-    "trend_windows": [20, 50, 100],
+    "trend_windows": [100],
     "channel_window": 50,
     "tz": "UTC-5",
     "sessions": {"NY": [(8, 30), (10, 30)], "LDN": [(2, 0), (4, 0)], "ASIA": [(18, 0), (20, 0)]},
@@ -654,7 +665,7 @@ class TradeSimulator:
             atr_mult_sl: float = 2.7,
             retrain_each_bar: bool = False,
             retrain_every_bars: int | None = None,
-            suppress_fit_stdout: bool = True,
+            suppress_fit_stdout: bool = False,
             suppress_predict_stdout: bool = True,
             use_offline_predictor: bool = True,
             offline_lookback_bars: int = 200,
@@ -742,9 +753,9 @@ class TradeSimulator:
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 # # RF con beta
-                self.analyzer.create_predictive_model(model_type="rf", calibrate_method="beta",
+                self.analyzer.create_predictive_model(model_type="rf", calibrate_method="beta", N_KEEP=N_KEEP,
                                                       model_kwargs={
-                                                          "n_estimators":700,
+                                                          "n_estimators":1200,
                                                           "max_features":"sqrt",
                                                           "n_jobs":-1,
                                                           "random_state":42
@@ -894,12 +905,12 @@ class TradeSimulator:
             pred_class = classes[best_idx]
 
         # filtro de “fake” señales como en tu predict_realtime
-        ema_15 = float(last_meta.get("EMA_10", np.nan))
+        ema_15 = float(last_meta.get("EMA_15", np.nan))
         close_px = float(last_meta["close"])
         pred = pred_class
-        if pred_class == 'bullish' and (not np.isnan(ema_15)) and close_px < ema_15  and probabilities.get('bullish', 0) < 0.80:
+        if pred_class == 'bullish' and (not np.isnan(ema_15)) and close_px < ema_15 and probabilities.get('bullish', 0) < 0.85:
             pred = 'lateral'
-        elif pred_class == 'bearish' and (not np.isnan(ema_15)) and close_px > ema_15  and probabilities.get('bearish', 0) < 0.80:
+        elif pred_class == 'bearish' and (not np.isnan(ema_15)) and close_px > ema_15 and probabilities.get('bearish', 0) < 0.85:
             pred = 'lateral'
 
         return {
@@ -950,10 +961,13 @@ class TradeSimulator:
         if self.use_adapter_tp_sl_when_missing and (maybe_tp is not None) and (maybe_sl is not None):
             return float(maybe_tp), float(maybe_sl)
         atr = float(self.df.loc[i, "atr"]) if not np.isnan(self.df.loc[i, "atr"]) else px * 0.005
+        ema_200 = float(self.df.loc[i, "EMA_200"])
         if side == "long":
+            self.atr_mult_tp = 2.3 if px < ema_200 else self.atr_mult_tp
             tp = px + self.atr_mult_tp * atr
             sl = px - self.atr_mult_sl * atr
         else:
+            self.atr_mult_tp = 2.3 if px > ema_200 else self.atr_mult_tp
             tp = px - self.atr_mult_tp * atr
             sl = px + self.atr_mult_sl * atr
         return tp, sl
@@ -2411,8 +2425,8 @@ class StochasticAnalyzer:
         df['e100'] = df['d100'].rolling(window=57).mean()
         #
         # # Estocástico estándar
-        # df['k'], df['d'] = self.calculate_stochastic(df['high'], df['low'], df['close'], 14, 3)
-        # df['e'] = df['d'].rolling(window=40).mean()
+        df['k'], df['d'] = self.calculate_stochastic(df['high'], df['low'], df['close'], 14, 3)
+        df['e'] = df['d'].rolling(window=40).mean()
 
         # ATR clásico (ya lo tienes, pero aseguramos consistencia)
         atr_period = 10
@@ -3452,6 +3466,41 @@ class StochasticAnalyzer:
         )
         # df_model, features = self.preparar_features(self.data)
 
+        # --- Guardas anti-fuga de fechas tras prepare_features_incremental ---
+        raw_start = self.data["datetime"].min()
+        raw_end = self.data["datetime"].max()
+
+        # Alinear tz del df_model a la de self.data (si hiciera falta)
+        tz_raw = getattr(self.data["datetime"].dt, "tz", None)
+        tz_mod = getattr(df_model["datetime"].dt, "tz", None)
+        if (tz_raw is not None) and (tz_mod is None):
+            df_model["datetime"] = df_model["datetime"].dt.tz_localize(tz_raw)
+        elif (tz_raw is not None) and (tz_mod is not None) and (str(tz_raw) != str(tz_mod)):
+            df_model["datetime"] = df_model["datetime"].dt.tz_convert(tz_raw)
+
+        # Recortar estrictamente al rango del train_slice
+        mask_bounds = (df_model["datetime"] >= raw_start) & (df_model["datetime"] <= raw_end)
+        n_outside = int((~mask_bounds).sum())
+        if n_outside:
+            print(f"[LEAK GUARD] recortando {n_outside} filas fuera de {raw_start}..{raw_end}")
+
+        df_model = df_model.loc[mask_bounds].copy()
+        df_model.sort_values("datetime", inplace=True)
+        df_model.reset_index(drop=True, inplace=True)
+
+        # (opcional) sanity checks
+        if not df_model["datetime"].is_monotonic_increasing:
+            print("[WARN] datetime no es monótono tras recorte; ordenando por seguridad.")
+            df_model = df_model.sort_values("datetime").reset_index(drop=True)
+
+        # Log del rango resultante (para auditar)
+        try:
+            a, b = df_model["datetime"].iloc[0], df_model["datetime"].iloc[-1]
+            print(f"Rango df_model tras recorte: {a} -> {b} (n={len(df_model)})")
+        except Exception:
+            pass
+
+
         L = getattr(self, "lookahead", 25)  # usa self.lookahead o 25 por defecto
 
         n_total = len(df_model)
@@ -3471,6 +3520,23 @@ class StochasticAnalyzer:
         df_train = df_model.iloc[:-L].copy()
         df_train = df_train[df_train["future_trend"].notna()]
         df_train = df_train.dropna(subset=features + ["future_trend"])
+
+        try:
+            first_val = df_train["datetime"].iloc[0]
+            last_val = df_train["datetime"].iloc[-1]
+
+            # Si son timestamps de pandas, usar .strftime
+            if isinstance(first_val, (pd.Timestamp, datetime)):
+                first_date = first_val.strftime("%Y-%m-%d %H:%M:%S")
+                last_date = last_val.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                # Caso de enteros o floats tipo UNIX timestamp
+                first_date = datetime.fromtimestamp(first_val).strftime("%Y-%m-%d %H:%M:%S")
+                last_date = datetime.fromtimestamp(last_val).strftime("%Y-%m-%d %H:%M:%S")
+
+            print(f"Rango de fechas en self.data inicial de recorte NKEEP y Lookahead: {first_date} -> {last_date}")
+        except Exception as e:
+            print(f"No se pudo obtener rango de fechas: {e}")
 
         X = df_train[features]
         y = df_train["future_trend"]
@@ -3695,6 +3761,18 @@ class StochasticAnalyzer:
 
             # 3) Re-entrenar el modelo base en TODO el TRAIN y envolver con Beta
             base_model_final = clone(base_model).fit(X_train_scaled, y_train)
+
+            preds_vanilla = base_model_final.predict(X_test_scaled)
+            proba_vanilla = base_model_final.predict_proba(X_test_scaled)
+            classes = base_model_final.classes_
+
+            print("Reporte de clasificación de modelo SIN calibrar + entrenamiento completo:")
+            print(classification_report(y_test, preds_vanilla, labels=classes))
+            print(f"Brier (multiclase): {multiclass_brier(y_test, proba_vanilla, classes):.6f}")
+            print(f"Log loss: {log_loss(y_test, proba_vanilla, labels=classes):.6f}")
+            print(f"ECE: {ece_maxprob(y_test, proba_vanilla, classes):.6f}")
+            print("=" * 50)
+
             self.model = BetaMultiWrapper(base_model_final, mc_beta, classes_=classes_global, label_encoder=None)
 
             # 4) (Opcional) clipping en inferencia dentro del wrapper (si tu wrapper no lo hace)
@@ -4055,6 +4133,40 @@ class StochasticAnalyzer:
             datetime_col="datetime",
             warmup_bars=150
         )
+
+        # --- Guardas anti-fuga de fechas tras prepare_features_incremental ---
+        raw_start = self.data["datetime"].min()
+        raw_end = self.data["datetime"].max()
+
+        # Alinear tz del df_model a la de self.data (si hiciera falta)
+        tz_raw = getattr(self.data["datetime"].dt, "tz", None)
+        tz_mod = getattr(df_model["datetime"].dt, "tz", None)
+        if (tz_raw is not None) and (tz_mod is None):
+            df_model["datetime"] = df_model["datetime"].dt.tz_localize(tz_raw)
+        elif (tz_raw is not None) and (tz_mod is not None) and (str(tz_raw) != str(tz_mod)):
+            df_model["datetime"] = df_model["datetime"].dt.tz_convert(tz_raw)
+
+        # Recortar estrictamente al rango del train_slice
+        mask_bounds = (df_model["datetime"] >= raw_start) & (df_model["datetime"] <= raw_end)
+        n_outside = int((~mask_bounds).sum())
+        if n_outside:
+            print(f"[LEAK GUARD] recortando {n_outside} filas fuera de {raw_start}..{raw_end}")
+
+        df_model = df_model.loc[mask_bounds].copy()
+        df_model.sort_values("datetime", inplace=True)
+        df_model.reset_index(drop=True, inplace=True)
+
+        # (opcional) sanity checks
+        if not df_model["datetime"].is_monotonic_increasing:
+            print("[WARN] datetime no es monótono tras recorte; ordenando por seguridad.")
+            df_model = df_model.sort_values("datetime").reset_index(drop=True)
+
+        # Log del rango resultante (para auditar)
+        try:
+            a, b = df_model["datetime"].iloc[0], df_model["datetime"].iloc[-1]
+            print(f"Rango df_model tras recorte: {a} -> {b} (n={len(df_model)})")
+        except Exception:
+            pass
 
         L = self.lookahead
         if len(df_model) <= L:
@@ -4556,13 +4668,15 @@ class StochasticAnalyzer:
 
         # 7) Filtro “fake” con EMA_10 (corrijo nombre de variable)
         close = float(last_meta['close'])
-        ema_10 = float(last_meta['EMA_10'])
+        ema_15 = float(last_meta['EMA_15'])
+        ema_200 = float(last_meta['EMA_200'])
+        k = float(last_meta['k'])
 
         pred = pred_class
-        if pred_class == 'bullish' and close < ema_10 and probabilities.get('bullish', 0.0) < 0.8:
+        if pred_class == 'bullish' and close < ema_15 and probabilities.get('bullish', 0.0) < 0.85 and k < 80:
             print(f"Fake bullish (cierre < EMA10 y prob < 0.8): {probabilities.get('bullish')}")
             pred = 'lateral'
-        elif pred_class == 'bearish' and close > ema_10 and probabilities.get('bearish', 0.0) < 0.8:
+        elif pred_class == 'bearish' and close > ema_15 and probabilities.get('bearish', 0.0) < 0.85 and k > 20:
             print(f"Fake bearish (cierre > EMA10 y prob < 0.8): {probabilities.get('bearish')}")
             pred = 'lateral'
 
@@ -4573,6 +4687,7 @@ class StochasticAnalyzer:
             "timestamp": last_meta['datetime'],
             "last_row_atr": float(last_meta['ATR']),
             "last_row_close": float(last_meta['close']),
+            "last_row_ema200": ema_200,
             "raw_df": df_new[["datetime", "open", "high", "low", "close", "volume"]].copy()
         }
         return result
@@ -4722,6 +4837,7 @@ class StochasticAnalyzer:
                 order_id=pos.get("order_id"),
                 trade_id=trade_id
             )
+            print(f"exit_reason={exit_reason} exit_price={exit_price}")
             # Si además cierras en el broker vía API, puedes dispararlo aquí.
             break  # ya cerramos; sal del loop
 
@@ -4786,6 +4902,8 @@ class StochasticAnalyzer:
                 # 3) Cálculos de RR/Kelly (con guardas de ATR)
                 atr = resultado.get('last_row_atr')
                 close_price = resultado.get('last_row_close')
+                ema200 = resultado.get('last_row_ema200')
+
                 atr_ok = (atr is not None) and (atr > 0)
 
                 # Evita asignar 'short' por defecto cuando es lateral
@@ -4814,8 +4932,8 @@ class StochasticAnalyzer:
                     kelly_fraction = max(0.0, min(p - (q / reward_risk), 0.95))
 
                 # Gate sólo si es elegible
-                self.umbral_strong = 0.76
-                self.umbral_soft = 0.75
+                self.umbral_strong = 0.74
+                self.umbral_soft = 0.73
 
                 gate = None
                 if eligible:
@@ -4881,7 +4999,7 @@ class StochasticAnalyzer:
                         new_side = "long" if pred == "bullish" else "short"
                         is_opposite = (side_position is not None and side_position != new_side)
 
-                        if is_opposite and proba_pred >= 0.70:
+                        if is_opposite and proba_pred >= 0.75:
                             # Criterio de PnL favorable (tal como lo tenías):
                             if side_position == "long" and entry_price is not None and close_price > entry_price:
                                 self.close_order("short")
@@ -4906,7 +5024,7 @@ class StochasticAnalyzer:
                             #  si ya no hay posición y llamar start_order; por ahora conservamos tu comportamiento.)
                         else:
                             self.start_order(pred, symbol, interval, bogota_time, proba_pred, probs,
-                                             atr, close_price, True, trade_id=trade_id)
+                                             atr, close_price, True, ema200, trade_id=trade_id)
                     else:
                         print("Señal no elegible (lateral, sin margen, sin ATR o bajo umbral).")
                     last_prediction = pred
@@ -4923,7 +5041,7 @@ class StochasticAnalyzer:
                                                       symbol=symbol, side=side_prediction, trade_id=trade_id)
                         else:
                             self.start_order(pred, symbol, interval, bogota_time, proba_pred, probs,
-                                             atr, close_price, True, trade_id=trade_id)
+                                             atr, close_price, True, ema200, trade_id=trade_id)
                     else:
                         print("Señal por debajo del umbral strong o no elegible — no trade.")
 
@@ -4951,13 +5069,16 @@ class StochasticAnalyzer:
                     os.rename(filename_, new_name_)
                     print("Nuevo nombre de archivo:", new_name_)
 
-    def start_order(self, pred, symbol, interval, bogota_time, proba, resultado, atr, close_price, real_account,
+    def start_order(self, pred, symbol, interval, bogota_time, proba, resultado, atr, close_price, real_account, ema200,
                     trade_id=None):
         if atr is not None and atr > 0:
             if (pred == "bullish") or (pred == "bearish"):
                 response = {}
-                profit_factor = 4
-                loss_factor = 3
+                profit_factor = 4.5
+                loss_factor = 3.5
+                if (pred == "bullish" and close_price < ema200) or (pred == "bearish" and close_price > ema200):
+                    profit_factor = 2.2
+
                 take_profit = close_price + (profit_factor * atr) if pred == "bullish" else close_price - (
                         profit_factor * atr)
                 stop_loss = close_price - (loss_factor * atr) if pred == "bullish" else close_price + (
@@ -5508,7 +5629,7 @@ class StochasticAnalyzer:
         # CONFIG (ajusta a tu mercado)
         # =========================
         # Ventanas para tendencia/canales
-        trend_windows = [20, 50, 100]
+        trend_windows = [100]
         channel_window = 50
 
         # Sesiones (UTC) — AJUSTA si tu dataset no está en UTC
@@ -5769,6 +5890,8 @@ class StochasticAnalyzer:
             dfx[f'high_lag{lag}'] = dfx['high'].shift(lag)
             dfx[f'low_lag{lag}'] = dfx['low'].shift(lag)
             dfx[f'e100_lag{lag}'] = dfx['e100'].shift(lag)
+            dfx[f'volume_lag{lag}'] = dfx['e100'].shift(lag)
+
 
 
         # =========================
@@ -5779,15 +5902,10 @@ class StochasticAnalyzer:
         # =========================
         # Lista final de features
         # =========================
-        for lag in lags:
-            dfx[f'close_lag{lag}'] = dfx['close'].shift(lag)
-            dfx[f'high_lag{lag}'] = dfx['high'].shift(lag)
-            dfx[f'low_lag{lag}'] = dfx['low'].shift(lag)
-            dfx[f'e100_lag{lag}'] = dfx['e100'].shift(lag)
 
 
         features_price = [
-            'close', 'high', 'low', 'e100'
+            'close', 'high', 'low', 'e100', 'volume'
         ]
         # === Generar lag features ===
         for col in features_price:
@@ -5795,31 +5913,28 @@ class StochasticAnalyzer:
                 df[f'{col}_lag{lag}'] = df[col].shift(lag)
         lag_feature_names = [f'{col}_lag{lag}' for col in features_price for lag in lags]
 
-        features_vol = ['volume', 'avg_volume_last_n', 'volatility', 'volatility_10', 'volatility_50', 'ATR',
-                        'atr_norm']
+        features_vol = ['avg_volume_last_n', 'volatility', 'volatility_50', 'atr_norm']
         features_sr = ['dist_PP', 'dist_S1', 'dist_R1', 'dist_S2', 'dist_R2', 'dist_resist_rl', 'dist_support_rl',
                        'dist_P_8h_atr', 'dist_S1_8h_atr', 'dist_R1_8h_atr', 'dist_S2_8h_atr', 'dist_R2_8h_atr']
-        features_time = ['minute_sin', 'minute_cos', 'dow_sin', 'dow_cos',
-                         'session_ny_open', 'session_london_open', 'session_asia_open']
+        features_time = ['minute_sin', 'minute_cos', 'dow_sin', 'dow_cos']
         features_trend = ['ema_ratio'] + \
                          [f"trend_slope_norm_{w}" for w in trend_windows] + \
-                         [f"trend_r2_{w}" for w in trend_windows] + \
+                         [f"trend_r2_100"] + \
                          [f"trend_dist_pct_{w}" for w in trend_windows] + \
                          ['trend_channel_slope_high', 'trend_channel_slope_low', 'trend_channel_width']
-        features_momentum = ['rsi_14', 'rsi_50', 'roc_10', 'roc_30', 'momentum_diff']
-        features_candles = ['candle_doji', 'candle_pinbar', 'candle_engulfing']
+        features_momentum = ['rsi_50', 'roc_30', 'k', 'd']
+        features_candles = ['candle_engulfing']
         features_conflu = ['rsi14_oversold_near_support', 'rsi14_overbought_near_resist']
 
-        new_day_feats = ['range_prev_day_abs', 'range_prev_day_pct', 'gap_open_abs', 'gap_open_pct',
+        new_day_feats = ['range_prev_day_abs', 'range_prev_day_pct',
                          'overnight_range_abs', 'overnight_range_pct']
         if 'ATR' in dfx.columns:
             new_day_feats += ['range_prev_day_atr', 'overnight_range_atr']
         # Dummies si existen (no obligatorias)
-        optional_dummies = [c for c in ['trend_ema200_up'] if c in dfx.columns]
+        # optional_dummies = [c for c in ['trend_ema200_up'] if c in dfx.columns]
 
         features_final = features_price + features_vol + features_sr + features_time + \
-                         features_trend + features_momentum + features_candles + \
-                         optional_dummies + new_day_feats + features_conflu + lag_feature_names
+                         features_trend + new_day_feats + lag_feature_names + features_candles + features_momentum
 
         # =========================
         # Limpieza robusta
@@ -6332,10 +6447,10 @@ if __name__ == "__main__":
         analyzer.create_predictive_model(
             model_type="rf",
             calibrate_method="beta",
-            N_KEEP=83000,
+            N_KEEP=101_000,
             display_graphic=True,
             model_kwargs={
-                "n_estimators": 1200,
+                "n_estimators": 1000,
                 "max_features": "sqrt",
                 "n_jobs": -1,
                 "random_state": 42
@@ -6381,18 +6496,18 @@ if __name__ == "__main__":
         #     on_event=logger,  # <— activar callback
         #     verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
         #     log_every_bars=250,
-        #     proba_threshold_day=0.7,
-        #     proba_threshold_night=0.72,
-        #     n_keep_for_fit=68880,
+        #     proba_threshold_day=0.75,
+        #     proba_threshold_night=0.76,
+        #     n_keep_for_fit=101000,
         #     atr_mult_tp=4,
         #     atr_mult_sl=3,
         #     retrain_each_bar=False,
-        #     retrain_every_bars=1152,
+        #     retrain_every_bars=None,
         #     suppress_fit_stdout=False,
-        #     early_exit_threshold=0.8
+        #     early_exit_threshold=0.75
         # )
         # #
-        # results = sim.run(test_start="2025-08-20", test_end="2025-09-03")
+        # results = sim.run(test_start="2025-08-26", test_end="2025-09-05")
         # print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
 
 
@@ -6433,7 +6548,7 @@ if __name__ == "__main__":
         #                 start_date="2024-01-01",
         #                 end_date=end_date,
         #                 interval="5"
-        #             )
+        #             )g
         #             analyzer.create_predictive_model(N_KEEP=60000)
         #             analyzer.monitor_predictions()
         #         else:
