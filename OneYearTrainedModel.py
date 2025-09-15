@@ -34,6 +34,7 @@ import warnings
 import smtplib
 from email.mime.text import MIMEText
 import pytz
+from numba import njit
 
 # helpers de librerías opcionales
 _HAS_LGBM, _HAS_XGB = False, False
@@ -94,9 +95,20 @@ warnings.filterwarnings('ignore')
 #     "sr_threshold_frac": 0.25
 # }
 
-# Solo 47 features
+# # Solo 47 features
+# params_to_features = {
+#     "version": "v3.7-traderlike_remove_low_features",  # cambia esto si modificas reglas de features
+#     "lags": [1],
+#     "trend_windows": [100],
+#     "channel_window": 50,
+#     "tz": "UTC-5",
+#     "sessions": {"NY": [(8, 30), (10, 30)], "LDN": [(2, 0), (4, 0)], "ASIA": [(18, 0), (20, 0)]},
+#     "sr_threshold_frac": 0.25
+# }
+
+# Solo 33 features
 params_to_features = {
-    "version": "v3.7-traderlike_remove_low_features",  # cambia esto si modificas reglas de features
+    "version": "v3.9-traderlike",  # cambia esto si modificas reglas de features
     "lags": [1],
     "trend_windows": [100],
     "channel_window": 50,
@@ -875,11 +887,11 @@ class TradeSimulator:
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 df_win = self.analyzer.add_indicators(df_win)
-                df_win = self.analyzer.add_volatility_zones(df_win)
+                # df_win = self.analyzer.add_volatility_zones(df_win)
                 df_ready, features = self.analyzer.preparar_features(df_win)
         else:
             df_win = self.analyzer.add_indicators(df_win)
-            df_win = self.analyzer.add_volatility_zones(df_win)
+            # df_win = self.analyzer.add_volatility_zones(df_win)
             df_ready, features = self.analyzer.preparar_features(df_win)
 
         if df_ready.empty:
@@ -904,14 +916,73 @@ class TradeSimulator:
             best_idx = int(np.argmax(proba_vec))
             pred_class = classes[best_idx]
 
+        # Señales con cruce y pendiente del histograma
+        m0 = self.df.loc[i, "macd"]
+        m1 = self.df.loc[i - 1, "macd"]
+
+        s0 = self.df.loc[i, "macd_signal"]
+        s1 = self.df.loc[i - 1, "macd_signal"]
+
+        h0 = self.df.loc[i, "macd_hist"]
+        h1 = self.df.loc[i - 1, "macd_hist"]
+        slope_up = h0 > h1
+        slope_down = h0 < h1
         # filtro de “fake” señales como en tu predict_realtime
         ema_15 = float(last_meta.get("EMA_15", np.nan))
+        ema_200 = float(last_meta.get("EMA_200", np.nan))
+
         close_px = float(last_meta["close"])
+        k = float(last_meta.get("k", np.nan))
         pred = pred_class
-        if pred_class == 'bullish' and (not np.isnan(ema_15)) and close_px < ema_15 and probabilities.get('bullish', 0) < 0.85:
-            pred = 'lateral'
-        elif pred_class == 'bearish' and (not np.isnan(ema_15)) and close_px > ema_15 and probabilities.get('bearish', 0) < 0.85:
-            pred = 'lateral'
+
+
+        # if pred_class == 'bullish' and slope_up and m0 > s0 and probabilities.get('bullish', 0) > 0.6 and m0 > m1:
+        #     pred = 'bullish'
+        # if pred_class == 'bullish' and probabilities.get('bullish', 0) > 0.85 and (slope_up or m0 > s0):
+        #     pred = 'bullish'
+        if pred_class == 'bullish' and m0 < s0 and probabilities.get('bullish', 0) > 0.6:
+            probabilities['bullish'] = 0.619
+        if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and not slope_up:
+            probabilities['bullish'] = 0.619
+        if pred_class == 'bullish' and probabilities.get('bearish') < 0.85 and k > 75:
+            probabilities['bullish'] = 0.619
+        if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and close_px < ema_15:
+            probabilities['bullish'] = 0.619
+
+        #     if not np.isnan(ema_15) :
+        #         pred = 'lateral'
+        #     if probabilities.get('bullish', 0) < 0.7 and m0 < s0:
+        #         pred = 'lateral'
+        # if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and close_px < ema_200 and m0 < s0:
+        #     pred = 'lateral'
+
+        # if pred_class == 'bullish' and probabilities.get('bullish', 0) > 0.85 and (slope_up or m0 > s0):
+        #     pred = 'bullish'
+
+        # if pred_class == 'bearish' and slope_down and m0 < s0 and probabilities.get('bearish', 0) > 0.6 and m0 < m1:
+        #     pred = 'bearish'
+        # if pred_class == 'bearish' and probabilities.get('bearish', 0) > 0.85 and (slope_down or m0 < s0):
+        #     pred = 'bearish'
+        if pred_class == 'bearish' and m0 > s0 and probabilities.get('bearish') < 0.85:
+            probabilities['bearish'] = 0.619
+        if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and not slope_down:
+            probabilities['bearish'] = 0.619
+        if pred_class == 'bearish' and probabilities.get('bearish') < 0.85 and k < 25:
+            probabilities['bearish'] = 0.619
+        if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and close_px > ema_15:
+            probabilities['bearish'] = 0.619
+
+        # elif pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and k < 40:
+        #     if not np.isnan(ema_15) and close_px > ema_15:
+        #         pred = 'lateral'
+        #     if probabilities.get('bearish', 0) < 0.7 and m0 > s0:
+        #         pred = 'lateral'
+        # if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and close_px > ema_200 and m0 > s0:
+        #     pred = 'lateral'
+
+        # if pred_class == 'bearish' and probabilities.get('bearish', 0) > 0.85 and (slope_down or m0 < s0):
+        #     pred = 'bearish'
+
 
         return {
             "prediction": pred,
@@ -955,7 +1026,7 @@ class TradeSimulator:
         # return proba is not None and thresh <= float(proba) < 0.89
         return proba is not None and float(proba) >= thresh
 
-    def _tp_sl_from_adapter_or_atr(self, i: int, side: Literal["long", "short"],
+    def _tp_sl_from_adapter_or_atr(self, i: int, proba: int, side: Literal["long", "short"],
                                    maybe_tp: Optional[float], maybe_sl: Optional[float]) -> Tuple[float, float]:
         px = float(self.df.loc[i, "close"])
         if self.use_adapter_tp_sl_when_missing and (maybe_tp is not None) and (maybe_sl is not None):
@@ -963,13 +1034,14 @@ class TradeSimulator:
         atr = float(self.df.loc[i, "atr"]) if not np.isnan(self.df.loc[i, "atr"]) else px * 0.005
         ema_200 = float(self.df.loc[i, "EMA_200"])
         if side == "long":
-            self.atr_mult_tp = 2.3 if px < ema_200 else self.atr_mult_tp
+            self.atr_mult_tp = 2.5 if px < ema_200 and proba < 0.8 else self.atr_mult_tp
             tp = px + self.atr_mult_tp * atr
             sl = px - self.atr_mult_sl * atr
         else:
-            self.atr_mult_tp = 2.3 if px > ema_200 else self.atr_mult_tp
+            self.atr_mult_tp = 2.5 if px > ema_200 and proba < 0.8 else self.atr_mult_tp
             tp = px - self.atr_mult_tp * atr
             sl = px + self.atr_mult_sl * atr
+
         return tp, sl
 
     def _size_position(self, px: float, kelly_fraction: Optional[float] = None) -> float:
@@ -1021,6 +1093,51 @@ class TradeSimulator:
         Por defecto **entrena una sola vez** con el histórico previo a `test_start`.
         Si `retrain_each_bar=True`, reentrena en cada barra antes de predecir.
         """
+
+        # --- helper: MACD con librería y solo hasta i ---
+        def _macd_last_two(close_s, fast=12, slow=26, signal=9):
+            """
+            Devuelve (m_prev, m_curr, s_prev, s_curr, h_prev, h_curr) usando SOLO datos hasta el punto dado.
+            Requiere al menos 2 valores válidos (no-NaN) de macd/signal/hist.
+            """
+            s = pd.Series(close_s, copy=True).astype(float)
+
+            # 1) Intentar pandas_ta
+            try:
+                import pandas_ta as ta  # pip install pandas-ta
+                macd_df = ta.macd(s, fast=fast, slow=slow, signal=signal)  # cols: MACD_*, MACDs_*, MACDh_*
+                macd_df = macd_df.dropna()
+                if len(macd_df) < 2:
+                    return None
+                last2 = macd_df.iloc[-2:]
+                # orden esperado: [MACD, MACDs, MACDh]
+                m_prev, m_curr = float(last2.iloc[0, 0]), float(last2.iloc[1, 0])
+                s_prev, s_curr = float(last2.iloc[0, 1]), float(last2.iloc[1, 1])
+                h_prev, h_curr = float(last2.iloc[0, 2]), float(last2.iloc[1, 2])
+                return (m_prev, m_curr, s_prev, s_curr, h_prev, h_curr)
+            except Exception:
+                pass
+
+            # 2) Fallback: ta (bukosabino)
+            try:
+                from ta.trend import MACD  # pip install ta
+                ind = MACD(close=s, window_slow=slow, window_fast=fast, window_sign=signal, fillna=False)
+                m = ind.macd()
+                sg = ind.macd_signal()
+                h = ind.macd_diff()
+                tmp = pd.concat([m, sg, h], axis=1).dropna()
+                if len(tmp) < 2:
+                    return None
+                last2 = tmp.iloc[-2:]
+                m_prev, m_curr = float(last2.iloc[0, 0]), float(last2.iloc[1, 0])
+                s_prev, s_curr = float(last2.iloc[0, 1]), float(last2.iloc[1, 1])
+                h_prev, h_curr = float(last2.iloc[0, 2]), float(last2.iloc[1, 2])
+                return (m_prev, m_curr, s_prev, s_curr, h_prev, h_curr)
+            except Exception as e:
+                raise ImportError(
+                    "Instala una librería para MACD: `pip install pandas-ta` o `pip install ta`."
+                ) from e
+
         # Alinear test_start / test_end a la misma tz que el DataFrame
         tz = getattr(self, "tz", None)
 
@@ -1100,6 +1217,23 @@ class TradeSimulator:
                         self.fit_model(train_slice)
                         if getattr(self, "announce_fit", False):
                             if self.on_event: self.on_event("fit_end", {"phase": "periodic", "pos": pos + 1})
+
+            # sig = self.get_signal(i)
+            # if sig:
+            #     pred = sig.get("prediction")
+            #     proba = self._extract_proba_for_monitor(sig)
+            #     ts = self.df.loc[i, "datetime"]
+            #     macd = self.df.loc[i, "macd"]
+            #     macd_signal = self.df.loc[i, "macd_signal"]
+            #     h0 = self.df.loc[i, "macd_hist"]
+            #     h1 = self.df.loc[i - 1, "macd_hist"]
+            #     slope = 'up' if h0 > h1 else 'down'
+            #
+            #     side = "long" if pred == "bullish" else "short"
+            #     if self.on_event and proba >= 0.6:
+            #         self.on_event("new_predicction", {
+            #             "time": ts, "side": pred, "prob": proba, "macd": macd, "macd_signal": macd_signal, 'histogram': slope,
+            #         })
 
             # Si hay trade abierto, intentar cierre en esta barra
             if current_trade is not None and current_trade.is_open():
@@ -1211,17 +1345,54 @@ class TradeSimulator:
                 if pred not in {"bullish", "bearish"}:
                     continue
                 ts = self.df.loc[i, "datetime"]
+                side = "long" if pred == "bullish" else "short"
                 if not self._passes_monitor(ts, proba):
                     continue
 
+                # close_slice = self.df.loc[:i, "close"]
+
+                # macd_vals = _macd_last_two(close_slice, fast=12, slow=26, signal=9)
+                # if macd_vals is None:
+                #     # No hay suficientes datos MACD válidos: no abrimos
+                #     continue
+                #
+                # m_prev, m_curr, s_prev, s_curr, h_prev, h_curr = macd_vals
+                #
+                # # Señales clásicas
+                # hist_cross_up = (h_prev <= 0) and (h_curr > 0)
+                # hist_cross_down = (h_prev >= 0) and (h_curr < 0)
+                # macd_cross_up = (m_prev <= s_prev) and (m_curr > s_curr)
+                # macd_cross_down = (m_prev >= s_prev) and (m_curr < s_curr)
+                # slope_up = (h_curr > h_prev)
+                # slope_down = (h_curr < h_prev)
+                #
+                # # Gates suaves con %K si lo tienes en self.df; si no, pasa
+                # import numpy as np
+                # k_val = float(self.df.loc[i, "k"]) if "k" in self.df.columns else np.nan
+                # bull_gate_k = (np.isnan(k_val) or k_val < 60)
+                # bear_gate_k = (np.isnan(k_val) or k_val > 40)
+                #
+                # macd_bull = ((slope_up))
+                # macd_bear = ((slope_down))
+                #
+                # # Alineación modelo + MACD + probas (umbral 0.60 ajustable)
+                # if pred == "bullish":
+                #     if (not macd_bull) or (probs.get("bullish", 0.0) < 0.60):
+                #         continue
+                # elif pred == "bearish":
+                #     if (not macd_bear) or (probs.get("bearish", 0.0) < 0.60):
+                #         continue
+                # else:
+                #     # Solo operamos direccionales
+                #     continue
+
                 px = float(self.df.loc[i, "close"])  # entrada al cierre de i
-                side = "long" if pred == "bullish" else "short"
 
                 # TP/SL concretos de esta señal
                 tp, sl = self._tp_sl_from_adapter_or_atr(
-                    i, side,
+                    i, proba, side,
                     sig.get("take_profit") or sig.get("tp"),
-                    sig.get("stop_loss") or sig.get("sl")
+                    sig.get("stop_loss") or sig.get("sl"),
                 )
 
                 # ★ Kelly: si la señal no trae kelly_fraction, lo calculamos aquí
@@ -2441,6 +2612,23 @@ class StochasticAnalyzer:
             df[f'EMA_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
             df[f'trend_ema{period}'] = np.where(df['close'] > df[f'EMA_{period}'], 'up', 'down')
 
+        def ema(data: pd.Series, period: int) -> pd.Series:
+            return data.ewm(span=period, adjust=False).mean()
+
+        def calculate(prices: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
+            fast_length = 12
+            slow_length = 26
+            signal_length = 9
+
+            fast_ma = ema(prices.astype("float64"), fast_length)
+            slow_ma = ema(prices.astype("float64"), slow_length)
+            macd_line = fast_ma - slow_ma
+            signal_line = ema(macd_line, signal_length)
+            histogram = macd_line - signal_line
+            return macd_line, signal_line, histogram
+
+        df["macd"], df["macd_signal"], df["macd_hist"] = calculate(df["close"])
+
         # # VWAP Trend
         # VWAP tradicional: suma acumulada de (precio*vol) / suma acumulada de volumen
         vwap = (df['close'] * df['volume']).cumsum() / df['volume'].cumsum()
@@ -3645,40 +3833,11 @@ class StochasticAnalyzer:
             )
             self.classes_ = classes_text
             self.model_tag_ = model_tag
-            u_soft = 0.75
-            u_strong = 0.76
-            # ==== Selección de umbrales con fallback XGB (como ya lo dejaste) ====
-            try:
-                u_strong, info_strong, u_soft, info_soft, df_bands = self.select_thresholds_by_band_precision(
-                    X_hold=X_test_scaled, y_hold=y_test_labels,
-                    band_step=0.1, u_min=0.55, u_max=0.95,
-                    min_margin=0.03,
-                    min_n_soft=1000,
-                    min_n_strong=1200,
-                    min_trade_rate_soft=0.10,
-                    min_trade_rate_strong=0.03,
-                    soft_range=(0.83, 0.865),
-                    strong_range=(0.89, 0.96),
-                    soft_start=0.60,
-                    strong_start=0.80,
-                    use_ci_lower=True,
-                    prefer_center_soft=True
-                )
-            except Exception as e:
-                print(f"[WARN] select_thresholds_by_band_precision falló con XGB: {e}")
-                self.umbral_soft = u_soft
-                self.umbral_strong = u_strong
-                info_soft = {"reason": "xgb_default_thresholds", "chosen": {"u": u_soft}}
-                info_strong = {"reason": "xgb_default_thresholds", "chosen": {"u": u_strong}}
-                df_bands = pd.DataFrame(columns=["u_lo", "u_hi", "n", "precision", "ci_lo", "ci_hi", "trade_rate"])
 
             print("\nImportancia de características:")
             print(self.feature_importance_)
 
             print(f"\nModelo base: {model_tag.upper()} | calibración: {calibrate_method}")
-            print("u_strong:", u_strong, "| u_soft:", u_soft)
-            print("STRONG:", info_strong)
-            print("SOFT:", info_soft)
 
             # Gráficas de calibración
             if display_graphic:
@@ -4604,7 +4763,7 @@ class StochasticAnalyzer:
 
         # 2) Indicadores y zonas
         df_new = self.add_indicators(df_new)
-        df_new = self.add_volatility_zones(df_new)
+        # df_new = self.add_volatility_zones(df_new)
 
         # 3) Preparar features
         df_ready, features = self.preparar_features(df_new)
@@ -4672,13 +4831,68 @@ class StochasticAnalyzer:
         ema_200 = float(last_meta['EMA_200'])
         k = float(last_meta['k'])
 
+        # Señales con cruce y pendiente del histograma
+        h0, h1 = float(df_ready["macd_hist"].iloc[-1]), float(df_new["macd_hist"].iloc[-2])
+        m0, m1 = float(df_ready["macd"].iloc[-1]), float(df_new["macd"].iloc[-2])
+        s0, s1 = float(df_ready["macd_signal"].iloc[-1]), float(df_new["macd_signal"].iloc[-2])
+        slope_up, slope_down = (h0 > h1), (h0 < h1)
+
+        # filtro de “fake” señales como en tu predict_realtime
+        ema_15 = float(last_meta.get("EMA_15", np.nan))
+        close_px = float(last_meta["close"])
+        k = float(last_meta.get("k", np.nan))
         pred = pred_class
-        if pred_class == 'bullish' and close < ema_15 and probabilities.get('bullish', 0.0) < 0.85 and k < 80:
-            print(f"Fake bullish (cierre < EMA10 y prob < 0.8): {probabilities.get('bullish')}")
-            pred = 'lateral'
-        elif pred_class == 'bearish' and close > ema_15 and probabilities.get('bearish', 0.0) < 0.85 and k > 20:
-            print(f"Fake bearish (cierre > EMA10 y prob < 0.8): {probabilities.get('bearish')}")
-            pred = 'lateral'
+
+        if pred_class == 'bullish' and m0 < s0 and probabilities.get('bullish', 0) > 0.6:
+            probabilities['bullish'] = 0.619
+            print(f"Fake bullish por Macd bajista): {probabilities.get('bullish')}")
+
+        if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and not slope_up:
+            probabilities['bullish'] = 0.619
+            print(f"Fake bullish por histograma Macd bajista): {probabilities.get('bullish')}")
+
+        if pred_class == 'bullish' and probabilities.get('bearish') < 0.85 and k > 75:
+            print(f"Fake bullish en sobre compra): {probabilities.get('bullish')}")
+            probabilities['bullish'] = 0.619
+
+        if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and close_px < ema_15:
+            probabilities['bullish'] = 0.619
+            print(f"Fake bullish (cierre < EMA10): {probabilities.get('bullish')}")
+
+
+        # if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and k > 50:
+        #     print(f"Fake bullish (cierre < EMA10 y prob < 0.8 o k > 50 k={k} o histograma baja): {probabilities.get('bullish')}")
+        #     if not np.isnan(ema_15) and close_px < ema_15:
+        #         pred = 'lateral'
+        #     if probabilities.get('bullish', 0) < 0.7 and m0 < s0:
+        #         pred = 'lateral'
+        # if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and not slope_up:
+        #     pred = 'lateral'
+
+        if pred_class == 'bearish' and m0 > s0 and probabilities.get('bearish') < 0.85:
+            probabilities['bearish'] = 0.619
+            print(f"Fake bearish por Macd alcista): {probabilities.get('bearish')}")
+
+        if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and not slope_down:
+            probabilities['bearish'] = 0.619
+            print(f"Fake bearish por histograma Macd alcista): {probabilities.get('bearish')}")
+
+        if pred_class == 'bearish' and probabilities.get('bearish') < 0.85 and k < 25:
+            probabilities['bearish'] = 0.619
+            print(f"Fake bearish en sobre venta): {probabilities.get('bearish')}")
+
+        if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and close_px > ema_15:
+            probabilities['bearish'] = 0.619
+            print(f"Fake bearish (cierre > EMA10): {probabilities.get('bearish')}")
+
+        # elif pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and k < 50:
+        #     print(f"Fake bearish (cierre > EMA10 y prob < 0.8 o k < 50 k={k} o histograma sube): {probabilities.get('bearish')}")
+        #     if not np.isnan(ema_15) and close_px > ema_15:
+        #         pred = 'lateral'
+        #     if probabilities.get('bearish', 0) < 0.7 and m0 > s0:
+        #         pred = 'lateral'
+        # if  pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and not slope_down:
+        #     pred = 'lateral'
 
         result = {
             "prediction": pred,
@@ -5074,9 +5288,9 @@ class StochasticAnalyzer:
         if atr is not None and atr > 0:
             if (pred == "bullish") or (pred == "bearish"):
                 response = {}
-                profit_factor = 4.5
-                loss_factor = 3.5
-                if (pred == "bullish" and close_price < ema200) or (pred == "bearish" and close_price > ema200):
+                profit_factor = 4.2
+                loss_factor = 3
+                if ((pred == "bullish" and close_price < ema200) or (pred == "bearish" and close_price > ema200)) and proba < 0.8:
                     profit_factor = 2.2
 
                 take_profit = close_price + (profit_factor * atr) if pred == "bullish" else close_price - (
@@ -5542,70 +5756,6 @@ class StochasticAnalyzer:
             self.data = pd.concat([self.data, new_df], ignore_index=True)
             self.data = self.data.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
 
-    def preparar_features_backup(self, df, lags=[1]):
-        df = df.copy()
-
-        base_features = [
-            'd100', 'e100', 'e', 'volatility', 'ATR', 'ADX_14', 'avg_volume_last_n',
-            'close', 'high', 'low'
-        ]
-
-        no_lag_features = [
-            'minute_sin', 'minute_cos', 'k100', 'dow_sin', 'dow_cos', 'k', 'd', 'volume'
-        ]
-
-        features_testing = [
-            'return_5',
-            'volatility_10', 'volatility_50', 'atr_norm',
-            'roc_10', 'roc_30', 'momentum_diff',
-            'rsi_14', 'rsi_50',
-            'ema_ratio'
-        ]
-
-        # Soporte y Resistencia
-        support_resistance = [
-            "dist_PP", "dist_S1", "dist_R1", "dist_S2", "dist_R2", "dist_resist_rl", "dist_support_rl"
-        ]
-
-        extra_feats = [
-            "dist_P_8h_atr", "dist_R1_8h_atr", "dist_R2_8h_atr", "dist_R3_8h_atr",
-            "dist_S1_8h_atr", "dist_S2_8h_atr", "dist_S3_8h_atr"
-        ]
-
-        sr_binaries = [
-            "near_res_8h", "near_sup_8h", "stoch_overbought_80", "stoch_overbought_90", "stoch_oversold_20",
-            "stoch_oversold_10", "stoch_k_slope", "stoch_k_above_d"
-        ]
-
-        dummy_cols_base = ['trend_ema200', 'trend_vwap']
-        dummy_expected = [
-            'trend_ema200_up', 'trend_vwap_up'
-        ]
-
-        # === Convertir variables categóricas en dummies ===
-        df = pd.get_dummies(df, columns=dummy_cols_base)
-
-        # === Asegurar que todas las dummies estén presentes ===
-        for col in dummy_expected:
-            if col not in df.columns:
-                df[col] = 0
-
-        # === Generar lag features ===
-        for col in base_features:
-            for lag in lags:
-                df[f'{col}_lag{lag}'] = df[col].shift(lag)
-
-        # === Lista final de features: actuales + lags ===
-        lag_feature_names = [f'{col}_lag{lag}' for col in base_features for lag in lags]
-        features_final = base_features + no_lag_features + lag_feature_names + features_testing + extra_feats + support_resistance + sr_binaries
-
-        # === Reemplazar infinitos y eliminar NaNs solo en las columnas de interés ===
-        df[features_final] = df[features_final].replace([np.inf, -np.inf], np.nan)
-
-        return df, features_final
-
-    import pandas as pd
-    import numpy as np
 
     def preparar_features(self, df, lags=[1]):
         """
@@ -5893,7 +6043,6 @@ class StochasticAnalyzer:
             dfx[f'volume_lag{lag}'] = dfx['e100'].shift(lag)
 
 
-
         # =========================
         # New day features
         # =========================
@@ -5904,28 +6053,28 @@ class StochasticAnalyzer:
         # =========================
 
 
-        features_price = [
-            'close', 'high', 'low', 'e100', 'volume'
-        ]
-        # === Generar lag features ===
-        for col in features_price:
-            for lag in lags:
-                df[f'{col}_lag{lag}'] = df[col].shift(lag)
-        lag_feature_names = [f'{col}_lag{lag}' for col in features_price for lag in lags]
-
-        features_vol = ['avg_volume_last_n', 'volatility', 'volatility_50', 'atr_norm']
-        features_sr = ['dist_PP', 'dist_S1', 'dist_R1', 'dist_S2', 'dist_R2', 'dist_resist_rl', 'dist_support_rl',
-                       'dist_P_8h_atr', 'dist_S1_8h_atr', 'dist_R1_8h_atr', 'dist_S2_8h_atr', 'dist_R2_8h_atr']
-        features_time = ['minute_sin', 'minute_cos', 'dow_sin', 'dow_cos']
-        features_trend = ['ema_ratio'] + \
-                         [f"trend_slope_norm_{w}" for w in trend_windows] + \
-                         [f"trend_r2_100"] + \
-                         [f"trend_dist_pct_{w}" for w in trend_windows] + \
-                         ['trend_channel_slope_high', 'trend_channel_slope_low', 'trend_channel_width']
-        features_momentum = ['rsi_50', 'roc_30', 'k', 'd']
-        features_candles = ['candle_engulfing']
-        features_conflu = ['rsi14_oversold_near_support', 'rsi14_overbought_near_resist']
-
+        # features_price = [
+        #     'close', 'high', 'low', 'e100', 'volume'
+        # ]
+        # # === Generar lag features ===
+        # for col in features_price:
+        #     for lag in lags:
+        #         df[f'{col}_lag{lag}'] = df[col].shift(lag)
+        # lag_feature_names = [f'{col}_lag{lag}' for col in features_price for lag in lags]
+        #
+        # features_vol = ['avg_volume_last_n', 'volatility', 'volatility_50', 'atr_norm']
+        # features_sr = ['dist_PP', 'dist_S1', 'dist_R1', 'dist_S2', 'dist_R2', 'dist_resist_rl', 'dist_support_rl',
+        #                'dist_P_8h_atr', 'dist_S1_8h_atr', 'dist_R1_8h_atr', 'dist_S2_8h_atr', 'dist_R2_8h_atr']
+        # features_time = ['minute_sin', 'minute_cos', 'dow_sin', 'dow_cos']
+        # features_trend = ['ema_ratio'] + \
+        #                  [f"trend_slope_norm_{w}" for w in trend_windows] + \
+        #                  [f"trend_r2_100"] + \
+        #                  [f"trend_dist_pct_{w}" for w in trend_windows] + \
+        #                  ['trend_channel_slope_high', 'trend_channel_slope_low', 'trend_channel_width']
+        # features_momentum = ['rsi_50', 'roc_30', 'k', 'd']
+        # features_candles = ['candle_engulfing']
+        # features_conflu = ['rsi14_oversold_near_support', 'rsi14_overbought_near_resist']
+        #
         new_day_feats = ['range_prev_day_abs', 'range_prev_day_pct',
                          'overnight_range_abs', 'overnight_range_pct']
         if 'ATR' in dfx.columns:
@@ -5933,8 +6082,15 @@ class StochasticAnalyzer:
         # Dummies si existen (no obligatorias)
         # optional_dummies = [c for c in ['trend_ema200_up'] if c in dfx.columns]
 
-        features_final = features_price + features_vol + features_sr + features_time + \
-                         features_trend + new_day_feats + lag_feature_names + features_candles + features_momentum
+        features_trader = ['dist_S2', 'dist_R2', 'close', 'dist_PP', 'volatility_50', 'minute_sin', 'minute_cos',
+                          'overnight_range_pct', 'trend_slope_norm_100', 'dist_S2_8h_atr', 'avg_volume_last_n',
+                          'dist_R2_8h_atr', 'overnight_range_abs', 'range_prev_day_pct', 'volume_lag1',
+                          'dist_R1_8h_atr', 'range_prev_day_abs', 'overnight_range_atr', 'dist_P_8h_atr',
+                          'trend_r2_100', 'range_prev_day_atr', 'trend_channel_slope_low',
+                          'ema_ratio', 'trend_dist_pct_100', 'rsi_50', 'dist_resist_rl', 'roc_30', 'dist_support_rl',
+                          'd', 'dow_sin', 'volume', 'dow_cos', 'candle_engulfing']
+
+        features_final = features_trader
 
         # =========================
         # Limpieza robusta
@@ -5942,7 +6098,6 @@ class StochasticAnalyzer:
         # Reemplaza inf/-inf por NaN en las columnas de interés y deja que tu pipeline downstream dropee NaNs
         dfx[features_final] = dfx[features_final].replace([np.inf, -np.inf], np.nan)
 
-        print("Datos preparados para el entrenamiento")
 
         return dfx, features_final
 
@@ -6447,10 +6602,10 @@ if __name__ == "__main__":
         analyzer.create_predictive_model(
             model_type="rf",
             calibrate_method="beta",
-            N_KEEP=101_000,
+            N_KEEP=170_000,
             display_graphic=True,
             model_kwargs={
-                "n_estimators": 1000,
+                "n_estimators": 700,
                 "max_features": "sqrt",
                 "n_jobs": -1,
                 "random_state": 42
