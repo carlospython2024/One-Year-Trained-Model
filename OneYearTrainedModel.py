@@ -4836,6 +4836,8 @@ class StochasticAnalyzer:
         m0, m1 = float(df_ready["macd"].iloc[-1]), float(df_new["macd"].iloc[-2])
         s0, s1 = float(df_ready["macd_signal"].iloc[-1]), float(df_new["macd_signal"].iloc[-2])
         slope_up, slope_down = (h0 > h1), (h0 < h1)
+        macd_up = s0 > s1
+        macd_down = s0 < s1
 
         # filtro de “fake” señales como en tu predict_realtime
         ema_15 = float(last_meta.get("EMA_15", np.nan))
@@ -4843,56 +4845,37 @@ class StochasticAnalyzer:
         k = float(last_meta.get("k", np.nan))
         pred = pred_class
 
-        if pred_class == 'bullish' and m0 < s0 and probabilities.get('bullish', 0) > 0.6:
-            probabilities['bullish'] = 0.619
-            print(f"Fake bullish por Macd bajista): {probabilities.get('bullish')}")
-
         if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and not slope_up:
-            probabilities['bullish'] = 0.619
-            print(f"Fake bullish por histograma Macd bajista): {probabilities.get('bullish')}")
+            probabilities['bullish'] = min(0.659, probabilities.get('bullish'))
+            print(f"Fake bullish: histograma Macd bajista)")
 
-        if pred_class == 'bullish' and probabilities.get('bearish') < 0.85 and k > 75:
-            print(f"Fake bullish en sobre compra): {probabilities.get('bullish')}")
-            probabilities['bullish'] = 0.619
+        if pred_class == 'bullish' and probabilities.get('bearish') < 0.85 and k > 80:
+            print(f"Fake bullish: en sobre compra)")
+            probabilities['bullish'] = min(0.659, probabilities.get('bullish'))
 
-        if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and close_px < ema_15:
-            probabilities['bullish'] = 0.619
-            print(f"Fake bullish (cierre < EMA10): {probabilities.get('bullish')}")
+        if pred_class == 'bullish' and probabilities.get('bullish') < 0.85 and not macd_up:
+            print(f"Fake bullish: Macd bajista)")
+            probabilities['bullish'] = min(0.659, probabilities.get('bullish'))
 
-
-        # if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and k > 50:
-        #     print(f"Fake bullish (cierre < EMA10 y prob < 0.8 o k > 50 k={k} o histograma baja): {probabilities.get('bullish')}")
-        #     if not np.isnan(ema_15) and close_px < ema_15:
-        #         pred = 'lateral'
-        #     if probabilities.get('bullish', 0) < 0.7 and m0 < s0:
-        #         pred = 'lateral'
-        # if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and not slope_up:
-        #     pred = 'lateral'
-
-        if pred_class == 'bearish' and m0 > s0 and probabilities.get('bearish') < 0.85:
-            probabilities['bearish'] = 0.619
-            print(f"Fake bearish por Macd alcista): {probabilities.get('bearish')}")
+        # if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and close_px < ema_15:
+        #     probabilities['bullish'] = 0.619
+        #     print(f"Fake bullish: cierre < EMA10")
 
         if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and not slope_down:
-            probabilities['bearish'] = 0.619
-            print(f"Fake bearish por histograma Macd alcista): {probabilities.get('bearish')}")
+            probabilities['bearish'] = min(0.659, probabilities.get('bearish'))
+            print(f"Fake bearish: histograma Macd alcista)")
 
-        if pred_class == 'bearish' and probabilities.get('bearish') < 0.85 and k < 25:
-            probabilities['bearish'] = 0.619
-            print(f"Fake bearish en sobre venta): {probabilities.get('bearish')}")
+        if pred_class == 'bearish' and probabilities.get('bearish') < 0.85 and k < 20:
+            probabilities['bearish'] = min(0.659, probabilities.get('bearish'))
+            print(f"Fake bearish: en sobre venta)")
 
-        if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and close_px > ema_15:
-            probabilities['bearish'] = 0.619
-            print(f"Fake bearish (cierre > EMA10): {probabilities.get('bearish')}")
+        if pred_class == 'bearish' and probabilities.get('bearish') < 0.85 and not macd_down:
+            print(f"Fake bearish: Macd alcista)")
+            probabilities['bearish'] = min(0.659, probabilities.get('bearish'))
 
-        # elif pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and k < 50:
-        #     print(f"Fake bearish (cierre > EMA10 y prob < 0.8 o k < 50 k={k} o histograma sube): {probabilities.get('bearish')}")
-        #     if not np.isnan(ema_15) and close_px > ema_15:
-        #         pred = 'lateral'
-        #     if probabilities.get('bearish', 0) < 0.7 and m0 > s0:
-        #         pred = 'lateral'
-        # if  pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and not slope_down:
-        #     pred = 'lateral'
+        # if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and close_px > ema_15:
+        #     probabilities['bearish'] = 0.619
+        #     print(f"Fake bearish: cierre > EMA10")
 
         result = {
             "prediction": pred,
@@ -4902,7 +4885,7 @@ class StochasticAnalyzer:
             "last_row_atr": float(last_meta['ATR']),
             "last_row_close": float(last_meta['close']),
             "last_row_ema200": ema_200,
-            "raw_df": df_new[["datetime", "open", "high", "low", "close", "volume"]].copy()
+            "raw_df": df_new[["datetime", "open", "high", "low", "close", "volume", "macd", "macd_signal", "macd_hist"]].copy()
         }
         return result
 
@@ -5117,6 +5100,7 @@ class StochasticAnalyzer:
                 atr = resultado.get('last_row_atr')
                 close_price = resultado.get('last_row_close')
                 ema200 = resultado.get('last_row_ema200')
+                data_df = resultado.get("raw_df")
 
                 atr_ok = (atr is not None) and (atr > 0)
 
@@ -5146,8 +5130,8 @@ class StochasticAnalyzer:
                     kelly_fraction = max(0.0, min(p - (q / reward_risk), 0.95))
 
                 # Gate sólo si es elegible
-                self.umbral_strong = 0.74
-                self.umbral_soft = 0.73
+                self.umbral_strong = 0.68
+                self.umbral_soft = 0.67
 
                 gate = None
                 if eligible:
@@ -5237,8 +5221,8 @@ class StochasticAnalyzer:
                             # (Si quisieras “flippear” inmediatamente después de cerrar en A2, podrías chequear aquí
                             #  si ya no hay posición y llamar start_order; por ahora conservamos tu comportamiento.)
                         else:
-                            self.start_order(pred, symbol, interval, bogota_time, proba_pred, probs,
-                                             atr, close_price, True, ema200, trade_id=trade_id)
+                            self.start_order(pred, symbol, bogota_time, proba_pred, probs,
+                                             atr, df=data_df, close_price=close_price, real_account=False, ema200=ema200, trade_id=trade_id)
                     else:
                         print("Señal no elegible (lateral, sin margen, sin ATR o bajo umbral).")
                     last_prediction = pred
@@ -5254,8 +5238,8 @@ class StochasticAnalyzer:
                             self.tradelogger.log_info(note="Señal ignorada: ya hay posición abierta",
                                                       symbol=symbol, side=side_prediction, trade_id=trade_id)
                         else:
-                            self.start_order(pred, symbol, interval, bogota_time, proba_pred, probs,
-                                             atr, close_price, True, ema200, trade_id=trade_id)
+                            self.start_order(pred, symbol, bogota_time, proba_pred, probs,
+                                             atr, df=data_df, close_price=close_price, real_account=False, ema200=ema200, trade_id=trade_id)
                     else:
                         print("Señal por debajo del umbral strong o no elegible — no trade.")
 
@@ -5283,20 +5267,43 @@ class StochasticAnalyzer:
                     os.rename(filename_, new_name_)
                     print("Nuevo nombre de archivo:", new_name_)
 
-    def start_order(self, pred, symbol, interval, bogota_time, proba, resultado, atr, close_price, real_account, ema200,
+    def start_order(self, pred, symbol, bogota_time, proba, resultado, atr, df, close_price, real_account, ema200,
                     trade_id=None):
+        # @TODO refactorizar close price y atr que salgan de df
+        m0 = df.iloc[-1]["macd"]
+        m1 = df.iloc[-2]["macd"]
+
+        s0 = df.iloc[-1]["macd_signal"]
+        s1 = df.iloc[-2]["macd_signal"]
+
+        h0 = df.iloc[-1]["macd_hist"]
+        h1 = df.iloc[-2]["macd_hist"]
+        slope_up = h0 > h1
+        slope_down = h0 < h1
+
         if atr is not None and atr > 0:
             if (pred == "bullish") or (pred == "bearish"):
                 response = {}
                 profit_factor = 4.2
                 loss_factor = 3
-                if ((pred == "bullish" and close_price < ema200) or (pred == "bearish" and close_price > ema200)) and proba < 0.8:
-                    profit_factor = 2.2
 
                 take_profit = close_price + (profit_factor * atr) if pred == "bullish" else close_price - (
                         profit_factor * atr)
                 stop_loss = close_price - (loss_factor * atr) if pred == "bullish" else close_price + (
                         loss_factor * atr)
+
+                if pred == "bullish" and close_price < ema200 and proba < 0.8:
+                    if close_price < ema200 and not (m0 > m1 and h0 > 0 and s0 > s1):
+                        profit_factor = 2.2
+                    take_profit = close_price + (profit_factor * atr)
+                    stop_loss = close_price - (loss_factor * atr)
+
+                if pred == "bearish" and close_price > ema200 and proba < 0.8:
+                    if close_price > ema200 and not (m0 < m1 and h1 < 0 and s0 < s1):
+                        profit_factor = 2.2
+                    take_profit = close_price - (profit_factor * atr)
+                    stop_loss = close_price + (loss_factor * atr)
+
                 # --- CÁLCULO DEL FRAGMENTO DE KELLY ---
                 ganancia = abs(take_profit - close_price)
                 perdida = abs(stop_loss - close_price)
@@ -6602,7 +6609,7 @@ if __name__ == "__main__":
         analyzer.create_predictive_model(
             model_type="rf",
             calibrate_method="beta",
-            N_KEEP=170_000,
+            N_KEEP=160_000,
             display_graphic=True,
             model_kwargs={
                 "n_estimators": 700,
