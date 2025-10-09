@@ -764,7 +764,6 @@ class TradeSimulator:
             import io, contextlib
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                # # RF con beta
                 self.analyzer.create_predictive_model(model_type="rf", calibrate_method="beta", N_KEEP=N_KEEP,
                                                       model_kwargs={
                                                           "n_estimators":1200,
@@ -772,46 +771,7 @@ class TradeSimulator:
                                                           "n_jobs":-1,
                                                           "random_state":42
                                                       })
-                #
-                # # LGBM con beta
-                # self.analyzer.create_predictive_model(model_type="lgbm", calibrate_method="sigmoid",
-                #                              model_kwargs={
-                #                                  "n_estimators":700,
-                #                                  "learning_rate":0.05,
-                #                                  "subsample":0.9,
-                #                                  "colsample_bytree":0.9,
-                #                                  "random_state":42,
-                #                                  "n_jobs":-1
-                #                              })
-
-                # XGB con beta (usa LabelEncoder interno)
-                # self.analyzer.create_predictive_model(model_type="xgb", calibrate_method="sigmoid",
-                #                                       model_kwargs={
-                #                                           "n_estimators": 700,
-                #                                           "learning_rate": 0.05,
-                #                                           "subsample": 0.9,
-                #                                           "colsample_bytree": 0.9,
-                #                                           "max_depth": 8,
-                #                                           "random_state": 42,
-                #                                           "n_jobs": -1,
-                #                                           "tree_method": "hist",
-                #                                           "objective": "multi:softprob"
-                #                                       })
-                # self.analyzer.create_predictive_model(model_type="xgb", calibrate_method="beta", N_KEEP=N_KEEP,
-                #                                       model_kwargs={
-                #                                           "n_estimators": 700,
-                #                                           "learning_rate": 0.05,
-                #                                           "subsample": 0.9,
-                #                                           "colsample_bytree": 0.9,
-                #                                           "max_depth": 8,
-                #                                           "random_state": 42,
-                #                                           "n_jobs": -1,
-                #                                           "tree_method": "hist",
-                #                                           "objective": "multi:softprob"
-                #                                       })
         else:
-
-            # # RF con beta # isotonic, sigmoid, beta
             self.analyzer.create_predictive_model(model_type="rf", calibrate_method="beta", N_KEEP=N_KEEP,
                                                   model_kwargs={
                                                       "n_estimators": 700,
@@ -819,31 +779,6 @@ class TradeSimulator:
                                                       "n_jobs": -1,
                                                       "random_state": 42
                                                   })
-            #
-            # # LGBM con beta
-            # self.analyzer.create_predictive_model(model_type="lgbm", calibrate_method="beta",  N_KEEP=N_KEEP,
-            #                              model_kwargs={
-            #                                  "n_estimators":700,
-            #                                  "learning_rate":0.05,
-            #                                  "subsample":0.9,
-            #                                  "colsample_bytree":0.9,
-            #                                  "random_state":42,
-            #                                  "n_jobs":-1
-            #                              })
-
-            # # XGB con beta (usa LabelEncoder interno)
-            # self.analyzer.create_predictive_model(model_type="xgb", calibrate_method="isotonic", N_KEEP=N_KEEP,
-            #                              model_kwargs={
-            #                                  "n_estimators": 700,
-            #                                  "learning_rate": 0.05,
-            #                                  "subsample": 0.9,
-            #                                  "colsample_bytree": 0.9,
-            #                                  "max_depth": 8,
-            #                                  "random_state": 42,
-            #                                  "n_jobs": -1,
-            #                                  "tree_method": "hist",
-            #                                  "objective": "multi:softprob"
-            #                              })
 
     def _extract_proba_for_monitor(self, sig: Dict, return_margin: bool = False):
         """
@@ -1094,50 +1029,6 @@ class TradeSimulator:
         Si `retrain_each_bar=True`, reentrena en cada barra antes de predecir.
         """
 
-        # --- helper: MACD con librería y solo hasta i ---
-        def _macd_last_two(close_s, fast=12, slow=26, signal=9):
-            """
-            Devuelve (m_prev, m_curr, s_prev, s_curr, h_prev, h_curr) usando SOLO datos hasta el punto dado.
-            Requiere al menos 2 valores válidos (no-NaN) de macd/signal/hist.
-            """
-            s = pd.Series(close_s, copy=True).astype(float)
-
-            # 1) Intentar pandas_ta
-            try:
-                import pandas_ta as ta  # pip install pandas-ta
-                macd_df = ta.macd(s, fast=fast, slow=slow, signal=signal)  # cols: MACD_*, MACDs_*, MACDh_*
-                macd_df = macd_df.dropna()
-                if len(macd_df) < 2:
-                    return None
-                last2 = macd_df.iloc[-2:]
-                # orden esperado: [MACD, MACDs, MACDh]
-                m_prev, m_curr = float(last2.iloc[0, 0]), float(last2.iloc[1, 0])
-                s_prev, s_curr = float(last2.iloc[0, 1]), float(last2.iloc[1, 1])
-                h_prev, h_curr = float(last2.iloc[0, 2]), float(last2.iloc[1, 2])
-                return (m_prev, m_curr, s_prev, s_curr, h_prev, h_curr)
-            except Exception:
-                pass
-
-            # 2) Fallback: ta (bukosabino)
-            try:
-                from ta.trend import MACD  # pip install ta
-                ind = MACD(close=s, window_slow=slow, window_fast=fast, window_sign=signal, fillna=False)
-                m = ind.macd()
-                sg = ind.macd_signal()
-                h = ind.macd_diff()
-                tmp = pd.concat([m, sg, h], axis=1).dropna()
-                if len(tmp) < 2:
-                    return None
-                last2 = tmp.iloc[-2:]
-                m_prev, m_curr = float(last2.iloc[0, 0]), float(last2.iloc[1, 0])
-                s_prev, s_curr = float(last2.iloc[0, 1]), float(last2.iloc[1, 1])
-                h_prev, h_curr = float(last2.iloc[0, 2]), float(last2.iloc[1, 2])
-                return (m_prev, m_curr, s_prev, s_curr, h_prev, h_curr)
-            except Exception as e:
-                raise ImportError(
-                    "Instala una librería para MACD: `pip install pandas-ta` o `pip install ta`."
-                ) from e
-
         # Alinear test_start / test_end a la misma tz que el DataFrame
         tz = getattr(self, "tz", None)
 
@@ -1217,23 +1108,6 @@ class TradeSimulator:
                         self.fit_model(train_slice)
                         if getattr(self, "announce_fit", False):
                             if self.on_event: self.on_event("fit_end", {"phase": "periodic", "pos": pos + 1})
-
-            # sig = self.get_signal(i)
-            # if sig:
-            #     pred = sig.get("prediction")
-            #     proba = self._extract_proba_for_monitor(sig)
-            #     ts = self.df.loc[i, "datetime"]
-            #     macd = self.df.loc[i, "macd"]
-            #     macd_signal = self.df.loc[i, "macd_signal"]
-            #     h0 = self.df.loc[i, "macd_hist"]
-            #     h1 = self.df.loc[i - 1, "macd_hist"]
-            #     slope = 'up' if h0 > h1 else 'down'
-            #
-            #     side = "long" if pred == "bullish" else "short"
-            #     if self.on_event and proba >= 0.6:
-            #         self.on_event("new_predicction", {
-            #             "time": ts, "side": pred, "prob": proba, "macd": macd, "macd_signal": macd_signal, 'histogram': slope,
-            #         })
 
             # Si hay trade abierto, intentar cierre en esta barra
             if current_trade is not None and current_trade.is_open():
@@ -1348,43 +1222,6 @@ class TradeSimulator:
                 side = "long" if pred == "bullish" else "short"
                 if not self._passes_monitor(ts, proba):
                     continue
-
-                # close_slice = self.df.loc[:i, "close"]
-
-                # macd_vals = _macd_last_two(close_slice, fast=12, slow=26, signal=9)
-                # if macd_vals is None:
-                #     # No hay suficientes datos MACD válidos: no abrimos
-                #     continue
-                #
-                # m_prev, m_curr, s_prev, s_curr, h_prev, h_curr = macd_vals
-                #
-                # # Señales clásicas
-                # hist_cross_up = (h_prev <= 0) and (h_curr > 0)
-                # hist_cross_down = (h_prev >= 0) and (h_curr < 0)
-                # macd_cross_up = (m_prev <= s_prev) and (m_curr > s_curr)
-                # macd_cross_down = (m_prev >= s_prev) and (m_curr < s_curr)
-                # slope_up = (h_curr > h_prev)
-                # slope_down = (h_curr < h_prev)
-                #
-                # # Gates suaves con %K si lo tienes en self.df; si no, pasa
-                # import numpy as np
-                # k_val = float(self.df.loc[i, "k"]) if "k" in self.df.columns else np.nan
-                # bull_gate_k = (np.isnan(k_val) or k_val < 60)
-                # bear_gate_k = (np.isnan(k_val) or k_val > 40)
-                #
-                # macd_bull = ((slope_up))
-                # macd_bear = ((slope_down))
-                #
-                # # Alineación modelo + MACD + probas (umbral 0.60 ajustable)
-                # if pred == "bullish":
-                #     if (not macd_bull) or (probs.get("bullish", 0.0) < 0.60):
-                #         continue
-                # elif pred == "bearish":
-                #     if (not macd_bear) or (probs.get("bearish", 0.0) < 0.60):
-                #         continue
-                # else:
-                #     # Solo operamos direccionales
-                #     continue
 
                 px = float(self.df.loc[i, "close"])  # entrada al cierre de i
 
@@ -2161,7 +1998,7 @@ class StochasticAnalyzer:
         self.api_key = api_key
         self.api_secret = api_secret
         self.atr_mult = 4
-        self.atr_stop = 2.7
+        self.atr_stop = 3
         self.lookahead = 70
         self.tradelogger = TradeLogger(log_path="trade_log.jsonl")
 
@@ -4829,7 +4666,10 @@ class StochasticAnalyzer:
         close = float(last_meta['close'])
         # ema_15 = float(last_meta['EMA_15'])
         ema_200 = float(last_meta['EMA_200'])
-        # k = float(last_meta['k'])
+
+        k = float(df_ready["k"].iloc[-1])
+        e0 = float(df_ready["e"].iloc[-1])
+        # e1 = float(df_ready["e"].iloc[-2])
 
         probs = probabilities
         # proba_pred = float(probs.get(pred, 0.0))
@@ -4840,58 +4680,90 @@ class StochasticAnalyzer:
         margin = (top1 - top2)
 
         # Señales con cruce y pendiente del histograma
-        h0, h1 = float(df_ready["macd_hist"].iloc[-1]), float(df_new["macd_hist"].iloc[-2])
-        # m0, m1 = float(df_ready["macd"].iloc[-1]), float(df_new["macd"].iloc[-2])
+        # h0, h1 = float(df_ready["macd_hist"].iloc[-1]), float(df_new["macd_hist"].iloc[-2])
+        m0, m1 = float(df_ready["macd"].iloc[-1]), float(df_new["macd"].iloc[-2])
         s0, s1 = float(df_ready["macd_signal"].iloc[-1]), float(df_new["macd_signal"].iloc[-2])
-        slope_up, slope_down = (h0 > h1), (h0 < h1)
-        macd_up = s0 > s1
-        macd_down = s0 < s1
+        # slope_up, slope_down = (h0 > h1), (h0 < h1)
+        # macd_up = s0 > s1
+        # macd_down = s0 < s1
 
         # filtro de “fake” señales como en tu predict_realtime
         # ema_15 = float(last_meta.get("EMA_15", np.nan))
         # close_px = float(last_meta["close"])
-        k = float(last_meta.get("k", np.nan))
+        k100 = df_ready["k100"].iloc[-1]
+        e100 =  df_ready["e100"].iloc[-1]
+        rsi_14 = df_ready["rsi_14"].iloc[-1]
+
+        r2_q = pd.qcut(df_ready["trend_r2_100"], q=4, labels=["Q1", "Q2", "Q3", "Q4"]).iloc[-1]
+
+        volume_q = pd.qcut(df_ready["volume"], q=4, labels=["Q1", "Q2", "Q3", "Q4"]).iloc[-1]
+        atr_q = pd.qcut(df_ready["ATR"], q=4, labels=["Q1", "Q2", "Q3", "Q4"]).iloc[-1]
+        dist_pct_100_q = pd.qcut(df_ready["trend_dist_pct_100"], q=4, labels=["Q1", "Q2", "Q3", "Q4"]).iloc[-1]
+
         pred = pred_class
 
-        if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.9 and not slope_up:
-            probabilities['bullish'] = min(0.69, probabilities.get('bullish'))
-            print(f"Fake bullish: histograma Macd bajista)")
+        prob_min = 0.66
 
-        # if pred_class == 'bullish' and probabilities.get('bullish') < 0.9 and k > 90:
-        #     print(f"Fake bullish: en sobre compra)")
-        #     probabilities['bullish'] = min(0.69, probabilities.get('bullish'))
+        if pred_class == 'bullish' and m0 < s0:
+            print(f"Fake bullish: Macd < Signal)")
+            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
 
-        if pred_class == 'bullish' and probabilities.get('bullish') < 0.9 and not macd_up:
-            print(f"Fake bullish: Macd bajista)")
-            probabilities['bullish'] = min(0.69, probabilities.get('bullish'))
+        if pred_class == 'bullish' and margin < 0.3:
+            print(f"Fake bullish: Margen insuficiente")
+            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
 
-        if pred_class == 'bullish' and probabilities.get('bullish') < 0.9 and margin < 0.5:
-            print(f"Fake bullish: margen por debajo de 0.5)")
-            probabilities['bullish'] = min(0.69, probabilities.get('bullish'))
+        if pred_class == 'bullish' and k100 < e100:
+            print(f"Fake bullish: k100 < e100")
+            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
 
-        # if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and close_px < ema_15:
-        #     probabilities['bullish'] = 0.69
-        #     print(f"Fake bullish: cierre < EMA10")
+        if pred_class == 'bullish' and (rsi_14 > 70):
+            print(f"Fake bullish: 55 > rsi_14 > 70")
+            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
 
-        if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.9 and not slope_down:
-            probabilities['bearish'] = min(0.69, probabilities.get('bearish'))
-            print(f"Fake bearish: histograma Macd alcista)")
+        if pred_class == 'bullish' and volume_q in ("Q1"):
+            print(f"Fake bullish: Volumen muy bajo")
+            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
 
-        # if pred_class == 'bearish' and probabilities.get('bearish') < 0.9 and k < 10:
-        #     probabilities['bearish'] = min(0.69, probabilities.get('bearish'))
-        #     print(f"Fake bearish: en sobre venta)")
+        if pred_class == 'bullish' and atr_q in ("Q1"):
+            print(f"Fake bullish: ATR muy bajo")
+            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
 
-        if pred_class == 'bearish' and probabilities.get('bearish') < 0.9 and not macd_down:
-            print(f"Fake bearish: Macd alcista)")
-            probabilities['bearish'] = min(0.69, probabilities.get('bearish'))
+        if pred_class == 'bullish' and r2_q in ("Q1"):
+            print(f"Fake bullish: Trend r2 muy bajo")
+            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
 
-        if pred_class == 'bearish' and probabilities.get('bearish') < 0.9 and margin < 0.5:
-            print(f"Fake bearish: margen por debajo de 0.5)")
-            probabilities['bearish'] = min(0.69, probabilities.get('bearish'))
 
-        # if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and close_px > ema_15:
-        #     probabilities['bearish'] = 0.619
-        #     print(f"Fake bearish: cierre > EMA10")
+        if pred_class == 'bearish' and m0 > s0:
+            print(f"Fake bearish: Macd > Signal)")
+            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
+
+        if pred_class == 'bearish' and margin < 0.4:
+            print(f"Fake bearish: Margen insuficiente)")
+            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
+
+        if pred_class == 'bearish' and (k < 20):
+            print(f"Fake bearish: k en sobrecompra o sobreventa)")
+            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
+
+        if pred_class == 'bearish' and r2_q in ("Q1", "Q2"):
+            print(f"Fake bearish: resistencia de tendencia baja)")
+            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
+
+        if pred_class == 'bearish' and volume_q == 'Q4':
+            print(f"Fake bearish: Volumen muy alto)")
+            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
+
+        if pred_class == 'bearish' and atr_q in ("Q4"):
+            print(f"Fake bearish: ATR muy alto)")
+            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
+
+        if pred_class == 'bearish' and dist_pct_100_q in ("Q1"):
+            print(f"Fake bearish:  distancia a linea de tendencia baja)")
+            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
+
+        # if pred_class == 'bearish' and k100 > e100 and probabilities.get('bullish') < 0.85:
+        #     print(f"Fake bearish:  k100 sobre e100)")
+        #     probabilities['bearish'] = min(0.619, probabilities.get('bearish'))
 
         result = {
             "prediction": pred,
@@ -5092,6 +4964,7 @@ class StochasticAnalyzer:
                     self.check_and_close_from_market(symbol, resultado.get("raw_df"))
                 except Exception as e:
                     self.tradelogger.log_info(event="predict_error", error=str(e))
+                    print(e)
                     time.sleep(5)
                     continue
 
@@ -5146,8 +5019,8 @@ class StochasticAnalyzer:
                     kelly_fraction = max(0.0, min(p - (q / reward_risk), 0.95))
 
                 # Gate sólo si es elegible
-                self.umbral_strong = 0.71
-                self.umbral_soft = 0.7
+                self.umbral_strong = 0.67
+                self.umbral_soft = 0.67
 
                 gate = None
                 if eligible:
@@ -5300,7 +5173,7 @@ class StochasticAnalyzer:
         if atr is not None and atr > 0:
             if (pred == "bullish") or (pred == "bearish"):
                 response = {}
-                profit_factor = 4.2
+                profit_factor = 4.5
                 loss_factor = 3
 
                 take_profit = close_price + (profit_factor * atr) if pred == "bullish" else close_price - (
@@ -5310,13 +5183,13 @@ class StochasticAnalyzer:
 
                 if pred == "bullish" and close_price < ema200 and proba < 0.8:
                     if close_price < ema200 and not (m0 > m1 and h0 > 0 and s0 > s1):
-                        profit_factor = 2.2
+                        profit_factor = 3
                     take_profit = close_price + (profit_factor * atr)
                     stop_loss = close_price - (loss_factor * atr)
 
                 if pred == "bearish" and close_price > ema200 and proba < 0.8:
                     if close_price > ema200 and not (m0 < m1 and h1 < 0 and s0 < s1):
-                        profit_factor = 2.2
+                        profit_factor = 3
                     take_profit = close_price - (profit_factor * atr)
                     stop_loss = close_price + (loss_factor * atr)
 
@@ -6589,8 +6462,8 @@ def is_allowed_time():
 if __name__ == "__main__":
     now = datetime.now()
 
-    # analyzer = StochasticAnalyzer(api_key=api_key_roge, api_secret=api_secret_roge)
-    analyzer = StochasticAnalyzer(api_key=api_key, api_secret=api_secret)
+    analyzer = StochasticAnalyzer(api_key=api_key_roge, api_secret=api_secret_roge)
+    # analyzer = StochasticAnalyzer(api_key=api_key, api_secret=api_secret)
     # API pública
     # analyzer = StochasticAnalyzer()
 
@@ -6621,11 +6494,11 @@ if __name__ == "__main__":
 
         # # # #
         # RF model production mode
-
+        # print("hola q hace")
         analyzer.create_predictive_model(
             model_type="rf",
             calibrate_method="beta",
-            N_KEEP=170_000,
+            N_KEEP=177_000,
             display_graphic=True,
             model_kwargs={
                 "n_estimators": 700,
@@ -6635,58 +6508,57 @@ if __name__ == "__main__":
             },
             display_feature_plot=True
         )
-
         analyzer.monitor_predictions()
 
         #=====================TESTING======================#
 
         # ==================== simulator
-        # df = analyzer.data
-        # def logger(event, payload):
-        #     if event == "progress":
-        #         print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
-        #               f"equity={payload['equity']:.2f} | trades={payload['trades']}")
-        #     elif event == "open":
-        #         print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
-        #               f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
-        #               f"proba={payload['prob'] * 100:.1f} | "
-        #               f"kelly={payload['kelly'] if payload['kelly'] is not None else 1.0:.3f}")
-        #     elif event == "close":
-        #         dur = payload.get("duration")
-        #         print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
-        #               f"PnL={payload['pnl']:.2f} | "
-        #               f"equity={payload['equity']:.2f} | "
-        #               f"in={payload['entry_time']} out={payload['time']} "
-        #               f"dur={dur}")
-        #     elif event == "early_opposite":
-        #         print(
-        #             f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
-        #             f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
-        #             f"| in={payload['entry_time']} out={payload['time']} "
-        #             f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
-        #         )
-        # sim = TradeSimulator(
-        #     analyzer,
-        #     df,
-        #     initial_equity=155,
-        #     leverage=200,
-        #     risk_fraction=0.02,
-        #     on_event=logger,  # <— activar callback
-        #     verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
-        #     log_every_bars=250,
-        #     proba_threshold_day=0.75,
-        #     proba_threshold_night=0.76,
-        #     n_keep_for_fit=101000,
-        #     atr_mult_tp=4,
-        #     atr_mult_sl=3,
-        #     retrain_each_bar=False,
-        #     retrain_every_bars=None,
-        #     suppress_fit_stdout=False,
-        #     early_exit_threshold=0.75
-        # )
-        # #
-        # results = sim.run(test_start="2025-08-26", test_end="2025-09-05")
-        # print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
+        df = analyzer.data
+        def logger(event, payload):
+            if event == "progress":
+                print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
+                      f"equity={payload['equity']:.2f} | trades={payload['trades']}")
+            elif event == "open":
+                print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
+                      f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
+                      f"proba={payload['prob'] * 100:.1f} | "
+                      f"kelly={payload['kelly'] if payload['kelly'] is not None else 1.0:.3f}")
+            elif event == "close":
+                dur = payload.get("duration")
+                print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
+                      f"PnL={payload['pnl']:.2f} | "
+                      f"equity={payload['equity']:.2f} | "
+                      f"in={payload['entry_time']} out={payload['time']} "
+                      f"dur={dur}")
+            elif event == "early_opposite":
+                print(
+                    f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
+                    f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
+                    f"| in={payload['entry_time']} out={payload['time']} "
+                    f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
+                )
+        sim = TradeSimulator(
+            analyzer,
+            df,
+            initial_equity=155,
+            leverage=200,
+            risk_fraction=0.02,
+            on_event=logger,  # <— activar callback
+            verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
+            log_every_bars=250,
+            proba_threshold_day=0.75,
+            proba_threshold_night=0.76,
+            n_keep_for_fit=101000,
+            atr_mult_tp=4,
+            atr_mult_sl=3,
+            retrain_each_bar=False,
+            retrain_every_bars=None,
+            suppress_fit_stdout=False,
+            early_exit_threshold=0.75
+        )
+        #
+        results = sim.run(test_start="2025-08-26", test_end="2025-09-05")
+        print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
 
 
         # # =========== get_best_calibration_model
@@ -6694,8 +6566,8 @@ if __name__ == "__main__":
 
         # =============best dataset size:
         # df_results = analyzer.sweep_nkeep(
-        #     start=40_000,
-        #     stop=110_000,
+        #     start=161_000,
+        #     stop=179_000,
         #     step=1000,
         #     model_type="rf",
         #     model_kwargs={"n_estimators": 700, "max_features": "sqrt", "random_state": 42, "n_jobs": -1},
