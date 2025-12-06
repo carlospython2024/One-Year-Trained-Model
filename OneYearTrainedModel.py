@@ -34,7 +34,8 @@ import warnings
 import smtplib
 from email.mime.text import MIMEText
 import pytz
-from numba import njit
+from rules_engine import validate_start_order_fast
+
 
 # helpers de librerías opcionales
 _HAS_LGBM, _HAS_XGB = False, False
@@ -67,11 +68,6 @@ email_password = os.getenv("EMAIL_PASSWORD")
 EMAIL_SMTP = "smtp.gmail.com"
 EMAIL_PORT = 587
 EMAIL_RECEIVER = "candrelosolaz@gmail.com"
-
-RESTART_HOUR_1 = 8
-RESTART_HOUR_2 = 12
-RESTART_HOUR_3 = 17
-RESTART_HOUR_4 = 22
 
 warnings.filterwarnings('ignore')
 
@@ -242,127 +238,152 @@ def add_sr_features(
         near_pct: float = 0.005,  # 0.5% del precio
         near_k_atr: float = 0.5,  # 0.5 * ATR
         use_daily_pivots: bool = True,
-        session_day_start: str | None = None,  # ej. "08:00" para partir el “día” a esa hora local
+        session_day_start: str | None = None,  # ej. "08:00"
         tz_for_session: str | None = None,  # ej. "America/Bogota"
 ) -> pd.DataFrame:
     """
-    Agrega features de Soporte/Resistencia:
-      - Pivotes diarios PP, S1, R1, S2, R2 del día PREVIO.
-      - Distancias relativas a PP/S1/R1/S2/R2 + flags 'near' por % y por ATR.
-      - Soporte/Resistencia rolling (fractales) con shift(1) + distancias/flags.
-      - ATR (si no existe).
-
-    Requisitos: columnas OHLC y datetime.
-    No provoca fuga de información: todos los niveles se basan en datos previos (shift o día previo).
+    Agrega features de Soporte/Resistencia sin fuga de info.
     """
-    df = df.copy()
+    try:
 
-    # -------- Validaciones mínimas --------
-    for c in (datetime_col, high_col, low_col, close_col):
-        if c not in df.columns:
-            raise ValueError(f"Falta la columna requerida: '{c}'")
-    if not is_datetime64_any_dtype(df[datetime_col]):
-        df[datetime_col] = pd.to_datetime(df[datetime_col], utc=True, errors="coerce")
-    # -------- Ordenar por tiempo --------
-    df.sort_values(datetime_col, inplace=True)
-    df.reset_index(drop=True, inplace=True)
 
-    # -------- ATR (si no existe) --------
-    if "ATR" not in df.columns:
-        h = df[high_col].astype(float)
-        l = df[low_col].astype(float)
-        c = df[close_col].astype(float)
-        prev_c = c.shift(1)
-        tr = pd.concat([(h - l).abs(),
-                        (h - prev_c).abs(),
-                        (l - prev_c).abs()], axis=1).max(axis=1)
-        df["ATR"] = tr.rolling(atr_window, min_periods=1).mean()
+        df = df.copy()
 
-    # -------- Construcción de “día” para pivotes --------
-    # Opción A: día calendario (UTC/local) usando floor("D").
-    # Opción B: día de sesión con hora de cambio personalizada (session_day_start).
-    if tz_for_session:
-        # si tu datetime ya tiene tz, convierto; si no, localizo
-        if df[datetime_col].dt.tz is None:
-            df[datetime_col] = df[datetime_col].dt.tz_localize(tz_for_session)
+        # -------- Validaciones mínimas --------
+        for c in (datetime_col, high_col, low_col, close_col):
+            if c not in df.columns:
+                raise ValueError(f"Falta la columna requerida: '{c}'")
+
+        # Asegurar datetime
+        if not is_datetime64_any_dtype(df[datetime_col]):
+            df[datetime_col] = pd.to_datetime(df[datetime_col], utc=True, errors="coerce")
         else:
+            # Si es naive, localízala a UTC para tener base consistente
+            if df[datetime_col].dt.tz is None:
+                if tz_for_session:
+                    df[datetime_col] = df[datetime_col].dt.tz_localize(tz_for_session)
+                else:
+                    df[datetime_col] = df[datetime_col].dt.tz_localize("UTC")
+
+        # -------- Ordenar por tiempo --------
+        df.sort_values(datetime_col, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+
+        # -------- ATR (si no existe) --------
+        if "ATR" not in df.columns:
+            h = df[high_col].astype(float)
+            l = df[low_col].astype(float)
+            c = df[close_col].astype(float)
+            prev_c = c.shift(1)
+            tr = pd.concat([(h - l).abs(),
+                            (h - prev_c).abs(),
+                            (l - prev_c).abs()], axis=1).max(axis=1)
+            df["ATR"] = tr.rolling(atr_window, min_periods=1).mean()
+
+        # -------- Construcción de “día” para pivotes --------
+        # Convertir a tz de sesión (si se pide)
+        if tz_for_session:
             df[datetime_col] = df[datetime_col].dt.tz_convert(tz_for_session)
-    # marca de día
-    if session_day_start:
-        # definimos el “día de sesión” como bloques rolling de 24h que empiezan en HH:MM local
-        hh, mm = map(int, session_day_start.split(":"))
-        # desplazamos la hora para “cortar” el día en HH:MM
-        shifted = df[datetime_col] - pd.to_timedelta(hh, unit="h") - pd.to_timedelta(mm, unit="m")
-        day_key = shifted.dt.floor("D")  # día de sesión
-    else:
-        day_key = df[datetime_col].dt.floor("D")
 
-    df["_day"] = day_key
+        # Día de sesión o día calendario
+        if session_day_start:
+            hh, mm = map(int, session_day_start.split(":"))
+            shifted = df[datetime_col] - pd.to_timedelta(hh, unit="h") - pd.to_timedelta(mm, unit="m")
+            day_key = shifted.dt.floor("D")
+        else:
+            day_key = df[datetime_col].dt.floor("D")
 
-    # -------- Pivotes diarios clásicos del DÍA PREVIO --------
-    if use_daily_pivots:
-        daily = df.groupby("_day").agg(
-            day_high=(high_col, "max"),
-            day_low=(low_col, "min"),
-            day_close=(close_col, "last"),
-        )
+        df["_day"] = day_key
 
-        piv = pd.DataFrame(index=daily.index)
-        piv["PP"] = (daily["day_high"] + daily["day_low"] + daily["day_close"]) / 3.0
-        piv["R1"] = 2 * piv["PP"] - daily["day_low"]
-        piv["S1"] = 2 * piv["PP"] - daily["day_high"]
-        rng = (daily["day_high"] - daily["day_low"]).astype(float)
-        piv["R2"] = piv["PP"] + rng
-        piv["S2"] = piv["PP"] - rng
+        # Clave numérica robusta para merges (evita problemas de tz)
+        # Nota: view('int64') requiere dtype datetime64[ns, tz]; convertimos a UTC para robustez.
+        _day_utc = df["_day"].dt.tz_convert("UTC") if df["_day"].dt.tz is not None else df["_day"].dt.tz_localize("UTC")
+        df["_day_key"] = _day_utc.view("int64")
 
-        # Usar pivotes del día previo
-        piv_prev = piv.shift(1).reset_index(names="_day")
+        # -------- Pivotes diarios clásicos del DÍA PREVIO --------
+        if use_daily_pivots:
+            daily = df.groupby("_day").agg(
+                day_high=(high_col, "max"),
+                day_low=(low_col, "min"),
+                day_close=(close_col, "last"),
+            )
 
-        # Merge con intradía
-        df = df.merge(piv_prev[["_day", "PP", "R1", "S1", "R2", "S2"]], on="_day", how="left")
+            piv = pd.DataFrame(index=daily.index)
+            piv["PP"] = (daily["day_high"] + daily["day_low"] + daily["day_close"]) / 3.0
+            piv["R1"] = 2 * piv["PP"] - daily["day_low"]
+            piv["S1"] = 2 * piv["PP"] - daily["day_high"]
+            rng = (daily["day_high"] - daily["day_low"]).astype(float)
+            piv["R2"] = piv["PP"] + rng
+            piv["S2"] = piv["PP"] - rng
 
-        # Distancias relativas al close
+            # Pivotes del día previo
+            piv_prev = piv.shift(1).reset_index(names="_day")
+
+            # Clave numérica en el lado derecho también
+            _day_right = (piv_prev["_day"].dt.tz_convert("UTC")
+                          if piv_prev["_day"].dt.tz is not None
+                          else piv_prev["_day"].dt.tz_localize("UTC"))
+            piv_prev["_day_key"] = _day_right.view("int64")
+
+            # Mantener solo lo necesario
+            piv_prev = piv_prev[["_day_key", "PP", "R1", "S1", "R2", "S2"]]
+
+            # ---- Merge robusto
+            df = df.merge(piv_prev, on="_day_key", how="left")
+
+            # Garantizar que existan las columnas aunque no matchee nada
+            for lvl in ["PP", "S1", "R1", "S2", "R2"]:
+                if lvl not in df.columns:
+                    df[lvl] = np.nan
+
+            # Distancias relativas al close
+            close = df[close_col].astype(float).replace(0, np.nan)
+            eps = 1e-12
+            for lvl in ["PP", "S1", "R1", "S2", "R2"]:
+                df[f"dist_{lvl}"] = (df[lvl].astype(float) - close) / (close + eps)
+
+            # Flags de cercanía por % y por ATR
+            for lvl in ["PP", "S1", "R1", "S2", "R2"]:
+                df[f"near_{lvl}_pct"] = (df[f"dist_{lvl}"].abs() <= float(near_pct)).astype("Int64").fillna(0).astype(int)
+                df[f"near_{lvl}_atr"] = ((df[lvl].astype(float) - close).abs() <= float(near_k_atr) * df["ATR"]) \
+                    .astype("Int64").fillna(0).astype(int)
+
+        # -------- Soporte/Resistencia rolling (fractales) --------
+        df["resist_rl"] = df[high_col].astype(float).rolling(fractal_window, min_periods=1).max().shift(1)
+        df["support_rl"] = df[low_col].astype(float).rolling(fractal_window, min_periods=1).min().shift(1)
+
         close = df[close_col].astype(float).replace(0, np.nan)
-        eps = 1e-12
-        for lvl in ["PP", "S1", "R1", "S2", "R2"]:
-            df[f"dist_{lvl}"] = (df[lvl] - close) / (close + eps)
+        df["dist_resist_rl"] = (df["resist_rl"] - close) / (close + 1e-12)
+        df["dist_support_rl"] = (close - df["support_rl"]) / (close + 1e-12)
 
-        # Flags de cercanía por % y por ATR
-        for lvl in ["PP", "S1", "R1", "S2", "R2"]:
-            df[f"near_{lvl}_pct"] = (df[f"dist_{lvl}"].abs() <= float(near_pct)).astype(int)
-            df[f"near_{lvl}_atr"] = ((df[lvl] - close).abs() <= float(near_k_atr) * df["ATR"]).astype(int)
+        df["near_resist_rl_pct"] = (df["dist_resist_rl"].abs() <= float(near_pct)).astype(int)
+        df["near_support_rl_pct"] = (df["dist_support_rl"].abs() <= float(near_pct)).astype(int)
 
-    # -------- Soporte/Resistencia rolling (fractales) --------
-    df["resist_rl"] = df[high_col].rolling(fractal_window, min_periods=1).max().shift(1)
-    df["support_rl"] = df[low_col].rolling(fractal_window, min_periods=1).min().shift(1)
+        df["near_resist_rl_atr"] = ((df["resist_rl"] - close).abs() <= float(near_k_atr) * df["ATR"]).astype(int)
+        df["near_support_rl_atr"] = ((close - df["support_rl"]).abs() <= float(near_k_atr) * df["ATR"]).astype(int)
 
-    close = df[close_col].astype(float).replace(0, np.nan)
-    df["dist_resist_rl"] = (df["resist_rl"] - close) / (close + 1e-12)
-    df["dist_support_rl"] = (close - df["support_rl"]) / (close + 1e-12)
+        # -------- Limpieza: rellenar NaNs iniciales / flags --------
+        def _ffill_if_exists(cols):
+            for c in cols:
+                if c in df.columns:
+                    df[c] = df[c].ffill()
 
-    df["near_resist_rl_pct"] = (df["dist_resist_rl"].abs() <= float(near_pct)).astype(int)
-    df["near_support_rl_pct"] = (df["dist_support_rl"].abs() <= float(near_pct)).astype(int)
+        cont_cols = ["PP", "S1", "R1", "S2", "R2", "resist_rl", "support_rl",
+                     "dist_PP", "dist_S1", "dist_R1", "dist_S2", "dist_R2",
+                     "dist_resist_rl", "dist_support_rl"]
+        _ffill_if_exists(cont_cols)
 
-    df["near_resist_rl_atr"] = ((df["resist_rl"] - close).abs() <= float(near_k_atr) * df["ATR"]).astype(int)
-    df["near_support_rl_atr"] = ((close - df["support_rl"]).abs() <= float(near_k_atr) * df["ATR"]).astype(int)
+        for c in df.columns:
+            if c.startswith("near_"):
+                df[c] = df[c].fillna(0).astype(int)
 
-    # -------- Limpieza: rellenar NaNs iniciales / flags --------
-    # Rellena forward niveles continuos y pone 0 en flags
-    def _ffill_if_exists(cols):
-        for c in cols:
-            if c in df.columns:
-                df[c] = df[c].ffill()
+        # Quitar helper
+        df.drop(columns=["_day_key"], errors="ignore", inplace=True)
 
-    cont_cols = ["PP", "S1", "R1", "S2", "R2", "resist_rl", "support_rl",
-                 "dist_PP", "dist_S1", "dist_R1", "dist_S2", "dist_R2",
-                 "dist_resist_rl", "dist_support_rl"]
-    _ffill_if_exists(cont_cols)
+        return df
 
-    for c in df.columns:
-        if c.startswith("near_"):
-            df[c] = df[c].fillna(0).astype(int)
-
-    return df
+    except Exception as e:
+        print(f"Error features sr: {e}")
 
 
 def add_sr_features_8h(df: pd.DataFrame, freq: str = "8H",
@@ -884,20 +905,7 @@ class TradeSimulator:
         if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and close_px < ema_15:
             probabilities['bullish'] = 0.619
 
-        #     if not np.isnan(ema_15) :
-        #         pred = 'lateral'
-        #     if probabilities.get('bullish', 0) < 0.7 and m0 < s0:
-        #         pred = 'lateral'
-        # if pred_class == 'bullish' and probabilities.get('bullish', 0) < 0.85 and close_px < ema_200 and m0 < s0:
-        #     pred = 'lateral'
 
-        # if pred_class == 'bullish' and probabilities.get('bullish', 0) > 0.85 and (slope_up or m0 > s0):
-        #     pred = 'bullish'
-
-        # if pred_class == 'bearish' and slope_down and m0 < s0 and probabilities.get('bearish', 0) > 0.6 and m0 < m1:
-        #     pred = 'bearish'
-        # if pred_class == 'bearish' and probabilities.get('bearish', 0) > 0.85 and (slope_down or m0 < s0):
-        #     pred = 'bearish'
         if pred_class == 'bearish' and m0 > s0 and probabilities.get('bearish') < 0.85:
             probabilities['bearish'] = 0.619
         if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and not slope_down:
@@ -907,16 +915,7 @@ class TradeSimulator:
         if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and close_px > ema_15:
             probabilities['bearish'] = 0.619
 
-        # elif pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and k < 40:
-        #     if not np.isnan(ema_15) and close_px > ema_15:
-        #         pred = 'lateral'
-        #     if probabilities.get('bearish', 0) < 0.7 and m0 > s0:
-        #         pred = 'lateral'
-        # if pred_class == 'bearish' and probabilities.get('bearish', 0) < 0.85 and close_px > ema_200 and m0 > s0:
-        #     pred = 'lateral'
 
-        # if pred_class == 'bearish' and probabilities.get('bearish', 0) > 0.85 and (slope_down or m0 < s0):
-        #     pred = 'bearish'
 
 
         return {
@@ -2546,8 +2545,8 @@ class StochasticAnalyzer:
         # df['roc_30'] = safe_pct_change(df['close'], 30)
         #
         # # Volatilidad
-        # df['return_1_raw'] = df['close'].pct_change().replace([np.inf, -np.inf], np.nan)
-        # df['volatility_10'] = df['return_1_raw'].rolling(10).std()
+        df['return_1_raw'] = df['close'].pct_change().replace([np.inf, -np.inf], np.nan)
+        df['volatility_10'] = df['return_1_raw'].rolling(10).std()
         # df['volatility_50'] = df['return_1_raw'].rolling(50).std()
         # df.drop(columns=['return_1_raw'], inplace=True)
         #
@@ -4575,7 +4574,7 @@ class StochasticAnalyzer:
     def predict_realtime(self,
                          symbol: str = "AVAXUSDT",
                          interval: str = "5",
-                         lookback_bars: int = 200,
+                         lookback_bars: int = 400,
                          thresholds: dict = None,
                          default_class: str = "lateral"):
         """
@@ -4595,24 +4594,26 @@ class StochasticAnalyzer:
 
         # 1) Descargar datos
         df_new = self.get_bybit_data_private(symbol, interval, start_date=None, end_date=None, limit=lookback_bars)
+
+        df_new["datetime"] = pd.to_datetime(df_new["datetime"])  # sin forzar utc=False
+
+        # forzar awareness y convertir a Bogota (UTC-5)
+        if getattr(df_new["datetime"].dt, "tz", None) is None:
+            # si tus tiempos representan UTC sin tz, primero localiza como UTC
+            df_new["datetime"] = df_new["datetime"].dt.tz_localize("UTC")
+
+        df_new["datetime"] = df_new["datetime"].dt.tz_convert("America/Bogota")
+
         if df_new is None or len(df_new) == 0:
             raise RuntimeError("No se pudieron obtener velas de Bybit")
 
         # 2) Indicadores y zonas
         df_new = self.add_indicators(df_new)
-        # df_new = self.add_volatility_zones(df_new)
 
         # 3) Preparar features
         df_ready, features = self.preparar_features(df_new)
 
-        # df_ready, features, _ = prepare_features_incremental(
-        #     raw_df=df_new,
-        #     preparar_features_fn=self.preparar_features,  # tu propia función
-        #     params=params_to_features,
-        #     cache_dir="feature_cache",
-        #     datetime_col="datetime",
-        #     warmup_bars=150
-        # )
+        self.append_new_data(df_ready)
 
         if df_ready.empty:
             raise RuntimeError("No hay suficientes datos para calcular todas las features necesarias (lags, etc).")
@@ -4662,108 +4663,23 @@ class StochasticAnalyzer:
             min_margin=0.03
         )
 
-        # 7) Filtro “fake” con EMA_10 (corrijo nombre de variable)
-        close = float(last_meta['close'])
-        # ema_15 = float(last_meta['EMA_15'])
-        ema_200 = float(last_meta['EMA_200'])
-
-        k = float(df_ready["k"].iloc[-1])
-        e0 = float(df_ready["e"].iloc[-1])
-        # e1 = float(df_ready["e"].iloc[-2])
-
         probs = probabilities
-        # proba_pred = float(probs.get(pred, 0.0))
 
         ordered = sorted(probs.values(), reverse=True)
         top1 = ordered[0] if ordered else 0.0
         top2 = ordered[1] if len(ordered) > 1 else 0.0
         margin = (top1 - top2)
 
-        # Señales con cruce y pendiente del histograma
-        # h0, h1 = float(df_ready["macd_hist"].iloc[-1]), float(df_new["macd_hist"].iloc[-2])
-        m0, m1 = float(df_ready["macd"].iloc[-1]), float(df_new["macd"].iloc[-2])
-        s0, s1 = float(df_ready["macd_signal"].iloc[-1]), float(df_new["macd_signal"].iloc[-2])
-        # slope_up, slope_down = (h0 > h1), (h0 < h1)
-        # macd_up = s0 > s1
-        # macd_down = s0 < s1
-
-        # filtro de “fake” señales como en tu predict_realtime
-        # ema_15 = float(last_meta.get("EMA_15", np.nan))
-        # close_px = float(last_meta["close"])
-        k100 = df_ready["k100"].iloc[-1]
-        e100 =  df_ready["e100"].iloc[-1]
-        rsi_14 = df_ready["rsi_14"].iloc[-1]
-
-        r2_q = pd.qcut(df_ready["trend_r2_100"], q=4, labels=["Q1", "Q2", "Q3", "Q4"]).iloc[-1]
-
-        volume_q = pd.qcut(df_ready["volume"], q=4, labels=["Q1", "Q2", "Q3", "Q4"]).iloc[-1]
-        atr_q = pd.qcut(df_ready["ATR"], q=4, labels=["Q1", "Q2", "Q3", "Q4"]).iloc[-1]
-        dist_pct_100_q = pd.qcut(df_ready["trend_dist_pct_100"], q=4, labels=["Q1", "Q2", "Q3", "Q4"]).iloc[-1]
-
         pred = pred_class
-
-        prob_min = 0.66
-
-        if pred_class == 'bullish' and m0 < s0:
-            print(f"Fake bullish: Macd < Signal)")
-            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
-
-        if pred_class == 'bullish' and margin < 0.3:
-            print(f"Fake bullish: Margen insuficiente")
-            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
-
-        if pred_class == 'bullish' and k100 < e100:
-            print(f"Fake bullish: k100 < e100")
-            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
-
-        if pred_class == 'bullish' and (rsi_14 > 70):
-            print(f"Fake bullish: 55 > rsi_14 > 70")
-            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
-
-        if pred_class == 'bullish' and volume_q in ("Q1"):
-            print(f"Fake bullish: Volumen muy bajo")
-            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
-
-        if pred_class == 'bullish' and atr_q in ("Q1"):
-            print(f"Fake bullish: ATR muy bajo")
-            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
-
-        if pred_class == 'bullish' and r2_q in ("Q1"):
-            print(f"Fake bullish: Trend r2 muy bajo")
-            probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
-
-
-        if pred_class == 'bearish' and m0 > s0:
-            print(f"Fake bearish: Macd > Signal)")
-            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
-
-        if pred_class == 'bearish' and margin < 0.4:
-            print(f"Fake bearish: Margen insuficiente)")
-            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
-
-        if pred_class == 'bearish' and (k < 20):
-            print(f"Fake bearish: k en sobrecompra o sobreventa)")
-            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
-
-        if pred_class == 'bearish' and r2_q in ("Q1", "Q2"):
-            print(f"Fake bearish: resistencia de tendencia baja)")
-            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
-
-        if pred_class == 'bearish' and volume_q == 'Q4':
-            print(f"Fake bearish: Volumen muy alto)")
-            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
-
-        if pred_class == 'bearish' and atr_q in ("Q4"):
-            print(f"Fake bearish: ATR muy alto)")
-            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
-
-        if pred_class == 'bearish' and dist_pct_100_q in ("Q1"):
-            print(f"Fake bearish:  distancia a linea de tendencia baja)")
-            probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
-
-        # if pred_class == 'bearish' and k100 > e100 and probabilities.get('bullish') < 0.85:
-        #     print(f"Fake bearish:  k100 sobre e100)")
-        #     probabilities['bearish'] = min(0.619, probabilities.get('bearish'))
+        ema_200 = float(last_meta['EMA_200'])
+        # prob_min = 0.66
+        # if pred_class == 'bullish' and margin < 0.3:
+        #     print(f"Fake bullish: Margen insuficiente")
+        #     probabilities['bullish'] = min(prob_min, probabilities.get('bullish'))
+        #
+        # if pred_class == 'bearish' and margin < 0.4:
+        #     print(f"Fake bearish: Margen insuficiente)")
+        #     probabilities['bearish'] = min(prob_min, probabilities.get('bearish'))
 
         result = {
             "prediction": pred,
@@ -4775,6 +4691,7 @@ class StochasticAnalyzer:
             "last_row_ema200": ema_200,
             "raw_df": df_new[["datetime", "open", "high", "low", "close", "volume", "macd", "macd_signal", "macd_hist"]].copy()
         }
+
         return result
 
     def _pnl_usdt_linear(self, side, entry, exit_, qty, fee_rate=0.0006, include_both_sides=True):
@@ -4841,70 +4758,107 @@ class StochasticAnalyzer:
 
     def check_and_close_from_market(self, symbol: str, df_last: pd.DataFrame):
         """
-        Usa la última/s velas (5m) ya descargadas para verificar si el TP/SL de la posición abierta se tocó.
-        Si cierra, calcula PnL y llama tradelogger.log_close(...).
+        Verifica si una posición abierta tocó TP/SL en cualquiera de las velas *desde la apertura
+        (o desde el último chequeo)*. Si cierra, calcula PnL y lo registra en TradeLogger.
+        Compatible con TradeLogger provisto.
         """
         pos = self.tradelogger.get_open_position(symbol)
         if not pos:
             return  # no hay posición
 
         side = pos.get("side")
-        entry_price = float(pos.get("entry_price", 0))
-        tp = float(pos.get("take_profit", 0))
-        sl = float(pos.get("stop_loss", 0))
         qty = pos.get("qty")
-        fee_rate = pos.get("fee_rate", getattr(self, "fee_rate", 0.0006))
         trade_id = pos.get("trade_id")
-        if not side or not entry_price or not qty or not tp or not sl:
-            return  # info insuficiente
+        order_id = pos.get("order_id")
+        fee_rate = pos.get("fee_rate", getattr(self, "fee_rate", 0.0006))
 
-        # Asegúrate de tener al menos 1 vela cerrada reciente:
+        # entry/tp/sl deberían haberse inyectado a open_positions con enrich_open_position
+        entry_price = float(pos.get("entry_price", 0) or 0)
+        tp = float(pos.get("take_profit", 0) or 0)
+        sl = float(pos.get("stop_loss", 0) or 0)
+        if not side or not qty or entry_price <= 0 or tp <= 0 or sl <= 0:
+            # Info insuficiente: evita falsos positivos
+            return
+
         if df_last is None or df_last.empty:
             return
 
-        # Tomamos la última vela cerrada y, opcionalmente, también la anterior por si la posición se abrió “entre velas”
-        # (si quieres, puedes filtrar desde la hora de apertura de la posición)
-        df = df_last.sort_values("datetime").tail(2)
+        # ---- Preparar dataframe y deducir intervalo (min) ----
+        df_last = df_last.sort_values("datetime").copy()
+        try:
+            dmed = pd.to_timedelta(df_last["datetime"].diff().dropna().median())
+            interval_minutes = int(max(1, round(dmed / pd.Timedelta(minutes=1))))
+        except Exception:
+            interval_minutes = 5  # fallback razonable
 
-        # Recorremos las velas en orden cronológico
-        for i in range(len(df)):
-            row = df.iloc[i]
-            bar_open = float(row["open"])
+        # ---- Punto de inicio: desde opened_utc y/o last_check_dt de la posición ----
+        # TradeLogger guarda opened_utc en log_order_ack; last_check_dt lo guardaremos nosotros.
+        opened_utc = pos.get("opened_utc")
+        last_check_dt = pos.get("last_check_dt")
+
+        try:
+            opened_dt = pd.to_datetime(opened_utc) if opened_utc else None
+        except Exception:
+            opened_dt = None
+        try:
+            last_check_dt = pd.to_datetime(last_check_dt) if last_check_dt else None
+        except Exception:
+            last_check_dt = None
+
+        # Comenzar 1 intervalo antes para cubrir “apertura dentro de vela”
+        candidates = []
+        if opened_dt is not None:
+            candidates.append(opened_dt - pd.Timedelta(minutes=interval_minutes))
+        if last_check_dt is not None:
+            candidates.append(last_check_dt - pd.Timedelta(minutes=interval_minutes))
+        if not candidates:
+            # Sin marcas: mirar al menos las últimas 2 velas para no perder un evento reciente
+            candidates.append(df_last["datetime"].iloc[-1] - pd.Timedelta(minutes=2 * interval_minutes))
+
+        start_dt = max(min(candidates), df_last["datetime"].iloc[0])
+
+        # ---- Slicing de velas a revisar ----
+        df = df_last[df_last["datetime"] >= start_dt].copy()
+        if df.empty:
+            # Aun así, actualizamos last_check_dt a la última de df_last para no reprocesar en loop
+            try:
+                self.tradelogger.enrich_open_position(symbol, last_check_dt=str(df_last["datetime"].iloc[-1]))
+            except Exception:
+                pass
+            return
+
+        # ---- Recorrer en orden cronológico y evaluar TP/SL ----
+        for _, row in df.iterrows():
             bar_high = float(row["high"])
             bar_low = float(row["low"])
             bar_open_dt = pd.to_datetime(row["datetime"])
-            # fin del intervalo = open + 5 minutos
-            bar_end_dt = bar_open_dt + pd.Timedelta(
-                minutes=int(df["datetime"].diff().median() / pd.Timedelta(minutes=1) if len(df) > 1 else 5))
+            bar_end_dt = bar_open_dt + pd.Timedelta(minutes=interval_minutes)
 
-            # ¿tocó niveles en esta vela?
             hit_tp = (bar_high >= tp) if side == "long" else (bar_low <= tp)
             hit_sl = (bar_low <= sl) if side == "long" else (bar_high >= sl)
 
             if not hit_tp and not hit_sl:
-                continue  # nada en esta barra
+                continue
 
-            # Si ambos en la misma vela, resuelve bajando a 1m
+            # Si ambos en la misma vela: resolver con 1m
             if hit_tp and hit_sl:
+                # Debe existir este método en tu clase; si devuelve None, priorizamos SL
                 first = self._resolve_tp_sl_order_in_bar(symbol, bar_open_dt, bar_end_dt, side, tp, sl)
                 if first is None:
-                    # regla conservadora: prioriza SL (peor caso)
                     first = "sl"
             else:
                 first = "tp" if hit_tp else "sl"
 
-            # Determina precio de salida (si quieres precio exacto del nivel, usa tp/sl; si prefieres close real, usa bar_close)
             exit_reason = first
             exit_price = tp if first == "tp" else sl
 
-            # Calcula PnL
-            pnl_usdt = self._pnl_usdt_linear(side, entry_price, exit_price, qty, fee_rate=fee_rate,
-                                             include_both_sides=True)
+            # ---- PnL ----
+            pnl_usdt = self._pnl_usdt_linear(
+                side, entry_price, exit_price, qty, fee_rate=fee_rate, include_both_sides=True
+            )
 
-            # (Opcional) PnL en R si dejaste reward_risk en la señal:
+            # PnL en R (opcional)
             pnl_r = None
-            # Si guardaste el R “unitario” (= distancia a SL), puedes hacer:
-            # R = abs(entry - sl); pnl_r = (exit - entry)/R * sign
             try:
                 R = abs(entry_price - sl) if side == "long" else abs(sl - entry_price)
                 sign = 1 if side == "long" else -1
@@ -4912,19 +4866,24 @@ class StochasticAnalyzer:
             except Exception:
                 pass
 
-            # Loguea cierre y limpia posición
+            # ---- Log de cierre y limpieza ----
             self.tradelogger.log_close(
                 symbol=symbol,
                 exit_reason=exit_reason,
                 exit_price=exit_price,
                 pnl_usdt=float(pnl_usdt) if pnl_usdt is not None else None,
                 pnl_r=float(pnl_r) if pnl_r is not None else None,
-                order_id=pos.get("order_id"),
+                order_id=order_id,
                 trade_id=trade_id
             )
-            print(f"exit_reason={exit_reason} exit_price={exit_price}")
-            # Si además cierras en el broker vía API, puedes dispararlo aquí.
-            break  # ya cerramos; sal del loop
+            print(f"\n exit_reason={exit_reason} exit_price={exit_price} \n")
+            return  # ya cerramos
+
+        # Si no cerró, actualizar last_check_dt a la última vela procesada
+        try:
+            self.tradelogger.enrich_open_position(symbol, last_check_dt=str(df["datetime"].iloc[-1]))
+        except Exception:
+            pass
 
     def send_email(self, subject, body):
         msg = MIMEText(body)
@@ -4941,6 +4900,114 @@ class StochasticAnalyzer:
             print(f"Error enviando email: {e}")
 
     def monitor_predictions(self, symbol="AVAXUSDT", interval="5"):
+
+        def prepare_rule_inputs(df: pd.DataFrame, window: int = 2000, min_periods: int = 200) -> pd.DataFrame:
+            """
+            Precalcula:
+            - Cuartiles rodantes (Q1..Q4) para las columnas necesarias (past-only).
+            - Señales derivadas simples (vwap_up, k100<e100, etc.).
+
+            Devuelve un DataFrame con columnas originales + *_q (labels) + señales.
+            """
+            need_quartiles = [
+                "dist_R1", "dist_R2", "dist_S1", "dist_S2",
+                "volatility_10", "volatility_50",
+                "VWAP", "dist_PP", "atr_norm"
+            ]
+            # <- CAMBIO MINIMO: columnas opcionales si existen en df
+            optional_quartiles = [
+                "VWAP", "k", "e", "e100", "k100", "rsi_14", "macd", "macd_signal", "dist_R2", "atr_norm",
+                "dist_PP",
+            ]
+
+            def rolling_ntile_labels_past_only(
+                    s: pd.Series,
+                    n: int = 5,
+                    window: int = 4300,
+                    min_periods: int = 200,
+            ) -> pd.Series:
+                """
+                Discretiza s en n-tiles usando sólo historia (shift(1)) y cuantiles rolling.
+                Devuelve etiquetas 'Q1'..'Qn' (category). Sin fuga temporal.
+                """
+                s_shift = s.shift(1)
+
+                # cortes interiores: p = 1/n, 2/n, ..., (n-1)/n
+                probs = [(k / n) for k in range(1, n)]
+                # calculamos cada cuantila rolling una sola vez
+                cuts = []
+                for p in probs:
+                    cuts.append(s_shift.rolling(window=window, min_periods=min_periods).quantile(p))
+
+                labels = pd.Series(index=s.index, dtype="object")
+                valid_mask = pd.Series(True, index=s.index)
+                for c in cuts:
+                    valid_mask &= c.notna()
+
+                # Asignación por tramos (Q1..Qn)
+                # Caso Q1: s <= cut1
+                labels.loc[valid_mask & (s <= cuts[0])] = "Q1"
+                # Casos intermedios: cut(k-1) < s <= cut(k)
+                for k in range(1, n - 1):
+                    lower = cuts[k - 1]
+                    upper = cuts[k]
+                    labels.loc[valid_mask & (s > lower) & (s <= upper)] = f"Q{k + 1}"
+                # Caso Qn: s > cut(n-1)
+                labels.loc[valid_mask & (s > cuts[-1])] = f"Q{n}"
+
+                return labels.astype("category")
+
+            out = df.copy()
+
+            # Etiquetas de cuartil rodante (una sola vez por columna)
+            for col in need_quartiles:
+                out[f"{col}_q"] = rolling_ntile_labels_past_only(out[col], window=window, min_periods=min_periods)
+
+            # <- CAMBIO MINIMO: genera *_q sólo si esas columnas existen
+            for col in optional_quartiles:
+                if col in out.columns and f"{col}_q" not in out.columns:
+                    out[f"{col}_q"] = rolling_ntile_labels_past_only(out[col], window=window, min_periods=min_periods)
+
+            # Señales derivadas (vectorizadas)
+            out["vwap_up"] = out["VWAP"].diff().gt(0)  # True si VWAP sube vs vela previa
+            out["vwap_down"] = out["VWAP"].diff().lt(0)
+            out["e_down"] = out["e"].diff().lt(0)
+            out["d_down"] = out["d"].diff().lt(0)
+
+            out["e100_up"] = out["e100"].diff().gt(0)
+            out["e100_down"] = out["e100"].diff().lt(0)
+            out["macd_up"] = out["macd"].diff().gt(0)
+            out["macd_down"] = out["macd"].diff().lt(0)
+
+            out["atr_down"] = out["ATR"].diff().lt(0)
+            out["macd_hist_down"] = out["macd_hist"].diff().lt(0)
+            out["macd_signal_down"] = out["macd_signal"].diff().lt(0)
+            out["macd_signal_up"] = out["macd_signal"].diff().gt(0)
+
+
+
+            out["k100_lt_e100"] = out["k100"] < out["e100"]
+            out["k100_gt_e100"] = out["k100"] > out["e100"]
+            out["k_gt_e"] = out["k"] > out["e"]
+            out["k_lt_e"] = out["k"] < out["e"]
+            out["d_lt_e"] = out["d"] < out["e"]
+            out["d_gt_e"] = out["d"] > out["e"]
+
+
+            out["macd_gt_signal"] = out["macd"] > out["macd_signal"]
+            out["e_lt_25"] = out["e"] < 25
+            out["e100_lt_25"] = out["e100"] <= 25
+            out["dist_PP_lt_0"] = out["dist_PP"] < 0
+
+            out["dist_R1_gt_0"] = out["dist_R1"] > 0
+            out["dist_R2_gt_0"] = out["dist_R2"] > 0
+
+            out["dist_S1_gt_0"] = out["dist_S1"] > 0
+            out["dist_S2_gt_0"] = out["dist_S2"] > 0
+            out["rsi_40_60"] = out["rsi_14"].between(40, 60, inclusive="left").fillna(False)
+
+            return out
+
         last_prediction = None
         last_minute_checked = None
         min_margin = getattr(self, "min_margin", 0.05)
@@ -4967,6 +5034,9 @@ class StochasticAnalyzer:
                     print(e)
                     time.sleep(5)
                     continue
+
+                # Preparar reglas para filtrar ordenes
+                dfp = prepare_rule_inputs(self.data, window=4300, min_periods=200)
 
                 pred = resultado.get('prediction')
                 probs = resultado.get('probabilities', {}) or {}
@@ -5019,13 +5089,12 @@ class StochasticAnalyzer:
                     kelly_fraction = max(0.0, min(p - (q / reward_risk), 0.95))
 
                 # Gate sólo si es elegible
-                self.umbral_strong = 0.67
-                self.umbral_soft = 0.67
+                self.umbral_strong = 0.62
+                self.umbral_soft = 0.62
 
                 gate = None
                 if eligible:
-                    gate = "strong" if proba_pred >= self.umbral_strong else (
-                        "soft" if proba_pred >= self.umbral_soft else None)
+                    gate = "strong" if self.umbral_strong <= proba_pred < 0.82 else None
 
                 # 1) Log de señal (marca elegibilidad)
                 trade_id = self.tradelogger.log_signal(
@@ -5058,8 +5127,33 @@ class StochasticAnalyzer:
                         side_position = info_positions.get("side")
 
                         if side_position == "long" and entry_price is not None and close_price > entry_price:
+                            # Get position info before closing
+                            pos = self.tradelogger.get_open_position(symbol)
+                            qty = pos.get("qty")
+                            order_id = pos.get("order_id")
+                            trade_id = pos.get("trade_id")
+                            fee_rate = pos.get("fee_rate", getattr(self, "fee_rate", 0.0006))
+                            
+                            # Close at broker
                             self.close_order("short")
-                            self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+                            
+                            # Calculate PnL
+                            pnl_usdt = self._pnl_usdt_linear(
+                                side_position, entry_price, close_price, qty,
+                                fee_rate=fee_rate, include_both_sides=True
+                            )
+                            
+                            # Update tradelogger state
+                            self.tradelogger.log_close(
+                                symbol=symbol,
+                                exit_reason="manual_lateral",
+                                exit_price=close_price,
+                                pnl_usdt=float(pnl_usdt) if pnl_usdt is not None else None,
+                                pnl_r=None,
+                                order_id=order_id,
+                                trade_id=trade_id
+                            )
+                            
                             self.tradelogger.log_info(event="closed_on_lateral", symbol=symbol, prob=proba_pred,
                                                       note="Cierre por lateral>=0.80 con PnL favorable")
                             last_prediction = pred
@@ -5067,8 +5161,33 @@ class StochasticAnalyzer:
                             continue
 
                         if side_position == "short" and entry_price is not None and close_price < entry_price:
+                            # Get position info before closing
+                            pos = self.tradelogger.get_open_position(symbol)
+                            qty = pos.get("qty")
+                            order_id = pos.get("order_id")
+                            trade_id = pos.get("trade_id")
+                            fee_rate = pos.get("fee_rate", getattr(self, "fee_rate", 0.0006))
+                            
+                            # Close at broker
                             self.close_order("long")
-                            self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+                            
+                            # Calculate PnL
+                            pnl_usdt = self._pnl_usdt_linear(
+                                side_position, entry_price, close_price, qty,
+                                fee_rate=fee_rate, include_both_sides=True
+                            )
+                            
+                            # Update tradelogger state
+                            self.tradelogger.log_close(
+                                symbol=symbol,
+                                exit_reason="manual_lateral",
+                                exit_price=close_price,
+                                pnl_usdt=float(pnl_usdt) if pnl_usdt is not None else None,
+                                pnl_r=None,
+                                order_id=order_id,
+                                trade_id=trade_id
+                            )
+                            
                             self.tradelogger.log_info(event="closed_on_lateral", symbol=symbol, prob=proba_pred,
                                                       note="Cierre por lateral>=0.80 con PnL favorable")
                             last_prediction = pred
@@ -5089,16 +5208,66 @@ class StochasticAnalyzer:
                         if is_opposite and proba_pred >= 0.75:
                             # Criterio de PnL favorable (tal como lo tenías):
                             if side_position == "long" and entry_price is not None and close_price > entry_price:
+                                # Get position info before closing
+                                pos = self.tradelogger.get_open_position(symbol)
+                                qty = pos.get("qty")
+                                order_id = pos.get("order_id")
+                                trade_id = pos.get("trade_id")
+                                fee_rate = pos.get("fee_rate", getattr(self, "fee_rate", 0.0006))
+                                
+                                # Close at broker
                                 self.close_order("short")
-                                self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+                                
+                                # Calculate PnL
+                                pnl_usdt = self._pnl_usdt_linear(
+                                    side_position, entry_price, close_price, qty,
+                                    fee_rate=fee_rate, include_both_sides=True
+                                )
+                                
+                                # Update tradelogger state
+                                self.tradelogger.log_close(
+                                    symbol=symbol,
+                                    exit_reason="manual_opposite",
+                                    exit_price=close_price,
+                                    pnl_usdt=float(pnl_usdt) if pnl_usdt is not None else None,
+                                    pnl_r=None,
+                                    order_id=order_id,
+                                    trade_id=trade_id
+                                )
+                                
                                 self.tradelogger.log_info(event="closed_on_opposite", symbol=symbol, prob=proba_pred,
-                                                          note="Cierre por opuesto>=0.70 con PnL favorable")
+                                                          note="Cierre por opuesto>=0.75 con PnL favorable")
                                 # No abrimos aún; dejamos que el flujo de entrada lo decida abajo (si aplica).
                             elif side_position == "short" and entry_price is not None and close_price < entry_price:
+                                # Get position info before closing
+                                pos = self.tradelogger.get_open_position(symbol)
+                                qty = pos.get("qty")
+                                order_id = pos.get("order_id")
+                                trade_id = pos.get("trade_id")
+                                fee_rate = pos.get("fee_rate", getattr(self, "fee_rate", 0.0006))
+                                
+                                # Close at broker
                                 self.close_order("long")
-                                self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+                                
+                                # Calculate PnL
+                                pnl_usdt = self._pnl_usdt_linear(
+                                    side_position, entry_price, close_price, qty,
+                                    fee_rate=fee_rate, include_both_sides=True
+                                )
+                                
+                                # Update tradelogger state
+                                self.tradelogger.log_close(
+                                    symbol=symbol,
+                                    exit_reason="manual_opposite",
+                                    exit_price=close_price,
+                                    pnl_usdt=float(pnl_usdt) if pnl_usdt is not None else None,
+                                    pnl_r=None,
+                                    order_id=order_id,
+                                    trade_id=trade_id
+                                )
+                                
                                 self.tradelogger.log_info(event="closed_on_opposite", symbol=symbol, prob=proba_pred,
-                                                          note="Cierre por opuesto>=0.70 con PnL favorable")
+                                                          note="Cierre por opuesto>=0.75 con PnL favorable")
 
                     # =========================
                     # (B) ENTRADA/RE-ENTRADA (requiere eligible + gate)
@@ -5109,11 +5278,17 @@ class StochasticAnalyzer:
                                                       symbol=symbol, side=side_prediction, trade_id=trade_id)
                             # (Si quisieras “flippear” inmediatamente después de cerrar en A2, podrías chequear aquí
                             #  si ya no hay posición y llamar start_order; por ahora conservamos tu comportamiento.)
+
                         else:
-                            self.start_order(pred, symbol, bogota_time, proba_pred, probs,
+                            validate_order = validate_start_order_fast(dfp, pred)
+                            if validate_order and validate_order.get("enter"):
+                                # print(validate_order["rule"])
+                                self.start_order(pred, symbol, bogota_time, proba_pred, probs,
                                              atr, df=data_df, close_price=close_price, real_account=True, ema200=ema200, trade_id=trade_id)
+                            else:
+                                print(f"Prevent enter {validate_order["rule"]}")
                     else:
-                        print("Señal no elegible (lateral, sin margen, sin ATR o bajo umbral).")
+                         print("Señal no elegible (lateral, sin margen, sin ATR o bajo umbral).")
                     last_prediction = pred
 
                 else:
@@ -5126,9 +5301,18 @@ class StochasticAnalyzer:
                         if self.tradelogger.has_open_position(symbol):
                             self.tradelogger.log_info(note="Señal ignorada: ya hay posición abierta",
                                                       symbol=symbol, side=side_prediction, trade_id=trade_id)
+                        # validate_order = validate_start_order_fast(dfp, pred)
+                        # if validate_order and validate_order.get("enter"):
+                        #     print(validate_order["rule"])
                         else:
-                            self.start_order(pred, symbol, bogota_time, proba_pred, probs,
+                            validate_order = validate_start_order_fast(dfp, pred)
+                            if validate_order and validate_order.get("enter"):
+                                # print(validate_order["rule"])
+                                self.start_order(pred, symbol, bogota_time, proba_pred, probs,
                                              atr, df=data_df, close_price=close_price, real_account=True, ema200=ema200, trade_id=trade_id)
+                            else:
+                                print(f"Prevent enter {validate_order["rule"]}")
+
                     else:
                         print("Señal por debajo del umbral strong o no elegible — no trade.")
 
@@ -5173,7 +5357,7 @@ class StochasticAnalyzer:
         if atr is not None and atr > 0:
             if (pred == "bullish") or (pred == "bearish"):
                 response = {}
-                profit_factor = 4.5
+                profit_factor = 4.3
                 loss_factor = 3
 
                 take_profit = close_price + (profit_factor * atr) if pred == "bullish" else close_price - (
@@ -5198,6 +5382,7 @@ class StochasticAnalyzer:
                 perdida = abs(stop_loss - close_price)
                 reward_risk = ganancia / perdida if perdida != 0 else 0.0001  # protección para no dividir por 0
                 p = proba
+                p = 0.64 # el resultado maximo de las simulaciones
                 q = 1 - p
                 kelly_fraction = p - (q / reward_risk)
                 # Limitar valores extremos
@@ -5335,7 +5520,7 @@ class StochasticAnalyzer:
         }
         try:
             response = requests.post(
-                "http://52.67.38.220:80/webhook",
+                "http://52.67.38.220:80/close-trend",
                 json=payload,
                 timeout=10
             )
@@ -5344,17 +5529,6 @@ class StochasticAnalyzer:
         except Exception as e:
             print("Error enviando al webhook:", e)
 
-    def append_new_data(self, new_df):
-        """
-        Anexa nuevos datos OHLCV al histórico acumulado (self.data), evitando duplicados.
-        """
-        if new_df is None or new_df.empty:
-            return
-        if self.data is None or self.data.empty:
-            self.data = new_df
-        else:
-            self.data = pd.concat([self.data, new_df], ignore_index=True)
-            self.data = self.data.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
 
     def simular_estrategia(self, start_date="2024-07-01", end_date="2025-07-20",
                            capital_inicial=1000, fee=0.0012, leverage=19,
@@ -5652,7 +5826,6 @@ class StochasticAnalyzer:
             self.data = pd.concat([self.data, new_df], ignore_index=True)
             self.data = self.data.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
 
-
     def preparar_features(self, df, lags=[1]):
         """
         Feature set 'trader-like':
@@ -5852,6 +6025,8 @@ class StochasticAnalyzer:
                 dfx["close"].rolling(window=w, min_periods=w)
                 .apply(lambda a: _trend_dist_pct(a), raw=True)
             )
+        dfx['trend_slope_norm_100_down'] = np.where(dfx["trend_slope_norm_100"].diff().lt(0), 1, 0)
+
 
         # =========================
         # Canales de tendencia (regresión sobre highs/lows en ventana)
@@ -5984,7 +6159,7 @@ class StochasticAnalyzer:
                           'dist_R1_8h_atr', 'range_prev_day_abs', 'overnight_range_atr', 'dist_P_8h_atr',
                           'trend_r2_100', 'range_prev_day_atr', 'trend_channel_slope_low',
                           'ema_ratio', 'trend_dist_pct_100', 'rsi_50', 'dist_resist_rl', 'roc_30', 'dist_support_rl',
-                          'd', 'dow_sin', 'volume', 'dow_cos', 'candle_engulfing']
+                          'd', 'dow_sin', 'volume', 'dow_cos', 'trend_slope_norm_100_down']
 
         features_final = features_trader
 
@@ -6462,103 +6637,141 @@ def is_allowed_time():
 if __name__ == "__main__":
     now = datetime.now()
 
-    analyzer = StochasticAnalyzer(api_key=api_key_roge, api_secret=api_secret_roge)
+    # analyzer = StochasticAnalyzer(api_key=api_key_roge, api_secret=api_secret_roge)
     # analyzer = StochasticAnalyzer(api_key=api_key, api_secret=api_secret)
     # API pública
-    # analyzer = StochasticAnalyzer()
+    analyzer = StochasticAnalyzer()
 
     today_str = f"{datetime.now().day:02d}"
     tomorrow = datetime.now() + timedelta(days=1)
     tomorrow_day = f"{tomorrow.day:02d}"
     mont_str = f"{datetime.now().month:02d}"
-    filename = f'AVAXUSDT_5m_2024-01-01_2025-{mont_str}-{today_str}.csv'
-    if os.path.exists(filename):
-        nombre, extension = os.path.splitext(filename)
-        new_name = nombre[:-2] + tomorrow_day + extension
-        os.rename(filename, new_name)
-        print("Nuevo nombre de archivo:", new_name)
+    filename = f'AVAXUSDT_5m_2022-01-01_2025-{mont_str}-{today_str}.csv'
+    # if os.path.exists(filename):
+    #     nombre, extension = os.path.splitext(filename)
+    #     new_name = nombre[:-2] + tomorrow_day + extension
+    #     os.rename(filename, new_name)
+    #     print("Nuevo nombre de archivo:", new_name)
+    #
+    # end_date = f"2025-{mont_str}-{tomorrow_day}"
+    # filename_tomorrow = f'AVAXUSDT_5m_2022-01-01_{end_date}.csv'
+    # if os.path.exists(filename_tomorrow):
+    if True:
 
-    end_date = f"2025-{mont_str}-{tomorrow_day}"
-    filename_tomorrow = f'AVAXUSDT_5m_2024-01-01_{end_date}.csv'
-    if os.path.exists(filename_tomorrow):
         print(f"iniciando script a las {now.hour}:{now.minute}:{now.second} horas")
         # print(f"end_date {end_date}")
-        analyzer.run_analysis(
-            symbol="AVAXUSDT",
-            start_date="2024-01-01",
-            end_date=end_date,
-            interval="5"
-        )
+        # analyzer.run_analysis(
+        #     symbol="AVAXUSDT",
+        #     start_date="2022-01-01",
+        #     end_date=end_date,
+        #     interval="5",
+        # )
+
+        # --- Configuración base ---
+        symbol = "AVAXUSDT"
+        interval = "5"
+        start_date = datetime.strptime("2022-01-01", "%Y-%m-%d")
+        end_date = datetime.strptime("2025-12-04", "%Y-%m-%d")
+        final_date = datetime.strptime("2025-12-04", "%Y-%m-%d")
+
+        # Nombre del archivo que analyzer genera siempre (el mismo)
+        # original_file = f"{symbol}_{interval}m_2023-07-01_2023-07-12.csv"
+
+        # --- Iterar ---
+        while end_date <= final_date:
+            # --- 1️⃣ Renombrar primero el archivo de la iteración anterior ---
+            new_file = f"{symbol}_{interval}m_{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
+
+            end_date_original = end_date - timedelta(days=3)
+            original_file = f"{symbol}_{interval}m_{start_date.strftime('%Y-%m-%d')}_{end_date_original.strftime('%Y-%m-%d')}.csv"
+
+            if os.path.exists(original_file):
+                os.rename(original_file, new_file)
+                print(f"✅ Archivo renombrado a: {new_file}")
+            else:
+                print(f"⚠️ No se encontró {original_file}, saltando renombrado.")
+
+            # --- 2️⃣ Ejecutar el análisis para la siguiente iteración ---
+            analyzer.run_analysis(
+                symbol=symbol,
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d"),
+                interval=interval
+            )
+
+            # --- 3️⃣ Actualizar fechas ---
+            end_date += timedelta(days=3)
+
         # Guardar resultados
         # results_df = analyzer.save_results("avax_stochastic_analysis_cached.csv")
 
         # # # #
         # RF model production mode
         # print("hola q hace")
-        analyzer.create_predictive_model(
-            model_type="rf",
-            calibrate_method="beta",
-            N_KEEP=177_000,
-            display_graphic=True,
-            model_kwargs={
-                "n_estimators": 700,
-                "max_features": "sqrt",
-                "n_jobs": -1,
-                "random_state": 42
-            },
-            display_feature_plot=True
-        )
-        analyzer.monitor_predictions()
+        # analyzer.create_predictive_model(
+        #     model_type="rf",
+        #     calibrate_method="beta",
+        #     N_KEEP=212_000,
+        #     display_graphic=False,
+        #     model_kwargs={
+        #         "n_estimators": 700,
+        #         "max_features": "sqrt",
+        #         "n_jobs": -1,
+        #         "random_state": 42
+        #     },
+        #     display_feature_plot=False
+        # )
+        # analyzer.monitor_predictions()
 
         #=====================TESTING======================#
 
         # ==================== simulator
-        df = analyzer.data
-        def logger(event, payload):
-            if event == "progress":
-                print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
-                      f"equity={payload['equity']:.2f} | trades={payload['trades']}")
-            elif event == "open":
-                print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
-                      f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
-                      f"proba={payload['prob'] * 100:.1f} | "
-                      f"kelly={payload['kelly'] if payload['kelly'] is not None else 1.0:.3f}")
-            elif event == "close":
-                dur = payload.get("duration")
-                print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
-                      f"PnL={payload['pnl']:.2f} | "
-                      f"equity={payload['equity']:.2f} | "
-                      f"in={payload['entry_time']} out={payload['time']} "
-                      f"dur={dur}")
-            elif event == "early_opposite":
-                print(
-                    f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
-                    f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
-                    f"| in={payload['entry_time']} out={payload['time']} "
-                    f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
-                )
-        sim = TradeSimulator(
-            analyzer,
-            df,
-            initial_equity=155,
-            leverage=200,
-            risk_fraction=0.02,
-            on_event=logger,  # <— activar callback
-            verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
-            log_every_bars=250,
-            proba_threshold_day=0.75,
-            proba_threshold_night=0.76,
-            n_keep_for_fit=101000,
-            atr_mult_tp=4,
-            atr_mult_sl=3,
-            retrain_each_bar=False,
-            retrain_every_bars=None,
-            suppress_fit_stdout=False,
-            early_exit_threshold=0.75
-        )
-        #
-        results = sim.run(test_start="2025-08-26", test_end="2025-09-05")
-        print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
+        # df = analyzer.data
+        # def logger(event, payload):
+        #     if event == "progress":
+        #         print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
+        #               f"equity={payload['equity']:.2f} | trades={payload['trades']}")
+        #     elif event == "open":
+        #         print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
+        #               f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
+        #               f"proba={payload['prob'] * 100:.1f} | "
+        #               f"kelly={payload['kelly'] if payload['kelly'] is not None else 1.0:.3f}")
+        #     elif event == "close":
+        #         dur = payload.get("duration")
+        #         print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
+        #               f"PnL={payload['pnl']:.2f} | "
+        #               f"equity={payload['equity']:.2f} | "
+        #               f"in={payload['entry_time']} out={payload['time']} "
+        #               f"dur={dur}")
+        #     elif event == "early_opposite":
+        #         print(
+        #             f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
+        #             f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
+        #             f"| in={payload['entry_time']} out={payload['time']} "
+        #             f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
+        #         )
+        # sim = TradeSimulator(
+        #     analyzer,
+        #     df,
+        #     initial_equity=155,
+        #     leverage=200,
+        #     risk_fraction=0.02,
+        #     on_event=logger,  # <— activar callback
+        #     verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
+        #     log_every_bars=250,
+        #     proba_threshold_day=0.75,
+        #     proba_threshold_night=0.76,
+        #     n_keep_for_fit=101000,
+        #     atr_mult_tp=4,
+        #     atr_mult_sl=3,
+        #     retrain_each_bar=False,
+        #     retrain_every_bars=None,
+        #     suppress_fit_stdout=False,
+        #     early_exit_threshold=0.75
+        # )
+        # #
+        # results = sim.run(test_start="2025-08-26", test_end="2025-09-05")
+        # print("DBG sim.run returned", results["final_equity"], results["n_trades"], results["proba_summary"])
 
 
         # # =========== get_best_calibration_model
@@ -6606,7 +6819,3 @@ if __name__ == "__main__":
         #     time.sleep(60)
     else:
         print(f"El archivo {filename} no existe")
-
-# @todo probar calibracion beta,
-# @todo probar simulacion cambiando la restriccion de ema 15,
-# @todo hacer correccion de early opposite en start order
