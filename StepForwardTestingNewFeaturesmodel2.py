@@ -6665,7 +6665,7 @@ class StochasticAnalyzer:
 
                 gate = None
                 if eligible:
-                    gate = "strong" if self.umbral_strong <= proba_pred < 0.97 else None
+                    gate = "strong" if self.umbral_strong <= proba_pred < 0.98 else None
 
                 # 1) Log de señal (marca elegibilidad)
                 trade_id = self.tradelogger.log_signal(
@@ -6691,8 +6691,33 @@ class StochasticAnalyzer:
                     side_position = info_positions.get("side")
 
                     if side_position == "long" and entry_price is not None and close_price > entry_price:
+                        # Get position info before closing
+                        pos = self.tradelogger.get_open_position(symbol)
+                        qty = pos.get("qty")
+                        order_id = pos.get("order_id")
+                        trade_id = pos.get("trade_id")
+                        fee_rate = pos.get("fee_rate", getattr(self, "fee_rate", 0.0006))
+
+                        # Close at broker
                         self.close_order("short")
-                        self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+
+                        # Calculate PnL
+                        pnl_usdt = self._pnl_usdt_linear(
+                            side_position, entry_price, close_price, qty,
+                            fee_rate=fee_rate, include_both_sides=True
+                        )
+
+                        # Update tradelogger state
+                        self.tradelogger.log_close(
+                            symbol=symbol,
+                            exit_reason="manual_lateral",
+                            exit_price=close_price,
+                            pnl_usdt=float(pnl_usdt) if pnl_usdt is not None else None,
+                            pnl_r=None,
+                            order_id=order_id,
+                            trade_id=trade_id
+                        )
+
                         self.tradelogger.log_info(event="closed_on_lateral", symbol=symbol, prob=proba_pred,
                                                   note="Cierre por lateral>=0.80 con PnL favorable")
                         last_prediction = pred
@@ -6700,8 +6725,33 @@ class StochasticAnalyzer:
                         continue
 
                     if side_position == "short" and entry_price is not None and close_price < entry_price:
+                        # Get position info before closing
+                        pos = self.tradelogger.get_open_position(symbol)
+                        qty = pos.get("qty")
+                        order_id = pos.get("order_id")
+                        trade_id = pos.get("trade_id")
+                        fee_rate = pos.get("fee_rate", getattr(self, "fee_rate", 0.0006))
+
+                        # Close at broker
                         self.close_order("long")
-                        self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+
+                        # Calculate PnL
+                        pnl_usdt = self._pnl_usdt_linear(
+                            side_position, entry_price, close_price, qty,
+                            fee_rate=fee_rate, include_both_sides=True
+                        )
+
+                        # Update tradelogger state
+                        self.tradelogger.log_close(
+                            symbol=symbol,
+                            exit_reason="manual_lateral",
+                            exit_price=close_price,
+                            pnl_usdt=float(pnl_usdt) if pnl_usdt is not None else None,
+                            pnl_r=None,
+                            order_id=order_id,
+                            trade_id=trade_id
+                        )
+
                         self.tradelogger.log_info(event="closed_on_lateral", symbol=symbol, prob=proba_pred,
                                                   note="Cierre por lateral>=0.80 con PnL favorable")
                         last_prediction = pred
@@ -6722,17 +6772,66 @@ class StochasticAnalyzer:
                     if is_opposite and proba_pred >= 0.8:
                         # Criterio de PnL favorable (tal como lo tenías):
                         if side_position == "long" and entry_price is not None and close_price > entry_price:
+                            # Get position info before closing
+                            pos = self.tradelogger.get_open_position(symbol)
+                            qty = pos.get("qty")
+                            order_id = pos.get("order_id")
+                            trade_id = pos.get("trade_id")
+                            fee_rate = pos.get("fee_rate", getattr(self, "fee_rate", 0.0006))
+
+                            # Close at broker
                             self.close_order("short")
-                            self.check_and_close_from_market(symbol, resultado.get("raw_df"))
+
+                            # Calculate PnL
+                            pnl_usdt = self._pnl_usdt_linear(
+                                side_position, entry_price, close_price, qty,
+                                fee_rate=fee_rate, include_both_sides=True
+                            )
+
+                            # Update tradelogger state
+                            self.tradelogger.log_close(
+                                symbol=symbol,
+                                exit_reason="manual_opposite",
+                                exit_price=close_price,
+                                pnl_usdt=float(pnl_usdt) if pnl_usdt is not None else None,
+                                pnl_r=None,
+                                order_id=order_id,
+                                trade_id=trade_id
+                            )
+
                             self.tradelogger.log_info(event="closed_on_opposite", symbol=symbol, prob=proba_pred,
-                                                      note="Cierre por opuesto>=0.80 con PnL favorable")
+                                                      note="Cierre por opuesto>=0.75 con PnL favorable")
                             # No abrimos aún; dejamos que el flujo de entrada lo decida abajo (si aplica).
                         elif side_position == "short" and entry_price is not None and close_price < entry_price:
-                            self.close_order("long")
-                            self.check_and_close_from_market(symbol, resultado.get("raw_df"))
-                            self.tradelogger.log_info(event="closed_on_opposite", symbol=symbol, prob=proba_pred,
-                                                      note="Cierre por opuesto>=0.80 con PnL favorable")
+                            # Get position info before closing
+                            pos = self.tradelogger.get_open_position(symbol)
+                            qty = pos.get("qty")
+                            order_id = pos.get("order_id")
+                            trade_id = pos.get("trade_id")
+                            fee_rate = pos.get("fee_rate", getattr(self, "fee_rate", 0.0006))
 
+                            # Close at broker
+                            self.close_order("long")
+
+                            # Calculate PnL
+                            pnl_usdt = self._pnl_usdt_linear(
+                                side_position, entry_price, close_price, qty,
+                                fee_rate=fee_rate, include_both_sides=True
+                            )
+
+                            # Update tradelogger state
+                            self.tradelogger.log_close(
+                                symbol=symbol,
+                                exit_reason="manual_opposite",
+                                exit_price=close_price,
+                                pnl_usdt=float(pnl_usdt) if pnl_usdt is not None else None,
+                                pnl_r=None,
+                                order_id=order_id,
+                                trade_id=trade_id
+                            )
+
+                            self.tradelogger.log_info(event="closed_on_opposite", symbol=symbol, prob=proba_pred,
+                                                      note="Cierre por opuesto>=0.75 con PnL favorable")
 
                 # 4) Decisión de trade
                 if pred != last_prediction:
@@ -6850,7 +6949,7 @@ class StochasticAnalyzer:
                 perdida = abs(stop_loss - close_price)
                 reward_risk = ganancia / perdida if perdida != 0 else 0.0001  # protección para no dividir por 0
                 p = proba
-                # p = 0.64 # el resultado maximo de las simulaciones
+                p = max(0.66, proba - 0.3)
                 q = 1 - p
                 kelly_fraction = p - (q / reward_risk)
                 # Limitar valores extremos
@@ -10276,34 +10375,34 @@ if __name__ == "__main__":
         # # # #
         # lgbm model production mode
         #
-        # analyzer.create_predictive_model(
-        #     model_type="lgbm",
-        #     calibrate_method="sigmoid",
-        #     N_KEEP=197_000,
-        #     display_graphic=False,
-        #     model_kwargs={
-        #         "objective": "multiclass",
-        #         "num_class": 3,  # ajusta según tus clases reales
-        #         "n_estimators": 2000,  # más árboles + LR más bajo
-        #         "learning_rate": 0.03,  # más bajo para mejorar logloss
-        #         "num_leaves": 96,  # complejidad del árbol
-        #         "max_depth": -1,  # deja que LGBM lo maneje
-        #         "min_child_samples": 200,  # regularización clave con 220k filas
-        #
-        #         "subsample": 0.7,  # antes 0.9, bajamos para más robustez
-        #         "subsample_freq": 1,
-        #         "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
-        #
-        #         "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
-        #         "reg_alpha": 0.1,  # L1 ligera
-        #
-        #         "min_split_gain": 0.0,
-        #         "random_state": 42,
-        #         "n_jobs": -1
-        #     },
-        #     display_feature_plot=False
-        # )
-        # analyzer.monitor_predictions()
+        analyzer.create_predictive_model(
+            model_type="lgbm",
+            calibrate_method="sigmoid",
+            N_KEEP=197_000,
+            display_graphic=False,
+            model_kwargs={
+                "objective": "multiclass",
+                "num_class": 3,  # ajusta según tus clases reales
+                "n_estimators": 2000,  # más árboles + LR más bajo
+                "learning_rate": 0.03,  # más bajo para mejorar logloss
+                "num_leaves": 96,  # complejidad del árbol
+                "max_depth": -1,  # deja que LGBM lo maneje
+                "min_child_samples": 200,  # regularización clave con 220k filas
+
+                "subsample": 0.7,  # antes 0.9, bajamos para más robustez
+                "subsample_freq": 1,
+                "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
+
+                "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
+                "reg_alpha": 0.1,  # L1 ligera
+
+                "min_split_gain": 0.0,
+                "random_state": 42,
+                "n_jobs": -1
+            },
+            display_feature_plot=False
+        )
+        analyzer.monitor_predictions()
 
         #=====================TESTING======================#
         # model 2 model
@@ -10375,43 +10474,32 @@ if __name__ == "__main__":
             #     )
 
 
-        #
-        def logger(event, payload):
-            if event == "new_predicction":
-                print(
-                    f"Prediction {payload['time']} | {payload['side']} "
-                    f"| prob={payload['prob']:.3f}"
-                    f"| tp={payload['tp']}"
-                    f"| sl={payload['sl']}"
-                    f"| margin={payload['margin']}"
-                )
-
-        sim = TradeSimulator(
-            analyzer,
-            df,
-            initial_equity=1000,
-            leverage=200,
-            risk_fraction=0.02,
-            on_event=logger,  # <— activar callback
-            verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
-            log_every_bars=288,
-            proba_threshold_day=0.58,
-            proba_threshold_night=0.58,
-            n_keep_for_fit=197_000,
-            atr_mult_tp=4,
-            atr_mult_sl=3,
-            retrain_each_bar=False,
-            retrain_every_bars=1440,
-            suppress_fit_stdout=False,
-            early_exit_threshold=0.75,
-            n_estimators=2000,
-            start_date="2023-01-01",
-            end_date=end_date,
-            m2_model=model_m2
-        )
-        # #
-        results = sim.run(test_start="2025-08-01", test_end="2025-12-01")
-        print("DBG sim.run returned", results["final_equity"])
+        # sim = TradeSimulator(
+        #     analyzer,
+        #     df,
+        #     initial_equity=1000,
+        #     leverage=200,
+        #     risk_fraction=0.02,
+        #     on_event=logger,  # <— activar callback
+        #     verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
+        #     log_every_bars=288,
+        #     proba_threshold_day=0.58,
+        #     proba_threshold_night=0.58,
+        #     n_keep_for_fit=197_000,
+        #     atr_mult_tp=4,
+        #     atr_mult_sl=3,
+        #     retrain_each_bar=False,
+        #     retrain_every_bars=1440,
+        #     suppress_fit_stdout=False,
+        #     early_exit_threshold=0.75,
+        #     n_estimators=2000,
+        #     start_date="2023-01-01",
+        #     end_date=end_date,
+        #     m2_model=model_m2
+        # )
+        # # #
+        # results = sim.run(test_start="2025-08-01", test_end="2025-12-01")
+        # print("DBG sim.run returned", results["final_equity"])
         # # # #
         # rules_raw = sim.autogen_rules_from_entries(
         #     min_support=5,  # exige soporte sólido
