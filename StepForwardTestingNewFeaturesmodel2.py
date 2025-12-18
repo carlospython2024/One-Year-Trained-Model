@@ -999,7 +999,7 @@ class M1OutputCacheBuilder:
     # --------------------------
     # Proceso principal + cache
     # --------------------------
-    def build_and_cache(self, test_start: str, test_end: Optional[str] = None, verbose: int = 1) -> pd.DataFrame:
+    def build_and_cache(self, test_start: str, test_end: Optional[str] = None, verbose: int = 1, export_parquet: bool = True) -> pd.DataFrame:
         # Alinear fechas a tz del DF
         tz = self.tz
         start = pd.to_datetime(test_start)
@@ -1154,11 +1154,12 @@ class M1OutputCacheBuilder:
             combo = new_df
 
         # Escritura parquet
-        write_kwargs = {}
-        if self.cache.partition_cols:
-            write_kwargs["partition_cols"] = self.cache.partition_cols
+        if export_parquet:
+            write_kwargs = {}
+            if self.cache.partition_cols:
+                write_kwargs["partition_cols"] = self.cache.partition_cols
 
-        combo.to_parquet(self.cache.cache_path, engine=self.cache.engine, index=False, **write_kwargs)
+            combo.to_parquet(self.cache.cache_path, engine=self.cache.engine, index=False, **write_kwargs)
         return combo.sort_values("datetime").reset_index(drop=True)
 
 class TradeSimulator:
@@ -1620,8 +1621,8 @@ class TradeSimulator:
         start, end = self.day_hours
         in_day = start <= ts.time() <= end
         thresh = self.proba_threshold_day if in_day else self.proba_threshold_night
-        return proba is not None and thresh <= float(proba)
-        # return proba is not None and float(proba) >= thresh < 0.81
+        # return proba is not None and thresh <= float(proba)
+        return proba is not None and float(proba) >= thresh < 0.97
 
     def _tp_sl_from_adapter_or_atr(self, i: int, proba: int, side: Literal["long", "short"],
                                    maybe_tp: Optional[float], maybe_sl: Optional[float]) -> Tuple[float, float]:
@@ -3491,11 +3492,11 @@ def select_features_by_correlation(
 
 
 class StochasticAnalyzer:
-    def __init__(self, api_key=None, api_secret=None, atr_mult=4, atr_stop=3, m2_model=None):
+    def __init__(self, api_key=None, api_secret=None, atr_mult=4, atr_stop=3, m2_model=None, data=None):
         self.umbral_strong = None
         self.umbral_soft = None
         self.min_margin = 0.05
-        self.data = None
+        self.data = data
         self.results = []
         self.model = None
         self.m2_model = m2_model
@@ -4121,8 +4122,8 @@ class StochasticAnalyzer:
         df = self.assign_future_trend_with_dd_order_sensitive(
             df,
             lookahead=lookahead,
-            atr_mult=self.atr_mult,
-            atr_dd_mult=getattr(self, "atr_stop", 2.6),
+            atr_mult=getattr(self, "atr_mult", 5),
+            atr_dd_mult=getattr(self, "atr_stop", 3),
             order_sensitive=getattr(self, "order_sensitive_dd", True),
             drop_helpers=False  # o False si quieres auditar targets/stops
         )
@@ -4142,8 +4143,8 @@ class StochasticAnalyzer:
 
     def assign_future_trend_with_dd_first_event(self, df,
                                                 lookahead=60,
-                                                atr_mult=None,
-                                                atr_dd_mult=1.0,
+                                                atr_mult=5,
+                                                atr_dd_mult=3,
                                                 first_event=True,  # Variante A activada por defecto
                                                 drop_helpers=True):
         """
@@ -4928,7 +4929,7 @@ class StochasticAnalyzer:
             plt.xlabel("Importance")
             plt.ylabel("Feature")
             plt.tight_layout()
-            plt.show()
+            plt.show(block=False)
 
         return df_imp
 
@@ -4988,22 +4989,25 @@ class StochasticAnalyzer:
             model_kwargs: Optional[Dict] = None,
             calibrate_method: str = "isotonic",  # "isotonic" o "sigmoid"
             return_metrics: bool = False,
-            display_feature_plot: bool = False
+            display_feature_plot: bool = False,
+            use_df_parquet: bool = True
     ):
         if self.data is None:
             print("No hay datos para entrenar el modelo")
             return
 
         # Preparación de dataset y features (tu función existente)
-        df_model, features, _ = prepare_features_incremental(
-            raw_df=self.data,
-            preparar_features_fn=self.preparar_features,  # tu propia función
-            params=params_to_features,
-            cache_dir="feature_cache",
-            datetime_col="datetime",
-            warmup_bars=150
-        )
-        # df_model, features = self.preparar_features(self.data)
+        if use_df_parquet:
+            df_model, features, _ = prepare_features_incremental(
+                raw_df=self.data,
+                preparar_features_fn=self.preparar_features,  # tu propia función
+                params=params_to_features,
+                cache_dir="feature_cache",
+                datetime_col="datetime",
+                warmup_bars=150
+            )
+        else:
+            df_model, features = self.preparar_features(self.data)
 
         df_model["datetime"] = pd.to_datetime(df_model["datetime"])
 
@@ -5268,7 +5272,7 @@ class StochasticAnalyzer:
             plt.title(f'Gráfico de calibración: sin calibrar vs calibrado\nEntrenado: {fecha_actual}')
             plt.legend();
             plt.grid();
-            plt.show()
+            plt.show(block=False)
 
         # Guardar en self
         self.base_model = base_model
@@ -5757,7 +5761,7 @@ class StochasticAnalyzer:
             plt.title(f'Curvas de calibración (base vs mejor)\nEntrenado: {fecha_actual}')
             plt.legend()
             plt.grid()
-            plt.show()
+            plt.show(block=False)
 
         return self.model
 
@@ -6684,7 +6688,7 @@ class StochasticAnalyzer:
                 # =========================
 
                 # A1) Cierre por LATERAL fuerte
-                lateral_close_trigger = (pred == "lateral" and proba_pred >= 0.80)
+                lateral_close_trigger = (pred == "lateral" and proba_pred >= 0.75)
                 if lateral_close_trigger and self.tradelogger.has_open_position(symbol):
                     info_positions = self.tradelogger.open_positions.get(symbol) or {}
                     entry_price = info_positions.get("entry_price")
@@ -6719,7 +6723,7 @@ class StochasticAnalyzer:
                         )
 
                         self.tradelogger.log_info(event="closed_on_lateral", symbol=symbol, prob=proba_pred,
-                                                  note="Cierre por lateral>=0.80 con PnL favorable")
+                                                  note="Cierre por lateral>=0.75 con PnL favorable")
                         last_prediction = pred
                         last_minute_checked = minute
                         continue
@@ -6854,7 +6858,7 @@ class StochasticAnalyzer:
                             if True:
                                 # print(validate_order["rule"])
                                 self.start_order(pred, symbol, bogota_time, proba_pred, probs,
-                                             atr, df=data_df, close_price=close_price, real_account=True, ema200=ema200, trade_id=trade_id)
+                                             atr, df=data_df, close_price=close_price, real_account=False, ema200=ema200, trade_id=trade_id)
                             # else:
                             #     print(f"Prevent enter {validate_order["rule"]}")
                     else:
@@ -6877,7 +6881,7 @@ class StochasticAnalyzer:
                             if True:
                                 # print(validate_order["rule"])
                                 self.start_order(pred, symbol, bogota_time, proba_pred, probs,
-                                             atr, df=data_df, close_price=close_price, real_account=True, ema200=ema200, trade_id=trade_id)
+                                             atr, df=data_df, close_price=close_price, real_account=False, ema200=ema200, trade_id=trade_id)
                             # else:
                             #     print(f"Prevent enter {validate_order["rule"]}")
                     else:
@@ -6889,18 +6893,18 @@ class StochasticAnalyzer:
                 time.sleep(5)
 
             # === Recalcula 'now' aquí también antes de ventanas de reinicio ===
-            # now = datetime.now()
+            now = datetime.now()
 
-            # # Ventanas de reinicio
-            # if (now.hour in {RESTART_HOUR_1 - 1} and now.minute == 56):
-            #     break
+            # Ventanas de reinicio
+            if now.hour in {RESTART_HOUR_1 - 1, RESTART_HOUR_4 - 1} and now.minute == 56:
+                break
 
             if now.hour == 0 and now.minute == 59:
                 today_str_ = f"{now.day:02d}"
                 tomorrow_ = now + timedelta(days=1)
                 tomorrow_day_ = f"{tomorrow_.day:02d}"
                 mont_str_ = f"{now.month:02d}"
-                filename_ = f'AVAXUSDT_5m_2024-01-01_2025-{mont_str_}-{today_str_}.csv'
+                filename_ = f'AVAXUSDT_5m_2022-01-01_2025-{mont_str_}-{today_str_}.csv'
                 if os.path.exists(filename_):
                     name, extension_ = os.path.splitext(filename_)
                     new_name_ = name[:-2] + tomorrow_day_ + extension_
@@ -6924,7 +6928,7 @@ class StochasticAnalyzer:
         if atr is not None and atr > 0:
             if (pred == "bullish") or (pred == "bearish"):
                 response = {}
-                profit_factor = 4.3
+                profit_factor = 5
                 loss_factor = 3
 
                 take_profit = close_price + (profit_factor * atr) if pred == "bullish" else close_price - (
@@ -6933,14 +6937,14 @@ class StochasticAnalyzer:
                         loss_factor * atr)
 
                 if pred == "bullish" and close_price < ema200 and proba < 0.8:
-                    if close_price < ema200 and not (m0 > m1 and h0 > 0 and s0 > s1):
-                        profit_factor = 3
+                    # if close_price < ema200 and not (m0 > m1 and h0 > 0 and s0 > s1):
+                    #     profit_factor = 3
                     take_profit = close_price + (profit_factor * atr)
                     stop_loss = close_price - (loss_factor * atr)
 
                 if pred == "bearish" and close_price > ema200 and proba < 0.8:
-                    if close_price > ema200 and not (m0 < m1 and h1 < 0 and s0 < s1):
-                        profit_factor = 3
+                    # if close_price > ema200 and not (m0 < m1 and h1 < 0 and s0 < s1):
+                    #     profit_factor = 3
                     take_profit = close_price - (profit_factor * atr)
                     stop_loss = close_price + (loss_factor * atr)
 
@@ -7035,22 +7039,11 @@ class StochasticAnalyzer:
                             broker_raw=response_data
                         )
 
-                    try:
-                        response = requests.post(
-                            "http://52.67.38.220:80/hook-demo",
-                            json=payload,
-                            timeout=10
-                        )
-                        print("POST al webhook enviado:", payload)
-                        print("Respuesta:", response.text)
-                    except Exception as e:
-                        print("Error enviando al webhook:", e)
-
                     response_data = response.json()
                     success = response_data.get('success')
 
                 else:
-                    # Solo a cuenta demo
+                        # Se envia a la cuenta demo
                     try:
                         response = requests.post(
                             "http://52.67.38.220:80/hook-demo",
@@ -7066,7 +7059,32 @@ class StochasticAnalyzer:
                     success = response_data.get('success')
 
                     if success:
-                        subject = f"ALERTA TRADING DEMO: Tendencia {pred.upper()} >50%"
+                        # Extrae orderId si viene en la respuesta OK
+                        bybit_resp = response_data.get('bybit_response', {})
+                        order_id = None
+                        try:
+                            order_id = bybit_resp.get("result", {}).get("orderId")
+                        except Exception:
+                            pass
+
+                        # Si no te llega qty exacto, puedes usar el 'qty' de la respuesta si existe:
+                        qty_final = response_data.get("qty")
+
+                        # ACK + marcar posición abierta
+                        self.tradelogger.log_order_ack(
+                            trade_id=trade_id, symbol=symbol, side=side, qty=qty_final, broker_raw=response_data,
+                            order_id=order_id
+                        )
+                        # justo después de log_order_ack(...) y de conocer qty_final:
+                        self.tradelogger.enrich_open_position(
+                            symbol,
+                            entry_price=close_price,
+                            take_profit=take_profit,
+                            stop_loss=stop_loss,
+                            side=side,
+                            fee_rate=getattr(self, "fee_rate", 0.0006),  # 6 bps por lado si no defines otro
+                        )
+                        subject = f"ALERTA TRADING DEMO CON REGISTRO: Tendencia {pred.upper()} >{self.umbral_soft * 100:.2f}%"
                         body = f"""
                         Predicción automática:
                         Vela: {bogota_time.strftime('%Y-%m-%d %H:%M:%S')}
@@ -7078,6 +7096,12 @@ class StochasticAnalyzer:
                         Json: {payload}
                         """
                         self.send_email(subject, body)
+                    else:
+                        # Rechazo (incluye "Cambio de posición no permitido")
+                        self.tradelogger.log_order_reject(
+                            trade_id=trade_id, symbol=symbol, side=side, qty=response_data.get("qty"),
+                            broker_raw=response_data
+                        )
 
     def close_order(self, side):
 
@@ -7381,7 +7405,7 @@ class StochasticAnalyzer:
             plt.title("Tipos de Salidas (TP/SL/No Exit)")
 
             plt.tight_layout()
-            plt.show()
+            plt.show(block=False)
 
         # resumen, trades_df = self._summarize_backtest(trades_df,
         #                                         equity_curve=equity_df['equity'] if equity_df is not None else None)
@@ -10019,7 +10043,7 @@ def _safe_feature_importance(model, X_tr, y_tr, feature_names, plot=True, export
         plt.xlabel("Importance")
         plt.ylabel("Feature")
         plt.tight_layout()
-        plt.show()
+        plt.show(block=False)
 
     return df_imp
 
@@ -10242,7 +10266,7 @@ def create_predictive_model_m2(
 
 
     # Importancias
-    feature_importance = _safe_feature_importance(base_model, X_tr, y_tr, features)
+    feature_importance = _safe_feature_importance(base_model, X_tr, y_tr, features, display_feature_plot)
     print("\nImportancia de características:")
     print(feature_importance)
 
@@ -10273,7 +10297,7 @@ def create_predictive_model_m2(
         plt.title(f'Gráfico de calibración: sin calibrar vs calibrado\nEntrenado: {fecha_actual}')
         plt.legend();
         plt.grid();
-        plt.show()
+        plt.show(block=False)
 
     # model = base_model
 
@@ -10296,53 +10320,7 @@ def create_predictive_model_m2(
 
 if __name__ == "__main__":
     now = datetime.now()
-
-    #
-    # analyzer = StochasticAnalyzer(api_key=api_key_roge, api_secret=api_secret_roge)
-    # @ TODO hacer merge de df_cache + self.df para agregar las columnas "p_hat", "margin", "direction_sign" solo cuando coincide el timestamp
-    # ===========M2===========
-    features = FEATURES + FEATS_M2
-    model_kwargs = {
-        "objective": "multiclass",
-        "num_class": 3,  # ajusta según tus clases reales
-        "n_estimators": 4000,  # más árboles + LR más bajo
-        "learning_rate": 0.03,  # más bajo para mejorar logloss
-        "num_leaves": 96,  # complejidad del árbol
-        "max_depth": -1,  # deja que LGBM lo maneje
-        "min_child_samples": 200,  # regularización clave con 220k filas
-
-        "subsample": 0.7,  # antes 0.9, bajamos para más robustez
-        "subsample_freq": 1,
-        "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
-
-        "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
-        "reg_alpha": 0.1,  # L1 ligera
-
-        "min_split_gain": 0.0,
-        "random_state": 42,
-        "n_jobs": -1
-    }
-    df_cache = pd.read_parquet("m1_outputs_1year_dec5.parquet")
-    model_m2 = create_predictive_model_m2(
-        df_model=df_cache,
-        features=features,
-        model_type='lightgbm',
-        model_kwargs=model_kwargs,
-        calibrate_method="sigmoid",
-        display_graphic=True,
-        return_metrics=True
-    )
-
-    analyzer = StochasticAnalyzer(
-        api_key=api_key,
-        api_secret=api_secret,
-        atr_mult=4,
-        atr_stop=3,
-        m2_model=model_m2
-    )
-    # API pública
-    # analyzer = StochasticAnalyzer()
-
+    # ===========Script automatizado===========
     today_str = f"{datetime.now().day:02d}"
     tomorrow = datetime.now() + timedelta(days=1)
     tomorrow_day = f"{tomorrow.day:02d}"
@@ -10358,24 +10336,98 @@ if __name__ == "__main__":
     filename_tomorrow = f'AVAXUSDT_5m_2022-01-01_{end_date}.csv'
     if os.path.exists(filename_tomorrow):
         print(f"iniciando script a las {now.hour}:{now.minute}:{now.second} horas")
-        # print(f"end_date {end_date}")
-
-
+        analyzer = StochasticAnalyzer(api_key=api_key_roge, api_secret=api_secret_roge, m2_model=None, atr_mult=5, atr_stop=3)
         analyzer.run_analysis(
             symbol="AVAXUSDT",
             start_date="2022-01-01",
             end_date=end_date,
-            interval="5"
+            interval="5",
         )
-        # Guardar resultados
-        # results_df = analyzer.save_results("avax_stochastic_analysis_cached.csv")
 
+        df = analyzer.data
+        print("Iniciando M1 Output dataframe")
+        builder = M1OutputCacheBuilder(
+            analyzer,
+            df,
+            proba_threshold=0.60,  # único umbral
+            atr_period=14,
+            atr_mult_tp=5.0,
+            atr_mult_sl=3.0,
+            offline_lookback_bars=200,
+            n_keep_for_fit=197_000,
+            cache=CacheConfig(cache_path="m1_outputs_1year_dec7.parquet"),
+        )
+        today_str = datetime.now().day
+        tomorrow = datetime.now() + timedelta(days=1)
+        tomorrow_day = tomorrow.day
+        mont_str = int(datetime.now().month)
 
+        start = datetime(2024, mont_str, tomorrow_day)  # cambia a diario
+        end_limit = datetime(2025, mont_str, tomorrow_day)  # último test_end deseado (exclusivo)
+        
+        chunks = []
+        while start < end_limit:
+            end = start + relativedelta(months=1)
+            if end > end_limit:
+                end = end_limit  # por si el último tramo fuese parcial
+            ts, te = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+            print(f">>> Ejecutando ventana {ts} -> {te}")
+            meta_i = builder.build_and_cache(test_start=ts, test_end=te, verbose=1, export_parquet=True)
+            chunks.append(meta_i)
+            start = end  # avanza a la siguiente ventana
 
-        # # # #
-        # lgbm model production mode
-        #
-        analyzer.create_predictive_model(
+        # Unir todos los resultados en un solo DataFrame
+        m1_output = pd.concat(chunks, ignore_index=True)
+
+        # (opcional) Ordenar por columna temporal si existe
+        if "datetime" in m1_output.columns:
+            m1_output = m1_output.sort_values("datetime").reset_index(drop=True)
+        print("M1 Output listo")
+        print(m1_output.tail())
+        features = FEATURES + FEATS_M2
+        model_kwargs = {
+            "objective": "binary",
+            # "num_class": 3,  # ajusta según tus clases reales
+            "n_estimators": 4000,  # más árboles + LR más bajo
+            "learning_rate": 0.03,  # más bajo para mejorar logloss
+            "num_leaves": 64,  # ← REDUCIDO de 96 a 64 para menos confianza
+            "max_depth": 6,  # ← LIMITADO explícitamente (antes -1)
+            "min_child_samples": 300,  # ← AUMENTADO de 200 a 300
+
+            "subsample": 0.7,  # antes 0.9, bajamos para más robustez
+            "subsample_freq": 1,
+            "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
+
+            "reg_lambda": 25.0,  # ← AUMENTADO de 15.0 a 25.0 para más regularización
+            "reg_alpha": 2.0,  # ← AUMENTADO de 0.1 a 2.0 para más L1
+
+            "min_split_gain": 0.01,  # ← AÑADIDO para evitar splits innecesarios
+            "path_smooth": 1.0,  # ← AÑADIDO para suavizar predicciones
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbosity": -1
+        }
+        print("Creando modelo predictivo 2 con output M1")
+        model_m2 = create_predictive_model_m2(
+            df_model=m1_output,
+            features=features,
+            model_type='lightgbm',
+            model_kwargs=model_kwargs,
+            calibrate_method="sigmoid",
+            display_graphic=False,
+            return_metrics=False
+        )
+        analyzer2 = StochasticAnalyzer(
+            api_key=api_key_roge,
+            api_secret=api_secret_roge,
+            atr_mult=5,
+            atr_stop=3,
+            m2_model=model_m2,
+            data=df
+        )
+
+        print("Creando modelo predictivo 1")
+        analyzer2.create_predictive_model(
             model_type="lgbm",
             calibrate_method="sigmoid",
             N_KEEP=197_000,
@@ -10398,20 +10450,332 @@ if __name__ == "__main__":
 
                 "min_split_gain": 0.0,
                 "random_state": 42,
-                "n_jobs": -1
+                "n_jobs": -1,
+                "verbosity": -1
             },
             display_feature_plot=False
         )
+        print("Iniciando predicciones")
         analyzer.monitor_predictions()
 
-        #=====================TESTING======================#
-        # model 2 model
+        while True:
+            now = datetime.now()
+            if (now.hour == RESTART_HOUR_1 or now.hour == RESTART_HOUR_4) and now.minute == 0:
+                print("Reiniciando script programado a las ", now.hour, " horas")
+                now = datetime.now()
+                #
+                analyzer = StochasticAnalyzer(api_key=api_key_roge, api_secret=api_secret_roge, m2_model=None, atr_mult=5, atr_stop=3)
+                # ===========M2===========
+
+                today_str = f"{datetime.now().day:02d}"
+                tomorrow = datetime.now() + timedelta(days=1)
+                tomorrow_day = f"{tomorrow.day:02d}"
+                mont_str = f"{datetime.now().month:02d}"
+                filename = f'AVAXUSDT_5m_2022-01-01_2025-{mont_str}-{today_str}.csv'
+                if os.path.exists(filename):
+                    nombre, extension = os.path.splitext(filename)
+                    new_name = nombre[:-2] + tomorrow_day + extension
+                    os.rename(filename, new_name)
+                    print("Nuevo nombre de archivo:", new_name)
+
+                end_date = f"2025-{mont_str}-{tomorrow_day}"
+                filename_tomorrow = f'AVAXUSDT_5m_2022-01-01_{end_date}.csv'
+                if os.path.exists(filename_tomorrow):
+                    print(f"iniciando script a las {now.hour}:{now.minute}:{now.second} horas")
+                    analyzer.run_analysis(
+                        symbol="AVAXUSDT",
+                        start_date="2022-01-01",
+                        end_date=end_date,
+                        interval="5",
+                    )
+
+                    df = analyzer.data
+                    builder = M1OutputCacheBuilder(
+                        analyzer,
+                        df,
+                        proba_threshold=0.60,  # único umbral
+                        atr_period=14,
+                        atr_mult_tp=5.0,
+                        atr_mult_sl=3.0,
+                        offline_lookback_bars=200,
+                        n_keep_for_fit=197_000,
+                        cache=CacheConfig(cache_path="m1_outputs_1year_dec7.parquet"),
+                    )
+                    today_str = datetime.now().day
+                    tomorrow = datetime.now() + timedelta(days=1)
+                    tomorrow_day = tomorrow.day
+                    mont_str = int(datetime.now().month)
+
+                    start = datetime(2024, mont_str, tomorrow_day)  # cambia a diario
+                    end_limit = datetime(2025, mont_str, tomorrow_day)  # último test_end deseado (exclusivo)
+
+                    chunks = []
+                    while start < end_limit:
+                        end = start + relativedelta(months=1)
+                        if end > end_limit:
+                            end = end_limit  # por si el último tramo fuese parcial
+                        ts, te = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+                        print(f">>> Ejecutando ventana {ts} -> {te}")
+                        meta_i = builder.build_and_cache(test_start=ts, test_end=te, verbose=1)
+                        chunks.append(meta_i)
+                        start = end  # avanza a la siguiente ventana
+
+                    # Unir todos los resultados en un solo DataFrame
+                    m1_output = pd.concat(chunks, ignore_index=True)
+
+                    # (opcional) Ordenar por columna temporal si existe
+                    if "datetime" in m1_output.columns:
+                        m1_output = m1_output.sort_values("datetime").reset_index(drop=True)
+
+                    print(m1_output.tail())
+                    features = FEATURES + FEATS_M2
+                    model_kwargs = {
+                        "objective": "multiclass",
+                        "num_class": 3,  # ajusta según tus clases reales
+                        "n_estimators": 4000,  # más árboles + LR más bajo
+                        "learning_rate": 0.03,  # más bajo para mejorar logloss
+                        "num_leaves": 96,  # complejidad del árbol
+                        "max_depth": -1,  # deja que LGBM lo maneje
+                        "min_child_samples": 200,  # regularización clave con 220k filas
+
+                        "subsample": 0.7,  # antes 0.9, bajamos para más robustez
+                        "subsample_freq": 1,
+                        "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
+
+                        "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
+                        "reg_alpha": 0.1,  # L1 ligera
+
+                        "min_split_gain": 0.0,
+                        "random_state": 42,
+                        "n_jobs": -1
+                    }
+                    print("Creando modelo predictivo 2 con output M1")
+                    model_m2 = create_predictive_model_m2(
+                        df_model=m1_output,
+                        features=features,
+                        model_type='lightgbm',
+                        model_kwargs=model_kwargs,
+                        calibrate_method="sigmoid",
+                        display_graphic=False,
+                        return_metrics=False
+                    )
+                    print("Creando modelo predictivo 1")
+                    analyzer2 = StochasticAnalyzer(
+                        api_key=api_key_roge,
+                        api_secret=api_secret_roge,
+                        atr_mult=5,
+                        atr_stop=3,
+                        m2_model=model_m2,
+                        data=df
+                    )
+
+                    analyzer2.create_predictive_model(
+                        model_type="lgbm",
+                        calibrate_method="sigmoid",
+                        N_KEEP=197_000,
+                        display_graphic=False,
+                        model_kwargs={
+                            "objective": "multiclass",
+                            "num_class": 3,  # ajusta según tus clases reales
+                            "n_estimators": 2000,  # más árboles + LR más bajo
+                            "learning_rate": 0.03,  # más bajo para mejorar logloss
+                            "num_leaves": 96,  # complejidad del árbol
+                            "max_depth": -1,  # deja que LGBM lo maneje
+                            "min_child_samples": 200,  # regularización clave con 220k filas
+
+                            "subsample": 0.7,  # antes 0.9, bajamos para más robustez
+                            "subsample_freq": 1,
+                            "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
+
+                            "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
+                            "reg_alpha": 0.1,  # L1 ligera
+
+                            "min_split_gain": 0.0,
+                            "random_state": 42,
+                            "n_jobs": -1
+                        },
+                        display_feature_plot=False,
+                        use_df_parquet=False
+                    )
+                    print("Iniciando predicciones")
+                    analyzer.monitor_predictions()
+                else:
+                    print(f"El archivo {filename_tomorrow} no existe")
+            time.sleep(60)
+    else:
+        print(f"El archivo {filename} no existe")
 
 
-        # ==================== simulator
-        df = analyzer.data
-        # # # # # #
-        # # # # # # # =================== Create m1 output DF
+    #=====================================TESTING==================================
+    # model_kwargs = {
+    #     "objective": "multiclass",
+    #     "num_class": 3,  # ajusta según tus clases reales
+    #     "n_estimators": 4000,  # más árboles + LR más bajo
+    #     "learning_rate": 0.03,  # más bajo para mejorar logloss
+    #     "num_leaves": 96,  # complejidad del árbol
+    #     "max_depth": -1,  # deja que LGBM lo maneje
+    #     "min_child_samples": 200,  # regularización clave con 220k filas
+
+    #     "subsample": 0.7,  # antes 0.9, bajamos para más robustez
+    #     "subsample_freq": 1,
+    #     "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
+
+    #     "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
+    #     "reg_alpha": 0.1,  # L1 ligera
+
+    #     "min_split_gain": 0.0,
+    #     "random_state": 42,
+    #     "n_jobs": -1
+    # }
+
+    
+    # analyzer = StochasticAnalyzer(
+    #     api_key=api_key,
+    #     api_secret=api_secret,
+    #     atr_mult=4,
+    #     atr_stop=3,
+    #     m2_model=model_m2
+    # )
+    # API pública
+    # analyzer = StochasticAnalyzer()
+
+    # today_str = f"{datetime.now().day:02d}"
+    # tomorrow = datetime.now() + timedelta(days=1)
+    # tomorrow_day = f"{tomorrow.day:02d}"
+    # mont_str = f"{datetime.now().month:02d}"
+    # filename = f'AVAXUSDT_5m_2022-01-01_2025-{mont_str}-{today_str}.csv'
+    # if os.path.exists(filename):
+    #     nombre, extension = os.path.splitext(filename)
+    #     new_name = nombre[:-2] + tomorrow_day + extension
+    #     os.rename(filename, new_name)
+    #     print("Nuevo nombre de archivo:", new_name)
+    #
+    # end_date = f"2025-{mont_str}-{tomorrow_day}"
+    # filename_tomorrow = f'AVAXUSDT_5m_2022-01-01_{end_date}.csv'
+    # if os.path.exists(filename_tomorrow):
+    #     print(f"iniciando script a las {now.hour}:{now.minute}:{now.second} horas")
+    #     # print(f"end_date {end_date}")
+    #     features = FEATURES + FEATS_M2
+        # model_kwargs = {
+        #     "objective": "multiclass",
+        #     "num_class": 3,  # ajusta según tus clases reales
+        #     "n_estimators": 4000,  # más árboles + LR más bajo
+        #     "learning_rate": 0.03,  # más bajo para mejorar logloss
+        #     "num_leaves": 64,  # ← REDUCIDO de 96 a 64 para menos confianza
+        #     "max_depth": 6,  # ← LIMITADO explícitamente (antes -1)
+        #     "min_child_samples": 300,  # ← AUMENTADO de 200 a 300
+        #
+        #     "subsample": 0.7,  # antes 0.9, bajamos para más robustez
+        #     "subsample_freq": 1,
+        #     "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
+        #
+        #     "reg_lambda": 25.0,  # ← AUMENTADO de 15.0 a 25.0 para más regularización
+        #     "reg_alpha": 2.0,  # ← AUMENTADO de 0.1 a 2.0 para más L1
+        #
+        #     "min_split_gain": 0.01,  # ← AÑADIDO para evitar splits innecesarios
+        #     "path_smooth": 1.0,  # ← AÑADIDO para suavizar predicciones
+        #     "random_state": 42,
+        #     "n_jobs": -1,
+        #     "verbosity": -1
+        # }
+
+        # model_kwargs = {
+        #     "objective": "multiclass",
+        #     "num_class": 3,
+        #
+        #     # Reducir capacidad y controlar mejor con early stopping
+        #     "n_estimators": 3000,  # límite superior, usas early_stopping
+        #     "learning_rate": 0.03,
+        #
+        #     # Menos complejidad de árbol
+        #     "num_leaves": 48,  # antes 96
+        #     "max_depth": -1,
+        #
+        #     # Más regularización de estructura
+        #     "min_child_samples": 300,  # antes 200
+        #     "min_split_gain": 0.0,
+        #
+        #     # Bagging y feature sampling
+        #     "subsample": 0.7,
+        #     "subsample_freq": 1,
+        #     "colsample_bytree": 0.6,  # un poco menos que 0.7
+        #
+        #     # Regularización L2/L1 fuertes para bajar magnitud de logits
+        #     "reg_lambda": 40.0,  # subir de 15 → 40 (puedes probar 25, 40, 80)
+        #     "reg_alpha": 0.5,  # subir de 0.1
+        #
+        #     "random_state": 42,
+        #     "n_jobs": -1,
+        #     "boost_from_average": True,  # asegúrate que esté en True (por defecto suele estar)
+        # }
+        #
+        # df_cache = pd.read_parquet("m1_outputs_1year_dec2.parquet")
+        # model_m2 = create_predictive_model_m2(
+        #     df_model=df_cache,
+        #     features=features,
+        #     model_type='lightgbm',
+        #     model_kwargs=model_kwargs,
+        #     calibrate_method="sigmoid",
+        #     display_graphic=True,
+        #     return_metrics=True,
+        # )
+        #
+        # analyzer = StochasticAnalyzer(
+        #     api_key=api_key_roge,
+        #     api_secret=api_secret_roge,
+        #     atr_mult=4,
+        #     atr_stop=3,
+        #     m2_model=model_m2
+        # )
+        #
+        # analyzer.run_analysis(
+        #     symbol="AVAXUSDT",
+        #     start_date="2022-01-01",
+        #     end_date=end_date,
+        #     interval="5"
+        # )
+        # df = analyzer.data
+        # Guardar resultados
+        # results_df = analyzer.save_results("avax_stochastic_analysis_cached.csv")
+
+
+
+        # # # #
+        # lgbm model production mode
+        #
+        # analyzer.create_predictive_model(
+        #     model_type="lgbm",
+        #     calibrate_method="sigmoid",
+        #     N_KEEP=197_000,
+        #     display_graphic=False,
+        #     model_kwargs={
+        #         "objective": "multiclass",
+        #         "num_class": 3,  # ajusta según tus clases reales
+        #         "n_estimators": 2000,  # más árboles + LR más bajo
+        #         "learning_rate": 0.03,  # más bajo para mejorar logloss
+        #         "num_leaves": 96,  # complejidad del árbol
+        #         "max_depth": -1,  # deja que LGBM lo maneje
+        #         "min_child_samples": 200,  # regularización clave con 220k filas
+        #
+        #         "subsample": 0.7,  # antes 0.9, bajamos para más robustez
+        #         "subsample_freq": 1,
+        #         "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
+        #
+        #         "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
+        #         "reg_alpha": 0.1,  # L1 ligera
+        #
+        #         "min_split_gain": 0.0,
+        #         "random_state": 42,
+        #         "n_jobs": -1
+        #     },
+        #     display_feature_plot=False
+        # )
+        # analyzer.monitor_predictions()
+
+        # ==================== Creacion de dataset output M1
+        # df = analyzer.data
+        # # # # # # #
+        # # # # # # # # =================== Create m1 output DF
         # builder = M1OutputCacheBuilder(
         #     analyzer,
         #     df,
@@ -10421,11 +10785,11 @@ if __name__ == "__main__":
         #     atr_mult_sl=3.0,
         #     offline_lookback_bars=200,
         #     n_keep_for_fit=197_000,
-        #     cache=CacheConfig(cache_path="m1_outputs_1year_dec5.parquet"),
+        #     cache=CacheConfig(cache_path="m1_outputs_1year_dec7.parquet"),
         # )
         #
-        # start = datetime(2024, 12, 5)
-        # end_limit = datetime(2025, 12, 5)  # último test_end deseado (exclusivo)
+        # start = datetime(2025, 11, 7)
+        # end_limit = datetime(2025, 12, 7)  # último test_end deseado (exclusivo)
         #
         # chunks = []
         # while start < end_limit:
@@ -10434,7 +10798,7 @@ if __name__ == "__main__":
         #         end = end_limit  # por si el último tramo fuese parcial
         #     ts, te = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
         #     print(f">>> Ejecutando ventana {ts} -> {te}")
-        #     meta_i = builder.build_and_cache(test_start=ts, test_end=te, verbose=1)
+        #     meta_i = builder.build_and_cache(test_start=ts, test_end=te, verbose=1, export_parquet=False)
         #     chunks.append(meta_i)
         #     start = end  # avanza a la siguiente ventana
         #
@@ -10447,33 +10811,33 @@ if __name__ == "__main__":
         #
         # print(meta_base.tail())
 
-
-        def logger(event, payload):
-            if event == "progress":
-                print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
-                      f"equity={payload['equity']:.2f} | trades={payload['trades']}")
-            # elif event == "open":
-            #     print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
-            #           f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
-            #           f"proba={payload['prob'] * 100:.1f} | "
-            #           f"margin={payload['margin']:.2f} | "
-            #           f"kelly={payload['kelly'] if payload['kelly'] is not None else 1.0:.3f}")
-            # elif event == "close":
-            #     dur = payload.get("duration")
-            #     print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
-            #           f"PnL={payload['pnl']:.2f} | "
-            #           f"equity={payload['equity']:.2f} | "
-            #           f"in={payload['entry_time']} out={payload['time']} "
-            #           f"dur={dur}")
-            # elif event == "early_opposite":
-            #     print(
-            #         f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
-            #         f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
-            #         f"| in={payload['entry_time']} out={payload['time']} "
-            #         f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
-            #     )
-
-
+        # ==================== simulator
+        # def logger(event, payload):
+        #     if event == "progress":
+        #         print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
+        #               f"equity={payload['equity']:.2f} | trades={payload['trades']}")
+        #     # elif event == "open":
+        #     #     print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
+        #     #           f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
+        #     #           f"proba={payload['prob'] * 100:.1f} | "
+        #     #           f"margin={payload['margin']:.2f} | "
+        #     #           f"kelly={payload['kelly'] if payload['kelly'] is not None else 1.0:.3f}")
+        #     # elif event == "close":
+        #     #     dur = payload.get("duration")
+        #     #     print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
+        #     #           f"PnL={payload['pnl']:.2f} | "
+        #     #           f"equity={payload['equity']:.2f} | "
+        #     #           f"in={payload['entry_time']} out={payload['time']} "
+        #     #           f"dur={dur}")
+        #     # elif event == "early_opposite":
+        #     #     print(
+        #     #         f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
+        #     #         f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
+        #     #         f"| in={payload['entry_time']} out={payload['time']} "
+        #     #         f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
+        #     #     )
+        #
+        #
         # sim = TradeSimulator(
         #     analyzer,
         #     df,
@@ -10498,7 +10862,7 @@ if __name__ == "__main__":
         #     m2_model=model_m2
         # )
         # # #
-        # results = sim.run(test_start="2025-08-01", test_end="2025-12-01")
+        # results = sim.run(test_start="2025-10-01", test_end="2025-10-04")
         # print("DBG sim.run returned", results["final_equity"])
         # # # #
         # rules_raw = sim.autogen_rules_from_entries(
@@ -10690,5 +11054,11 @@ if __name__ == "__main__":
         #         else:
         #             print(f"El archivo {filename_tomorrow} no existe")
         #     time.sleep(60)
-    else:
-        print(f"El archivo {filename} no existe")
+
+
+
+
+
+
+    # else:
+    #     print(f"El archivo {filename} no existe")
