@@ -38,7 +38,7 @@ import smtplib
 from email.mime.text import MIMEText
 import pytz
 from numba import njit
-from rules_engine import validate_start_order_fast
+# from rules_engine import validate_start_order_fast
 import pandas as pd
 
 import math
@@ -2095,12 +2095,12 @@ class TradeSimulator:
                 top2 = ordered[1] if len(ordered) > 1 else 0.0
                 margin = (top1 - top2)
                 # 3) En tu loop: solo consulta
-                gate_order = validate_start_order_fast(dfp, pred, i, margin, proba)
-                if gate_order and gate_order.get("enter"):
-                    rule_name = gate_order.get("rule")  # ← nombre textual de la regla
-                    side_txt = gate_order.get("side")  # 'bullish' o 'bearish'
-                    if verbose >= 2:
-                        print(rule_name)
+                # gate_order = validate_start_order_fast(dfp, pred, i, margin, proba)
+                # if gate_order and gate_order.get("enter"):
+                #     rule_name = gate_order.get("rule")  # ← nombre textual de la regla
+                #     side_txt = gate_order.get("side")  # 'bullish' o 'bearish'
+                #     if verbose >= 2:
+                #         print(rule_name)
 
                 if True:
 
@@ -3607,7 +3607,12 @@ class StochasticAnalyzer:
 
             try:
                 r = requests.get(url, params=params, timeout=10)
-                data = r.json()
+                try:
+                    data = r.json()
+                except ValueError as e:
+                    print(f"Error decoding JSON (private look-back). Status: {r.status_code}, Body: {r.text[:500]}")
+                    raise e
+                    
                 if data["retCode"] == 0 and data["result"]["list"]:
                     for k in data["result"]["list"]:
                         all_data.append({
@@ -3649,7 +3654,12 @@ class StochasticAnalyzer:
                 params["sign"] = self.generate_signature(params, self.api_secret)
                 try:
                     r = requests.get(url, params=params, timeout=10)
-                    data = r.json()
+                    try:
+                        data = r.json()
+                    except ValueError as e:
+                        print(f"Error decoding JSON (private range). Status: {r.status_code}, Body: {r.text[:500]}")
+                        raise e
+
                     if data["retCode"] == 0 and data["result"]["list"]:
                         for k in data["result"]["list"]:
                             all_data.append({
@@ -3681,7 +3691,12 @@ class StochasticAnalyzer:
 
                     try:
                         r = requests.get(url, params=params, timeout=10)
-                        data = r.json()
+                        try:
+                            data = r.json()
+                        except ValueError as e:
+                            print(f"Error decoding JSON (private loop). Status: {r.status_code}, Body: {r.text[:500]}")
+                            raise e
+
                         if data["retCode"] == 0 and data["result"]["list"]:
                             klines = data["result"]["list"]
                             for k in klines:
@@ -3743,7 +3758,12 @@ class StochasticAnalyzer:
             try:
                 r = requests.get(url, params=params, timeout=10)
                 r.raise_for_status()
-                data = r.json()
+                try:
+                    data = r.json()
+                except ValueError as e:
+                    print(f"Error decoding JSON (look-back). Status: {r.status_code}, Body: {r.text[:500]}")
+                    raise e
+
                 if data["retCode"] == 0 and data["result"]["list"]:
                     klines = data["result"]["list"]
                     for k in klines:
@@ -3783,7 +3803,12 @@ class StochasticAnalyzer:
                 }
                 try:
                     r = requests.get(url, params=params, timeout=10)
-                    data = r.json()
+                    try:
+                        data = r.json()
+                    except ValueError as e:
+                        print(f"Error decoding JSON (range). Status: {r.status_code}, Body: {r.text[:500]}")
+                        raise e
+
                     if data["retCode"] == 0 and data["result"]["list"]:
                         klines = data["result"]["list"]
                         for k in klines:
@@ -3810,7 +3835,12 @@ class StochasticAnalyzer:
                     }
                     try:
                         r = requests.get(url, params=params, timeout=10)
-                        data = r.json()
+                        try:
+                            data = r.json()
+                        except ValueError as e:
+                            print(f"Error decoding JSON (public loop). Status: {r.status_code}, Body: {r.text[:500]}")
+                            raise e
+
                         if data["retCode"] == 0 and data["result"]["list"]:
                             klines = data["result"]["list"]
                             for k in klines:
