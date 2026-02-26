@@ -191,7 +191,6 @@ FEATURES = [
     'e',
     'z_atr_norm',
     'corr_close_vol_m',
-    'dow_sin',
     'trend_r2_50',
     'k100',
     'hurst_m',
@@ -200,6 +199,9 @@ FEATURES = [
     'up_vol_ratio',
     'signed_volume_ema',
     'delta_trend_slope_100',
+    # 'dom_sin',
+    # 'dom_cos',
+    'dow_sin',
     'dow_cos',
     'macd',
     'vol_ratio',
@@ -228,7 +230,7 @@ FEATURES = [
     'hmm_state',
     'vwap_up',
     'market_regime',
-    'trend_ema200_down',
+    'trend_ema200',
     # 'session_london_open',
     'near_PP_pct',
     'near_S1_pct',
@@ -1449,15 +1451,15 @@ class M1OutputCacheBuilder:
         # Lee cache y define desde dónde continuar
         existing = None
         last_dt = None
-        # try:
-        #     existing = pd.read_parquet(self.cache.cache_path, engine=self.cache.engine)
-        #     if not existing.empty:
-        #         last_dt = existing["datetime"].max()
-        #         # filtra idxs para procesar solo posteriores
-        #         if pd.notna(last_dt):
-        #             idxs = [i for i in idxs if self.df.loc[i, "datetime"] > last_dt]
-        # except Exception:
-        #     existing = None
+        try:
+            existing = pd.read_parquet(self.cache.cache_path, engine=self.cache.engine)
+            if not existing.empty:
+                last_dt = existing["datetime"].max()
+                # filtra idxs para procesar solo posteriores
+                if pd.notna(last_dt):
+                    idxs = [i for i in idxs if self.df.loc[i, "datetime"] > last_dt]
+        except Exception:
+            existing = None
 
         rows: List[dict] = []
 
@@ -1566,11 +1568,16 @@ class M1OutputCacheBuilder:
 
         # Escritura parquet
         if export_parquet:
-            write_kwargs = {}
-            if self.cache.partition_cols:
-                write_kwargs["partition_cols"] = self.cache.partition_cols
+            if self.cache is None:
+                if verbose > 0:
+                    print("[WARN] export_parquet=True pero no hay CacheConfig (self.cache is None). Se omite guardado.")
+            else:
+                write_kwargs = {}
+                if self.cache.partition_cols:
+                    write_kwargs["partition_cols"] = self.cache.partition_cols
 
-            combo.to_parquet(self.cache.cache_path, engine=self.cache.engine, index=False, **write_kwargs)
+                combo.to_parquet(self.cache.cache_path, engine=self.cache.engine, index=False, **write_kwargs)
+
         return combo.sort_values("datetime").reset_index(drop=True)
 
 class TradeSimulator:
@@ -1974,6 +1981,7 @@ class TradeSimulator:
                         # Si falta, deja NaN para detección
                         x_dict[f] = np.nan
 
+                x_dict['price_change'] = df_ready["price_change"].iloc[-2]
                 # Verifica NaNs
                 x_vals = [x_dict[f] for f in feats_m2]
                 if any([not np.isfinite(v) for v in x_vals]):
@@ -1998,8 +2006,7 @@ class TradeSimulator:
                 margin = top1 - top2
             except Exception as e:
                 # No rompas la predicción si M2 falla: deja M1 tal cual y reporta aviso.
-                if getattr(self, "verbose", 0) > 0:
-                    print(f"[M2] Inferencia omitida: {e}")
+                print(f"[M2] Inferencia omitida: {e}")
 
         close_px = float(last_meta["close"])
 
@@ -4882,9 +4889,9 @@ class StochasticAnalyzer:
         df['ATR'] = tr.rolling(window=atr_period).mean()
 
         # Trend EMA
-        for period in [10, 15, 20, 200]:
+        for period in [200]:
             df[f'EMA_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
-            df[f'trend_ema{period}'] = np.where(df['close'] > df[f'EMA_{period}'], 'up', 'down')
+            df[f'trend_ema{period}'] = np.where(df['close'] > df[f'EMA_{period}'], 1, 0)
 
         def sma(s: pd.Series, n: int) -> pd.Series:
             return s.rolling(n, min_periods=n).mean()
@@ -6857,14 +6864,13 @@ class StochasticAnalyzer:
         if thresholds is None:
             thresholds = {"bearish": 0.55, "bullish": 0.55, "lateral": 0.40}
 
-        # 1) Descargar datos
+        # 1) Descargar datos nuevos (solo OHLCV crudo)
         df_new = self.get_bybit_data_private(symbol, interval, start_date=None, end_date=None, limit=lookback_bars)
 
         df_new["datetime"] = pd.to_datetime(df_new["datetime"])  # sin forzar utc=False
 
         # forzar awareness y convertir a Bogota (UTC-5)
         if getattr(df_new["datetime"].dt, "tz", None) is None:
-            # si tus tiempos representan UTC sin tz, primero localiza como UTC
             df_new["datetime"] = df_new["datetime"].dt.tz_localize("UTC")
 
         df_new["datetime"] = df_new["datetime"].dt.tz_convert("America/Bogota")
@@ -6872,20 +6878,33 @@ class StochasticAnalyzer:
         if df_new is None or len(df_new) == 0:
             raise RuntimeError("No se pudieron obtener velas de Bybit")
 
-        # 2) Indicadores y zonas
-        df_new = self.add_indicators(df_new)
+        # 2) Merge con dataset histórico completo (self.data) ANTES de calcular features
+        #    Esto replica el contexto completo que tiene la simulación.
+        raw_cols = ["datetime", "open", "high", "low", "close", "volume"]
+        if self.data is not None and not self.data.empty:
+            # Tomar solo columnas crudas de self.data para evitar conflictos
+            existing_raw = self.data[raw_cols].copy()
+            # Combinar histórico + nuevas velas, sin duplicados
+            df_full = pd.concat([existing_raw, df_new[raw_cols]], ignore_index=True)
+            df_full = df_full.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+        else:
+            df_full = df_new[raw_cols].copy()
 
-        # 3) Preparar features
-        df_ready, features = self.preparar_features(df_new)
+        # 3) Optimización: Usar solo las últimas 2000 velas para calcular indicadores.
+        #    Esto es suficiente contexto para EMAs de 200 y otros rolling, y mantiene la velocidad.
+        df_context = df_full.tail(3000).copy()
+        df_processed = self.add_indicators(df_context)
+        df_ready, features = self.preparar_features(df_processed)
 
-        self.append_new_data(df_ready)
+        # Actualizar self.data con el dataset procesado (manteniendo solo la ventana relevante)
+        self.data = df_ready.copy()
 
         if df_ready.empty:
             raise RuntimeError("No hay suficientes datos para calcular todas las features necesarias (lags, etc).")
-
-        # 4) Última fila válida
+        features = FEATURES
+        # 4) Última fila válida (del dataset completo)
         last_row = df_ready[features].iloc[-1:]
-        last_meta = df_new.iloc[-1]
+        last_meta = df_ready.iloc[-1]
 
         # 5) Escalar y obtener probabilidades
         last_scaled = self.scaler.transform(last_row)
@@ -6980,6 +6999,7 @@ class StochasticAnalyzer:
                         x_dict[f] = np.nan
 
                 # Verifica NaNs
+                x_dict['price_change'] = df_ready["price_change"].iloc[-2]
                 x_vals = [x_dict[f] for f in feats_m2]
                 if any([not np.isfinite(v) for v in x_vals]):
                     # puedes cambiar por imputación si quieres continuar igual
@@ -7003,8 +7023,8 @@ class StochasticAnalyzer:
                 margin = top1 - top2
             except Exception as e:
                 # No rompas la predicción si M2 falla: deja M1 tal cual y reporta aviso.
-                if getattr(self, "verbose", 0) > 0:
-                    print(f"[M2] Inferencia omitida: {e}")
+                # if getattr(self, "verbose", 0) > 0:
+                print(f"[M2] Inferencia omitida: {e}")
 
 
         result = {
@@ -7015,7 +7035,7 @@ class StochasticAnalyzer:
             "last_row_atr": float(last_meta['ATR']),
             "last_row_close": float(last_meta['close']),
             "last_row_ema200": ema_200,
-            "raw_df": df_new[["datetime", "open", "high", "low", "close", "volume", "macd", "macd_signal", "macd_hist"]].copy()
+            "raw_df": df_ready.tail(lookback_bars)[["datetime", "open", "high", "low", "close", "volume", "macd", "macd_signal", "macd_hist"]].copy()
         }
 
         return result
@@ -7955,7 +7975,7 @@ class StochasticAnalyzer:
                         success = True
                         response_data = {
                             "success": True,
-                            "bybit_response": {"result": bybit_resp},
+                            "bybit_response": {"result": bybit_resp['result']},
                             "qty": qty,
                             "order_amount_usdt": order_qty
                         }
@@ -7975,7 +7995,9 @@ class StochasticAnalyzer:
                     try:
                          # Ajuste según estructura de respuesta
                          if isinstance(bybit_resp, dict) and 'result' in bybit_resp:
-                             order_id = bybit_resp['result'].get("orderId")
+                             order_id = bybit_resp['result']['orderId']
+                             print(f"bybit_resp {bybit_resp}")
+                             print(f'order id {order_id}')
                     except Exception:
                          pass
 
@@ -8831,6 +8853,11 @@ class StochasticAnalyzer:
             dow = dfx['datetime'].dt.dayofweek
             dfx['dow_sin'] = np.sin(2 * np.pi * dow / 7.0)
             dfx['dow_cos'] = np.cos(2 * np.pi * dow / 7.0)
+
+            # sin/cos día del mes (1-31)
+            dom = dfx['datetime'].dt.day
+            dfx['dom_sin'] = np.sin(2 * np.pi * dom / 31.0)
+            dfx['dom_cos'] = np.cos(2 * np.pi * dom / 31.0)
 
             # Flags de sesiones
             # Nota: si una sesión cruza medianoche, tratamos ese caso especial
@@ -11339,7 +11366,7 @@ if __name__ == "__main__":
     #         m2_model=None,
     #         atr_mult=4,
     #         atr_stop=3,
-    #         lookahead=60
+    #         lookahead=50
     #     )
     #     analyzer.run_analysis(
     #         symbol="AVAXUSDT",
@@ -11361,7 +11388,8 @@ if __name__ == "__main__":
     #         atr_mult_sl=3.0,
     #         offline_lookback_bars=200,
     #         n_keep_for_fit=122_000,
-    #         cache=CacheConfig(cache_path="m1_outputs_2026.parquet"),
+    #         # cache=CacheConfig(cache_path="m1_outputs_2026.parquet"),
+    #         cache=None,
     #     )
     #     today_str = datetime.now().day
     #     tomorrow = datetime.now() + timedelta(days=1)
@@ -11369,6 +11397,7 @@ if __name__ == "__main__":
     #     mont_str = int(datetime.now().month)
     #
     #     end_limit = datetime(2026, mont_str, tomorrow_day)  # último test_end deseado (exclusivo)
+    #     # start = end_limit - relativedelta(years=1)
     #     start = end_limit - relativedelta(years=1)
     #
     #     chunks = []
@@ -11434,7 +11463,7 @@ if __name__ == "__main__":
     #         m2_model=model_m2,
     #         data=df,
     #         early_exit_threshold=0.75,
-    #         lookahead=60
+    #         lookahead=50
     #     )
     #
     #     print("Creando modelo predictivo 1")
@@ -11498,7 +11527,7 @@ if __name__ == "__main__":
     #                     m2_model=None,
     #                     atr_mult=4,
     #                     atr_stop=3,
-    #                     lookahead=60
+    #                     lookahead=50
     #                 )
     #                 analyzer.run_analysis(
     #                     symbol="AVAXUSDT",
@@ -11518,7 +11547,7 @@ if __name__ == "__main__":
     #                     atr_mult_sl=3.0,
     #                     offline_lookback_bars=200,
     #                     n_keep_for_fit=122_000,
-    #                     cache=CacheConfig(cache_path="m1_outputs_2year_dec7.parquet"),
+    #                     cache=None,
     #                 )
     #                 today_str = datetime.now().day
     #                 tomorrow = datetime.now() + timedelta(days=1)
@@ -11591,7 +11620,7 @@ if __name__ == "__main__":
     #                     m2_model=model_m2,
     #                     data=df,
     #                     early_exit_threshold=0.75,
-    #                     lookahead=60
+    #                     lookahead=50
     #                 )
     #
     #                 analyzer2.create_predictive_model(
@@ -11629,7 +11658,6 @@ if __name__ == "__main__":
     #         time.sleep(60)
     # else:
     #     print(f"El archivo {filename} no existe")
-    #
 
     # =====================================TESTING==================================
 
@@ -11671,16 +11699,17 @@ if __name__ == "__main__":
             atr_mult_tp=4.0,
             atr_mult_sl=3.0,
             offline_lookback_bars=200,
-            n_keep_for_fit=130_000,
-            cache=CacheConfig(cache_path="m1_outputs_12month_march16.parquet"),
+            n_keep_for_fit=122_000,
+            cache=CacheConfig(cache_path="m1_outputs_12month_2025.parquet"),
+            # cache=CacheConfig(None),
         )
         today_str = datetime.now().day
         tomorrow = datetime.now() + timedelta(days=1)
         tomorrow_day = tomorrow.day
         mont_str = int(datetime.now().month)
 
-        start = datetime(2024, 2, 27)  # cambia a diario
-        end_limit = datetime(2025, 2, 27)  # último test_end deseado (exclusivo)
+        start = datetime(2024, 1, 1)  # cambia a diario
+        end_limit = datetime(2025, 1, 1)  # último test_end deseado (exclusivo)
 
         chunks = []
         while start < end_limit:
@@ -11704,14 +11733,14 @@ if __name__ == "__main__":
             m1_output = m1_output.sort_values("datetime").reset_index(drop=True)
         print("M1 Output listo")
         print(m1_output.tail())
-        # # #
-        # #
-        # #
+        #         # # #
+        #
+        #
         print("Creando modelo predictivo 2 con output M1")
-        df_cache_parquet = pd.read_parquet("m1_outputs_12month_march16.parquet")
+        # df_cache = pd.read_parquet("m1_outputs_12month_2026.parquet")
         df_cache = m1_output
         print("df_cache_parquet")
-        print(len(df_cache_parquet))
+        # print(len(df_cache_parquet))
         print("df_cache")
         print(len(df_cache))
         # Calcular winrate basado en la columna result
@@ -11746,6 +11775,7 @@ if __name__ == "__main__":
             return_metrics=False
         )
 
+
         # # ==================== simulator
         def logger(event, payload):
             if event == "progress":
@@ -11779,40 +11809,40 @@ if __name__ == "__main__":
             #         f"Capital Total (Eq+Ret): ${payload['capital_total']:.2f}"
             #     )
         # # #
-        print("Iniciando simulacion sin m2")
-        sim = TradeSimulator(
-            analyzer,
-            df,
-            initial_equity=30,
-            leverage=1000,
-            risk_fraction=0.02,
-            on_event=logger,  # <— activar callback
-            verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
-            log_every_bars=288,
-            proba_threshold_day=0.6,
-            proba_threshold_night=0.6,
-            n_keep_for_fit=122_000,
-            atr_mult_tp=4,
-            atr_mult_sl=3,
-            retrain_each_bar=False,
-            retrain_every_bars=288,
-            suppress_fit_stdout=False,
-            early_exit_threshold=0.75,
-            n_estimators=1000,
-            start_date="2023-01-01",
-            end_date=end_date,
-            m2_model=None,
-            enable_withdrawals=False
-        )
-        # # #
-        results = sim.run(test_start="2025-02-27", test_end="2025-02-28")
-        print("DBG sim.run returned", results["final_equity"])
-        sim.plot_performance(
-            initial_equity=40,  # Capital inicial
-            save_html="backtest_report_sin_m2.html",  # Guardar como HTML (opcional)
-            show_plot=True,  # Mostrar en navegador
-            height=2400  # Altura en píxeles
-        )
+        # print("Iniciando simulacion sin m2")
+        # sim = TradeSimulator(
+        #     analyzer,
+        #     df,
+        #     initial_equity=30,
+        #     leverage=1000,
+        #     risk_fraction=0.02,
+        #     on_event=logger,  # <— activar callback
+        #     verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
+        #     log_every_bars=288,
+        #     proba_threshold_day=0.6,
+        #     proba_threshold_night=0.6,
+        #     n_keep_for_fit=122_000,
+        #     atr_mult_tp=4,
+        #     atr_mult_sl=3,
+        #     retrain_each_bar=False,
+        #     retrain_every_bars=288,
+        #     suppress_fit_stdout=False,
+        #     early_exit_threshold=0.75,
+        #     n_estimators=1000,
+        #     start_date="2023-01-01",
+        #     end_date=end_date,
+        #     m2_model=None,
+        #     enable_withdrawals=False
+        # )
+        # # # #
+        # results = sim.run(test_start="2025-02-27", test_end="2025-02-28")
+        # print("DBG sim.run returned", results["final_equity"])
+        # sim.plot_performance(
+        #     initial_equity=40,  # Capital inicial
+        #     save_html="backtest_report_sin_m2.html",  # Guardar como HTML (opcional)
+        #     show_plot=True,  # Mostrar en navegador
+        #     height=2400  # Altura en píxeles
+        # )
 
         print("Iniciando simulacion con m2")
         sim = TradeSimulator(
@@ -11841,11 +11871,11 @@ if __name__ == "__main__":
             m2_df=df_cache
         )
         # # #
-        results = sim.run(test_start="2025-02-27", test_end="2025-02-28")
+        results = sim.run(test_start="2025-01-01", test_end="2025-02-01")
         print("DBG sim.run returned", results["final_equity"])
         sim.plot_performance(
             initial_equity=40,  # Capital inicial
-            save_html="backtest_report_con_m2.html",  # Guardar como HTML (opcional)
+            save_html="backtest_report_con_m2_2026.html",  # Guardar como HTML (opcional)
             show_plot=True,  # Mostrar en navegador
             height=2400  # Altura en píxeles
         )
