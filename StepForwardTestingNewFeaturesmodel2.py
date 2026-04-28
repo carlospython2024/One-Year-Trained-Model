@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ta
 from dotenv import load_dotenv
 from numpy.f2py.crackfortran import verbose
 from pandas.api.types import is_datetime64_any_dtype
@@ -41,10 +42,11 @@ import pytz
 from numba import njit
 # from rules_engine import validate_start_order_fast
 import pandas as pd
+import shap
 
 import math
 import seaborn as sns
-
+import optuna
 
 # helpers de librerías opcionales
 _HAS_LGBM, _HAS_XGB = False, False
@@ -86,442 +88,227 @@ RESTART_HOUR_2 = 12
 RESTART_HOUR_3 = 17
 RESTART_HOUR_4 = 22
 
-# Winrate 45.79 %
+# # #
 # FEATURES = [
-#     'open', 'volume', 'k100', 'e100', 'k', 'e', 'ATR', 'macd', 'macd_hist', 'VWAP', 'return_1_raw',
-#     'volatility_10', 'volatility_50', 'atr_norm', 'rsi_14', 'dist_PP', 'dist_S1', 'dist_R1', 'near_PP_pct',
-#     'near_PP_atr', 'near_S1_pct', 'near_S1_atr', 'near_R1_pct', 'near_R1_atr', 'near_S2_pct', 'near_S2_atr',
-#     'near_R2_pct', 'near_R2_atr', 'dist_resist_rl', 'dist_support_rl', 'near_resist_rl_pct', 'near_support_rl_pct',
-#     'near_resist_rl_atr', 'near_support_rl_atr', 'price_change', 'avg_volume_last_n', 'rsi_50', 'roc_10', 'roc_30',
-#     'momentum_diff', 'minute_sin', 'minute_cos', 'dow_sin', 'dow_cos', 'session_ny_open', 'session_london_open',
-#     'session_asia_open', 'dist_P_8h_atr', 'dist_R1_8h_atr', 'dist_S1_8h_atr', 'dist_R2_8h_atr', 'dist_S2_8h_atr',
-#     'near_res_8h', 'near_sup_8h', 'stoch_overbought_80', 'stoch_overbought_90', 'stoch_oversold_20',
-#     'stoch_oversold_10', 'stoch_k_above_d', 'trend_slope_norm_100', 'trend_r2_100', 'trend_dist_pct_100',
-#     'trend_channel_slope_high', 'candle_doji', 'candle_pinbar', 'candle_engulfing', 'rsi14_oversold_near_support',
-#     'rsi14_overbought_near_resist', 'trend_ema200_down', 'range_prev_day_abs', 'range_prev_day_pct',
-#     'gap_open_abs', 'overnight_range_abs', 'overnight_range_pct', 'range_prev_day_atr', 'overnight_range_atr',
-#     'vwap_up', 'dist_to_vwap', 'vol_ratio', 'z_atr_norm', 'z_volume', 'min_dist_level_atr', 'delta_trend_slope_100',
-#     'rsi_40_60', 'ret_abs', 'ret_diff2', 'ret_mean_s', 'ret_mean_m', 'ret_skew_m', 'ret_kurt_m', 'var_95_m', 'acf1_s',
-#     'acf2_s', 'p_entropy_s', 'hurst_m', 'slope_m', 'vol_rel_m', 'vol_std_m', 'up_vol_ratio', 'corr_close_vol_m',
-#     'var_ratio', 'cross_ma_m', 'market_regime', 'hmm_state', 'buy_pressure', 'sell_pressure', 'signed_volume_ema',
-#     'upper_wick', 'lower_wick', 'wick_imbalance', 'micro_slope', 'ret_ema_20', 'shock_ema', 'trend_slope_ema',
-#     'trend_r2_50', 'trend_acc'
+#     'atr_vs_ema200',
+#     'atr_norm',
+#     # 'close_vs_vwap_pct',
+#     'dist_PP',
+#     'z_atr_norm',
+#     'volatility_50',
+#     'shock_ema',
+#     'var_95_m',
+#     'min_dist_level_atr',
+#     'dist_S1_8h_atr',
+#     'dist_ema_200',
+#     'trend_slope_ema',
+#     'dist_to_vwap',
+#     'dist_P_8h_atr',
+#     'dist_R1_8h_atr',
+#     'trend_slope_norm_100',
+#     'e100',
+#     'k100_x_trend_slope',
+#     'signed_volume_ema',
+#     'session_ny',
+#     'trend_r2_100',
+#     'var_ratio',
+#     'vol_20',
+#     # 'gap_open_abs',
+#     'ret_kurt_m',
+#     'session_london_open',
+#     'ret_skew_m',
+#     # 'atr_pct',
+#     'trend_r2_50',
+#     'vol_ratio',
+#     'cross_ma_m',
+#     'macd_signal',
+#     'corr_close_vol_m',
+#     'acf2_s',
+#     'up_vol_ratio',
+#     # 'delta_trend_slope_100',
+#     'ema21_vs_50_norm',
+#     'session_ny_open',
+#     'hurst_m',
+#     'trend_dist_pct_100',
+#     'close_vs_8h_mean',
+#     'trend_channel_slope_high',
+#     'slope_m',
+#     'dist_to_high20',
+#     'roc_30',
+#     'dist_to_low50',
+#     'dist_support_rl',
+#     'obv_slope',
+#     'dist_to_high50',
+#     'vol_ratio_lag1',
+#     'candle_range_norm',
+#     'acf1_s',
+#     'hmm_state',
+#     'volatility_10',
+#     'micro_slope',
+#     'ema21_slope',
+#     'candle_range_norm_lag1',
+#     'rsi_50',
+#     'macd',
+#     'dist_ema_50',
+#     'dist_resist_rl',
+#     'atr_acceleration',
+#     'ema_50_vs_200',
+#     'ret_mean_s',
+#     'ret_mean_m',
+#     'ema_bear_aligned',
+#     'macd_hist_lag1',
+#     'macd_hist',
+#     # 'willr_14',
+#     'p_entropy_s',
+#     # 'vwap_dist',
+#     'session_asia_open',
+#     'cci_20',
+#     'z_volume_lag1',
+#     # 'volume_surge_20',
+#     'roc_10',
+#     'z_volume',
+#     'momentum_diff',
+#     'k_lag3',
+#     'lower_wick',
+#     'close_position',
+#     'ema_bull_aligned',
+#     'roc_5',
+#     'body_vs_atr',
+#     # Reemplazo variables estacionales
+#     # 'volume_ratio',
+#     'vol_change_pct',
+#     'vol_oscillator',
+#     'vol_cv',
+#     'gap_open_pct_abs',
+#     # 'gap_open_atr_abs',
+#     'gap_open_pct',
+#     # 'gap_open_pct_decay'
 # ]
 
-# Winrate: 46.51% correlation < 0.85
 # FEATURES = [
-#     'open', 'volume', 'k100', 'e100', 'k', 'e', 'ATR', 'macd', 'macd_hist', 'VWAP', 'return_1_raw', 'volatility_10',
-#     'volatility_50', 'rsi_14', 'dist_PP', 'dist_S1', 'dist_R1', 'near_PP_pct', 'near_PP_atr', 'near_S1_pct',
-#     'near_S1_atr', 'near_R1_pct', 'near_R1_atr', 'near_S2_pct', 'near_S2_atr', 'near_R2_pct', 'near_R2_atr',
-#     'dist_resist_rl', 'dist_support_rl', 'near_resist_rl_pct', 'near_support_rl_pct', 'near_resist_rl_atr',
-#     'near_support_rl_atr', 'price_change', 'avg_volume_last_n', 'rsi_50', 'roc_10', 'momentum_diff', 'minute_sin',
-#     'minute_cos', 'dow_sin', 'dow_cos', 'session_ny_open', 'session_london_open', 'session_asia_open', 'dist_P_8h_atr',
-#     'dist_R1_8h_atr', 'dist_S1_8h_atr', 'near_res_8h', 'near_sup_8h', 'stoch_overbought_80', 'stoch_overbought_90',
-#     'stoch_oversold_20', 'stoch_oversold_10', 'stoch_k_above_d', 'trend_r2_100', 'trend_dist_pct_100',
-#     'trend_channel_slope_high', 'candle_doji', 'candle_pinbar', 'candle_engulfing', 'rsi14_oversold_near_support',
-#     'rsi14_overbought_near_resist', 'trend_ema200_down', 'range_prev_day_abs', 'range_prev_day_pct', 'gap_open_abs',
-#     'overnight_range_pct', 'range_prev_day_atr', 'overnight_range_atr', 'vwap_up', 'vol_ratio', 'z_atr_norm',
-#     'z_volume', 'min_dist_level_atr', 'delta_trend_slope_100', 'rsi_40_60', 'ret_abs', 'ret_diff2', 'ret_skew_m',
-#     'ret_kurt_m', 'var_95_m', 'acf1_s', 'acf2_s', 'p_entropy_s', 'hurst_m', 'vol_std_m', 'up_vol_ratio',
-#     'corr_close_vol_m', 'var_ratio', 'cross_ma_m', 'market_regime', 'hmm_state', 'signed_volume_ema', 'upper_wick',
-#     'lower_wick', 'wick_imbalance', 'micro_slope', 'shock_ema', 'trend_slope_ema', 'trend_r2_50', 'trend_acc'
-# ]
+#     'dist_PP',
+#     'volatility_50',
+#     'e100',
+#     'vol_20',
+#     'slope_m',
+#     'ema21_slope',
+#     'rsi_50',
+#     'macd',
+#     'ema_bear_aligned',
+#     'macd_hist_lag1',
+#     'macd_hist',pol
+#     'p_entropy_s',
+#     'cci_20',
+#     'z_volume_lag1',
+#     'z_volume',
+#     'momentum_diff',
+#     'vol_oscillator',
+#     'vol_cv',
+#     # 'shock_ema'
+#     ]
 
-# # # Winrate: 48.46% correlation < 0.75 sin baja relevancia
-# FEATURES = [
-#     'open', 'volume', 'k100', 'e100', 'k', 'e', 'macd', 'macd_hist', 'VWAP', 'return_1_raw', 'volatility_10',
-#     'volatility_50', 'rsi_14', 'dist_PP', 'dist_S1', 'dist_R1', 'near_PP_pct', 'near_PP_atr', 'near_S1_pct',
-#     'near_R1_pct', 'near_R1_atr', 'near_R2_atr',
-#     'dist_resist_rl', 'dist_support_rl', 'near_resist_rl_atr', 'near_support_rl_atr', 'price_change',
-#     'avg_volume_last_n', 'momentum_diff', 'minute_sin', 'minute_cos', 'dow_sin', 'dow_cos', 'session_ny_open',
-#     'session_london_open', 'session_asia_open', 'dist_P_8h_atr', 'dist_R1_8h_atr', 'dist_S1_8h_atr', 'near_res_8h',
-#     'stoch_overbought_80', 'stoch_overbought_90', 'stoch_oversold_20',
-#     'stoch_k_above_d', 'trend_r2_100', 'trend_dist_pct_100', 'candle_pinbar', 'candle_engulfing',
-#     'rsi14_oversold_near_support', 'rsi14_overbought_near_resist', 'trend_ema200_down',
-#     'overnight_range_pct', 'range_prev_day_atr', 'overnight_range_atr', 'vwap_up', 'vol_ratio', 'z_atr_norm',
-#     'z_volume', 'min_dist_level_atr', 'delta_trend_slope_100', 'rsi_40_60', 'ret_abs', 'ret_diff2', 'ret_skew_m',
-#     'ret_kurt_m', 'acf1_s', 'acf2_s', 'p_entropy_s', 'hurst_m', 'vol_std_m', 'up_vol_ratio', 'corr_close_vol_m',
-#     'var_ratio', 'cross_ma_m', 'market_regime', 'hmm_state', 'signed_volume_ema', 'upper_wick', 'lower_wick',
-#     'wick_imbalance', 'micro_slope', 'shock_ema', 'trend_slope_ema', 'trend_r2_50', 'trend_acc'
-# ]
-
-
-# # Winrate: 48.46% correlation < 0.75 sin baja relevancia
-# FEATURES = [
-#     'open', 'volume', 'k100', 'e100', 'k', 'e', 'macd', 'macd_hist', 'VWAP', 'return_1_raw', 'volatility_10',
-#     'volatility_50', 'rsi_14', 'dist_PP', 'dist_S1', 'dist_R1', 'near_PP_pct', 'near_PP_atr', 'near_S1_pct',
-#     'near_R1_pct', 'near_R1_atr', 'near_R2_atr',
-#     'dist_resist_rl', 'dist_support_rl', 'near_resist_rl_atr', 'near_support_rl_atr', 'price_change',
-#     'avg_volume_last_n', 'momentum_diff', 'minute_sin', 'minute_cos', 'dow_sin', 'dow_cos', 'session_ny_open',
-#     'session_london_open', 'session_asia_open', 'dist_P_8h_atr', 'dist_R1_8h_atr', 'dist_S1_8h_atr', 'near_res_8h',
-#     'stoch_overbought_80', 'stoch_overbought_90', 'stoch_oversold_20',
-#     'stoch_k_above_d', 'trend_r2_100', 'trend_dist_pct_100', 'candle_pinbar', 'candle_engulfing',
-#     'rsi14_oversold_near_support', 'rsi14_overbought_near_resist', 'trend_ema200_down',
-#     'overnight_range_pct', 'range_prev_day_atr', 'overnight_range_atr', 'vwap_up', 'vol_ratio', 'z_atr_norm',
-#     'z_volume', 'min_dist_level_atr', 'delta_trend_slope_100', 'rsi_40_60', 'ret_abs', 'ret_diff2', 'ret_skew_m',
-#     'ret_kurt_m', 'acf1_s', 'acf2_s', 'p_entropy_s', 'hurst_m', 'vol_std_m', 'up_vol_ratio', 'corr_close_vol_m',
-#     'var_ratio', 'cross_ma_m', 'market_regime', 'hmm_state', 'signed_volume_ema', 'upper_wick', 'lower_wick',
-#     'wick_imbalance', 'micro_slope', 'shock_ema', 'trend_slope_ema', 'trend_r2_50', 'trend_acc'
-# ]
-
+  # n=    1  winrate=33.33333333333333
+  # n=    2  winrate=10.9375
+  # n=    3  winrate=13.20754716981132
+  # n=    4  winrate=33.63636363636363
+  # n=    5  winrate=47.05882352941176
 FEATURES = [
-    'VWAP',
-    'overnight_range_pct',
-    'open',
-    'dist_R1',
-    'dist_S1',
-    'minute_sin',
-    'volatility_50',
-    'minute_cos',
+    'atr_norm',
+    'shock_ema',
     'dist_PP',
     'e100',
-    'trend_slope_ema',
-    'trend_r2_100',
-    'min_dist_level_atr',
-    'dist_R1_8h_atr',
-    'avg_volume_last_n',
-    'dist_P_8h_atr',
-    'vol_std_m',
-    'overnight_range_atr',
-    'shock_ema',
-    'range_prev_day_atr',
-    'dist_S1_8h_atr',
-    'ret_kurt_m',
-    'ret_skew_m',
-    'e',
-    'z_atr_norm',
-    'corr_close_vol_m',
-    'trend_r2_50',
-    'k100',
-    'hurst_m',
-    'trend_dist_pct_100',
-    'var_ratio',
-    'up_vol_ratio',
-    'signed_volume_ema',
-    'delta_trend_slope_100',
-    # 'dom_sin',
-    # 'dom_cos',
-    'dow_sin',
-    'dow_cos',
+    'dist_ema_200',
+    'vol_cv',
     'macd',
-    'vol_ratio',
-    'acf1_s',
-    'acf2_s',
-    'volatility_10',
-    'dist_support_rl',
-    'macd_hist',
-    'dist_resist_rl',
-    'momentum_diff',
-    'price_change',
-    'cross_ma_m',
-    'rsi_14',
-    'k',
+    'dist_S1_8h_atr',
+    'trend_slope_ema',
+    'vol_oscillator',
+    'slope_m',
+    'ema21_slope',
     'z_volume',
-    'volume',
-    'micro_slope',
-    'p_entropy_s',
-    'wick_imbalance',
-    'ret_abs',
-    'trend_acc',
-    'ret_diff2',
-    'lower_wick',
-    'upper_wick',
-    'return_1_raw',
-    'hmm_state',
-    'vwap_up',
-    'market_regime',
-    'trend_ema200',
-    # 'session_london_open',
-    'near_PP_pct',
-    'near_S1_pct',
-    'near_R1_pct',
-    # 'rsi_40_60',
-    # 'session_ny_open',
-    # 'session_asia_open',
-    # 'candle_engulfing',
-    # 'stoch_overbought_80',
-    # 'stoch_k_above_d',
-    # 'rsi14_oversold_near_support',
-    # 'stoch_oversold_20',
-    # 'near_PP_atr',
-    # 'candle_pinbar',
-    # 'near_R1_atr',
-    # 'near_support_rl_atr',
-    # 'rsi14_overbought_near_resist',
-    # 'near_resist_rl_atr',
-    # 'stoch_overbought_90',
-    # 'near_R2_atr',
-    # 'near_res_8h'
+    'momentum_diff',
+    'z_volume_lag1',
+    'ema_bear_aligned',
+    'p_entropy_s'
 ]
-#56.8%
+
+
 # FEATURES = [
-#     'VWAP',
-#     'overnight_range_pct',
-#     'open',
-#     'dist_R1',
-#     'dist_S1',
-#     'minute_sin',
-#     'volatility_50',
-#     'minute_cos',
+#     'z_atr_norm', 'volatility_50', 'shock_ema', 'min_dist_level_atr', 'dist_S1_8h_atr', 'trend_slope_ema',
+#     'dist_to_vwap', 'dist_R1_8h_atr', 'trend_slope_norm_100', 'k100_x_trend_slope', 'session_ny',
+#     'trend_r2_100', 'ret_skew_m', 'up_vol_ratio', 'session_ny_open', 'dist_to_high20', 'vol_ratio_lag1',
+#     'volatility_10', 'micro_slope', 'ema21_slope', 'macd', 'dist_ema_50', 'ema_50_vs_200', 'ret_mean_m',
+#     'macd_hist', 'p_entropy_s', 'z_volume_lag1', 'roc_10', 'momentum_diff', 'close_position',
+#     'ema_bull_aligned', 'roc_5', 'vol_change_pct', 'vol_cv', 'gap_open_pct'
+# ]
+
+
+
+# FEATURES = [
+#     'atr_vs_ema200', 'atr_norm', 'dist_PP', 'z_atr_norm', 'dist_to_vwap',
+#     'e100', 'volatility_50', 'dist_ema_200', 'min_dist_level_atr', 'var_95_m',
+#     'shock_ema', 'dist_S1_8h_atr', 'trend_slope_ema', 'vol_cv', 'dist_R1_8h_atr',
+#     'slope_m', 'dist_P_8h_atr', 'k100_x_trend_slope', 'gap_open_pct', 'dist_to_high20',
+#     'session_ny', 'var_ratio', 'vol_ratio_lag1', 'trend_slope_norm_100',
+#     'trend_channel_slope_high', 'ret_skew_m', 'trend_r2_100', 'signed_volume_ema',
+#     'ema21_vs_50_norm', 'ret_kurt_m', 'macd', 'trend_r2_50', 'session_london_open',
+#     'trend_dist_pct_100', 'cross_ma_m', 'dist_support_rl', 'session_ny_open',
+#     'volatility_10', 'vol_20', 'up_vol_ratio', 'cci_20', 'vol_ratio', 'acf1_s',
+#     'rsi_50', 'vol_oscillator', 'ret_mean_m', 'candle_range_norm_lag1'
+# ]
+
+# FEATURES = [
 #     'dist_PP',
-#     'e100',
-#     'trend_slope_ema',
-#     'trend_r2_100',
-#     'min_dist_level_atr',
-#     'dist_R1_8h_atr',
-#     'avg_volume_last_n',
-#     'dist_P_8h_atr',
-#     'vol_std_m',
-#     'overnight_range_atr',
-#     'shock_ema',
-#     'range_prev_day_atr',
-#     'dist_S1_8h_atr',
-#     'ret_kurt_m',
-#     'ret_skew_m',
-#     'e',
-#     'z_atr_norm',
-#     'corr_close_vol_m',
-#     'dow_sin',
-#     'trend_r2_50',
-#     'k100',
-#     'hurst_m',
-#     'trend_dist_pct_100',
-#     'var_ratio',
-#     'up_vol_ratio',
-#     'signed_volume_ema',
-#     'delta_trend_slope_100',
-#     'dow_cos',
-#     'macd',
-#     'vol_ratio',
-#     'acf1_s',
-#     'acf2_s',
-#     'volatility_10',
-#     'dist_support_rl',
-#     'macd_hist',
-#     'dist_resist_rl',
-#     'momentum_diff',
-#     'price_change',
-#     'cross_ma_m',
-#     'rsi_14',
-#     'k',
-#     'z_volume',
-#     'volume',
-#     'micro_slope',
-#     'p_entropy_s',
-#     'wick_imbalance',
-#     'ret_abs',
-#     'trend_acc',
-#     'ret_diff2',
-#     'lower_wick',
-#     'upper_wick',
-#     'return_1_raw',
-#     'hmm_state',
-#     # 'vwap_up',
-#     'market_regime',
-#     'trend_ema200_down',
-#     # 'session_london_open',
-#     'near_PP_pct',
-#     'near_S1_pct',
-#     'near_R1_pct',
-# ]
-
-# # # %62
-# FEATURES = [
-#     'VWAP',
-#     'overnight_range_pct',
-#     'open',
-#     'dist_R1',
-#     'dist_S1',
-#     'minute_sin',
 #     'volatility_50',
-#     'minute_cos',
-#     'dist_PP',
-#     'e100',
-#     'trend_slope_ema',
-#     'trend_r2_100',
-#     'min_dist_level_atr',
-#     'dist_R1_8h_atr',
-#     'avg_volume_last_n',
 #     'dist_P_8h_atr',
-#     'vol_std_m',
-#     'overnight_range_atr',
-#     'shock_ema',
-#     'range_prev_day_atr',
-#     'dist_S1_8h_atr',
-#     'ret_kurt_m',
-#     'ret_skew_m',
-#     'e',
-#     'z_atr_norm',
-#     'corr_close_vol_m',
-#     'dow_sin',
-#     'trend_r2_50',
-#     'k100',
-#     'hurst_m',
-#     'trend_dist_pct_100',
 #     'var_ratio',
-#     'up_vol_ratio',
-#     'signed_volume_ema',
-#     'delta_trend_slope_100',
-#     'dow_cos',
-#     'macd',
-#     'vol_ratio',
-#     'acf1_s',
-#     'acf2_s',
-#     'volatility_10',
-#     'dist_support_rl',
-#     'macd_hist',
-#     'dist_resist_rl',
-#     'momentum_diff',
-#     'price_change',
-#     'cross_ma_m',
-#     'rsi_14',
-#     'k',
-#     'z_volume',
-#     'volume',
-#     'micro_slope',
-#     'p_entropy_s',
-#     'wick_imbalance',
-#     'ret_abs',
-#     'trend_acc',
-#     'ret_diff2',
-#     'lower_wick',
-#     'upper_wick',
-#     # 'return_1_raw',
-#     'hmm_state',
-#     # 'vwap_up',
-#     'market_regime',
-#     'trend_ema200_down',
-#     # 'session_london_open',
-#     'near_PP_pct',
-#     'near_S1_pct',
-#     'near_R1_pct',
-# ]
-
-
-# %62
-# FEATURES = [
-#     'VWAP',
-#     'overnight_range_pct',
-#     'open',
-#     'dist_R1',
-#     'dist_S1',
-#     'minute_sin',
-#     'volatility_50',
-#     'minute_cos',
-#     'dist_PP',
+#     'dist_S1_8h_atr',
+#     'atr_vs_ema200',
+#     'var_95_m',
 #     'e100',
-#     'trend_slope_ema',
-#     'trend_r2_100',
-#     'min_dist_level_atr',
-#     'dist_R1_8h_atr',
-#     'avg_volume_last_n',
-#     'dist_P_8h_atr',
-#     'vol_std_m',
-#     'overnight_range_atr',
-#     'shock_ema',
-#     'range_prev_day_atr',
-#     'dist_S1_8h_atr',
 #     'ret_kurt_m',
-#     'ret_skew_m',
-#     'e',
-#     'z_atr_norm',
-#     'corr_close_vol_m',
-#     'dow_sin',
-#     'trend_r2_50',
-#     'k100',
-#     'hurst_m',
-#     'trend_dist_pct_100',
-#     'var_ratio',
-#     'up_vol_ratio',
+#     'trend_r2_100',
 #     'signed_volume_ema',
-#     'delta_trend_slope_100',
-#     'dow_cos',
-#     'macd',
-#     'vol_ratio',
-#     'acf1_s',
-#     'acf2_s',
-#     'volatility_10',
+#     'vol_cv',
+#     'trend_dist_pct_100',
 #     'dist_support_rl',
-#     'macd_hist',
-#     'dist_resist_rl',
-#     'momentum_diff',
-#     'price_change',
-#     'cross_ma_m',
-#     'rsi_14',
-#     'k',
-#     'z_volume',
-#     'volume',
-#     'micro_slope',
-#     'p_entropy_s',
-#     'wick_imbalance',
-#     'ret_abs',
-#     'trend_acc',
-#     'ret_diff2',
-#     'lower_wick',
-#     'upper_wick',
-#     # 'return_1_raw',
-#     'hmm_state',
-#     # 'vwap_up',
-#     'market_regime',
-#     'trend_ema200_down',
-#     # 'session_london_open',
-#     'near_PP_pct',
-#     'near_S1_pct',
-#     'near_R1_pct',
+#     'gap_open_pct',
+#     'trend_slope_norm_100',
+#     'dist_R1_8h_atr',
+#     'shock_ema',
+#     'close_vs_8h_mean',
+#     'dist_ema_50',
+#     'min_dist_level_atr',
+#     'atr_acceleration',
 # ]
 
-# FEATURES = [
-#     # Winrate: 56.56%
-#     'VWAP', 'overnight_range_pct', 'open', 'dist_R1', 'dist_S1', 'minute_sin', 'volatility_50', 'minute_cos', 'dist_PP',
-#     'e100', 'trend_slope_ema',
-#     'trend_r2_100', 'overnight_range_atr',
-#     'ret_kurt_m', 'corr_close_vol_m',
-#     'trend_r2_50',
-#     'momentum_diff', 'price_change',
-#     'market_regime',
-# ]
+FEATURES_M2 = FEATURES
+#
 
-# Winrate: 48.25% correlation < 0.85
-# FEATURES = [
-#     'dist_S2', 'dist_R2', 'close', 'dist_PP', 'volatility_50', 'minute_sin', 'minute_cos',
-#     'overnight_range_pct', 'dist_S2_8h_atr', 'avg_volume_last_n', 'dist_R2_8h_atr',
-#     'range_prev_day_pct', 'volume_lag1',
-#     'overnight_range_atr', 'dist_P_8h_atr', 'range_prev_day_atr', 'trend_channel_slope_low',
-#     'dist_resist_rl', 'dist_support_rl', 'd', 'dow_sin',
-#     'volume', 'dow_cos', 'macd_minus_signal', 'vol_ratio', 'z_atr_norm', 'min_dist_level_atr',
-#     'delta_trend_slope_100', 'ret', 'ret_diff2', 'ret_skew_m', 'ret_kurt_m',
-#     'acf1_s', 'acf2_s', 'p_entropy_s', 'hurst_m', 'vol_rel_m',
-#     'vol_std_m', 'up_vol_ratio', 'corr_close_vol_m', 'cross_ma_m', 'market_regime', 'hmm_state',
-#     'signed_volume_ema', 'upper_wick', 'lower_wick', 'wick_imbalance',
-#     'micro_slope', 'shock_ema', 'trend_slope_ema', 'trend_r2_50', 'trend_acc'
-# ]
+# FEATURES = optimized
+
+
+# FEATURES = ['z_atr_norm', 'volatility_50', 'e100', 'shock_ema', 'dist_ema_200', 'trend_slope_ema', 'dist_R1_8h_atr', 'dist_P_8h_atr', 'var_ratio', 'session_london_open', 'ret_kurt_m', 'slope_m', 'ret_skew_m', 'trend_r2_50', 'session_ny_open']
 
 # FEATS_M2 = ['p_hat', 'margin', 'direction_sign', 'equity_dd', 'win_streak_len', 'loss_streak_len', 'hit_rate_50']
 FEATS_M2 = ['p_hat', 'margin', 'direction_sign']
 
 warnings.filterwarnings('ignore')
 
-
-
-# Test regime feature
-# params_to_features = {
-#     "version": "v3-testing-features-1-model2model   ",  # cambia esto si modificas reglas de features
-# }
-
-# Test regime feature
-# params_to_features = {
-#     "version": "tp_5_sl3",  # cambia esto si modificas reglas de features
-# }
-
+# # features_f843b6af84.parquet
 params_to_features = {
-    "version": "tp_4_sl3",  # cambia esto si modificas reglas de features
-    "lookahead": "60",  # cambia esto si modificas reglas de features
+    "version": "tp_5.5_sl3",  # cambia esto si modificas reglas de features
+    "lookahead": "50",  # cambia esto si modificas reglas de features
+    "features": "atr, agrego gap decay"
 }
 
+
 # params_to_features = {
-#     "version": "tp_4_sl3",  # cambia esto si modificas reglas de features
+#     "version": "tp_5.5_sl3",  # cambia esto si modificas reglas de features
 #     "lookahead": "50",  # cambia esto si modificas reglas de features
+#     "features": "optuna filtered"
 # }
+
 
 def feature_signature(params: dict) -> str:
     """
@@ -1086,11 +873,13 @@ class Trade:
 # Variable global simple para que Trade.fees_usdt tenga acceso a la instancia Fees
 fees = Fees()
 
+
 @dataclass
 class CacheConfig:
     cache_path: str = "m1_outputs.parquet"
     engine: str = "pyarrow"  # recomendado
     partition_cols: Optional[list] = None  # normalmente None; puedes añadir 'date' si quieres
+
 
 class M1OutputCacheBuilder:
     """
@@ -1102,18 +891,22 @@ class M1OutputCacheBuilder:
     """
 
     def __init__(
-        self,
-        analyzer,
-        candles: pd.DataFrame,
-        proba_threshold: float = 0.55,       # ÚNICO umbral para "operadas"
-        atr_period: int = 14,
-        atr_mult_tp: float = 4.0,
-        atr_mult_sl: float = 3.0,
-        use_adapter_tp_sl_when_missing: bool = True,
-        order_conflict_policy: Literal["worst", "best", "tp_first", "sl_first"] = "sl_first",
-        offline_lookback_bars: int = 200,
-        n_keep_for_fit: int = 40000,
-        cache: CacheConfig = CacheConfig(),
+            self,
+            analyzer,
+            candles: pd.DataFrame,
+            proba_threshold: float = 0.55,  # ÚNICO umbral para "operadas"
+            atr_period: int = 14,
+            atr_mult_tp: float = 4.0,
+            atr_mult_sl: float = 3.0,
+            use_adapter_tp_sl_when_missing: bool = True,
+            order_conflict_policy: Literal["worst", "best", "tp_first", "sl_first"] = "sl_first",
+            offline_lookback_bars: int = 200,
+            n_keep_for_fit: int = 40000,
+            cache: CacheConfig = CacheConfig(),
+            n_estimators=100,
+            n_childs=500,
+            max_depth=6,
+            num_leaves=40,
     ):
         self.analyzer = analyzer
         self.df = candles.reset_index(drop=True).copy()
@@ -1138,6 +931,10 @@ class M1OutputCacheBuilder:
         # Precalcula ATR simple para fallback de TP/SL
         self.df["tr"] = self._true_range(self.df)
         self.df["atr"] = self.df["tr"].rolling(self.atr_period).mean()
+        self.n_estimators = n_estimators
+        self.n_childs = n_childs
+        self.max_depth = max_depth,
+        self.num_leaves = num_leaves,
 
     # --------------------------
     # Entrenamiento (una vez)
@@ -1145,67 +942,204 @@ class M1OutputCacheBuilder:
     def _fit_once(self, train_df: pd.DataFrame, suppress_fit_stdout: bool = True):
         self.analyzer.data = train_df.copy()
         N_KEEP = min(len(train_df), self.n_keep_for_fit)
+
+        # 1. El Núcleo Duro (Top 20 SHAP) - Siempre presentes
+        # top = [
+        #     'atr_vs_ema200', 'atr_norm', 'dist_PP', 'e100', 'dist_to_vwap', 'z_atr_norm', 'volatility_50', 'shock_ema',
+        #     'min_dist_level_atr', 'vol_cv',
+        #     'var_95_m', 'dist_ema_200', 'dist_S1_8h_atr', 'trend_slope_ema',
+        #     'dist_R1_8h_atr', 'trend_slope_norm_100', 'k100_x_trend_slope', 'dist_P_8h_atr', 'var_ratio',
+        #     'trend_r2_100',
+        #     'signed_volume_ema', 'session_london_open', 'ret_kurt_m', 'session_ny', 'gap_open_pct',
+        #     'slope_m', 'ret_skew_m', 'trend_r2_50', 'trend_channel_slope_high', 'session_ny_open',
+        # ]
+        #
+        # candidates = [
+        #     'vol_20', 'macd', 'cross_ma_m', 'dist_support_rl', 'corr_close_vol_m', 'dist_to_high50', 'up_vol_ratio',
+        #     'ema21_vs_50_norm', 'close_vs_8h_mean', 'vol_ratio', 'acf2_s', 'dist_to_low50', 'vol_ratio_lag1',
+        #     'macd_signal',
+        #     'trend_dist_pct_100', 'ema21_slope', 'hurst_m', 'hmm_state', 'dist_to_high20', 'acf1_s', 'dist_resist_rl',
+        #     'candle_range_norm', 'volatility_10', 'vol_oscillator', 'roc_30', 'rsi_50', 'candle_range_norm_lag1',
+        #     'obv_slope',
+        #     'macd_hist_lag1', 'dist_ema_50', 'ema_bear_aligned', 'atr_acceleration', 'cci_20', 'z_volume',
+        #     'z_volume_lag1',
+        #     'macd_hist', 'ema_50_vs_200', 'session_asia_open', 'ret_mean_m', 'p_entropy_s', 'body_vs_atr', 'ret_mean_s',
+        #     'momentum_diff', 'micro_slope', 'roc_10', 'ema_bull_aligned', 'k_lag3', 'roc_5', 'lower_wick',
+        #     'close_position',
+        #     'vol_change_pct', 'gap_open_pct_abs'
+        # ]
+        #  'dist_P_8h_atr',
+        #  'trend_r2_100',
+        #  'signed_volume_ema',
+        #  'session_london_open',
+        #  'gap_open_pct',
+        #  'ret_skew_m',
+        #  'trend_r2_50',
+        # ]
+        #
+        # to_review = [
+        #     'shock_ema', 'dist_S1_8h_atr', 'trend_slope_ema','atr_vs_ema200','z_atr_norm',
+        # ]
+
+        #
+        # Auditoría Global: Dejamos que Optuna revise las 30 features desde cero
+        # get_best_features_by_pnl(
+        #     df_data=train_df,
+        #     fixed_features=FEATURES,
+        #     candidate_features=to_review,
+        #     analyzer=self.analyzer,
+        #     n_keep=370000,
+        #     trials=10000,
+        #     min_features=10 # Forzamos al menos 10 para robustez
+        # )
+
+        # model_kwargs_simple = {
+        #     "verbosity": -1,
+        #     "random_state": 42,
+        #     "objective": "multiclass",
+        #     "num_class": 3,
+        #     "n_jobs": -1,
+        #     # 'class_weight': 'balanced',
+        #     # 'max_depth': 8, 'num_leaves': 145,
+        #     # 'learning_rate': 0.005052123487504084, 'min_child_samples': 20, 'n_estimators': 450,
+        # }
+        # fixed = {'max_depth': 6, 'num_leaves': 10, 'min_child_samples': 40, 'n_estimators': 1000, 'learning_rate': 0.03, 'subsample': 1.0, 'colsample_bytree': 1.0}
+        # model_kwargs_simple = get_best_kwargs_by_df(df_general=train_df, df_data=train_df, trials=20000, features=FEATURES, analyzer=self.analyzer, n_keep=N_KEEP, timeout_mins=120, target_pnl=70)
+        # Winrate: 87.50 %
+        model_kwargs_simple = {
+            "objective": "multiclass",
+            "num_class": 3,  # ajusta según tus clases reales
+            # 'class_weight': 'balanced',
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbosity": -1,
+            'max_depth': 6, 'num_leaves': 10, 'min_child_samples': 40, 'n_estimators': 1000, 'learning_rate': 0.03, 'subsample': 1.0, 'colsample_bytree': 1.0
+            #
+        }
+
+        # model_kwargs_simple = {
+        #     "objective": "multiclass",
+        #     "num_class": 3,  # ajusta según tus clases reales
+        #
+        #     # "class_weight": "balanced",
+        #     'class_weight': None,
+        #
+        #     "random_state": 42,
+        #     "n_jobs": -1,
+        #     "verbosity": -1,
+        #     'max_depth': 4,
+        #     'num_leaves': 59,
+        #     'min_child_samples': 640,
+        #     'n_estimators': 585,
+        # }
+        # model_kwargs_simple = {
+        #     "objective": "multiclass",
+        #     "num_class": 3,  # ajusta según tus clases reales
+        #
+        #     "class_weight": "balanced",
+        #     "random_state": 42,
+        #     "n_jobs": -1,
+        #     "verbosity": -1,
+        #     # "n_estimators": self.n_estimators,  # más árboles + LR más bajo
+        #     # "min_child_samples": self.n_childs,  # regularización clave con 220k filas
+        #     # "max_depth": self.max_depth,  # Muy importante: árboles poco profundos. > 6 es suicidio en crypto.
+        #     # "num_leaves": self.num_leaves,
+        # }
         if suppress_fit_stdout:
             import io, contextlib
             buf = io.StringIO()
-            # with contextlib.redirect_stdout(buf):
-            #     self.analyzer.create_predictive_model(
-            #         model_type="lgbm",
-            #         calibrate_method="beta",
-            #         N_KEEP=N_KEEP,
-            #         display_graphic=False,
-            #         model_kwargs={
-            #             "objective": "multiclass",
-            #             "num_class": 3,  # ajusta según tus clases reales
-            #             "n_estimators": 4000,  # más árboles + LR más bajo
-            #             "learning_rate": 0.03,  # más bajo para mejorar logloss
-            #             "num_leaves": 96,  # complejidad del árbol
-            #             "max_depth": -1,  # deja que LGBM lo maneje
-            #             "min_child_samples": 200,  # regularización clave con 220k filas
-            #
-            #             "subsample": 0.7,  # antes 0.9, bajamos para más robustez
-            #             "subsample_freq": 1,
-            #             "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
-            #
-            #             "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
-            #             "reg_alpha": 0.1,  # L1 ligera
-            #
-            #             "min_split_gain": 0.0,
-            #             "random_state": 42,
-            #             "n_jobs": -1
-            #         },
-            #         display_feature_plot=False
-            #     )
-        else:
-            self.analyzer.create_predictive_model(
+            with contextlib.redirect_stdout(buf):
+
+                # defaults_simple = dict(
+                #     random_state=42,
+                #     n_jobs=-1,
+                #     verbosity=-1
+                # )
+
+                self.analyzer.create_predictive_model(
                     model_type="lgbm",
                     calibrate_method="sigmoid",
                     N_KEEP=N_KEEP,
                     display_graphic=False,
-                    model_kwargs={
-                        "objective": "multiclass",
-                        "num_class": 3,  # ajusta según tus clases reales
-                        "n_estimators": 1000,  # más árboles + LR más bajo
-                        "learning_rate": 0.03,  # más bajo para mejorar logloss
-                        "num_leaves": 96,  # complejidad del árbol
-                        "max_depth": -1,  # deja que LGBM lo maneje
-                        "min_child_samples": 200,  # regularización clave con 220k filas
-
-                        "subsample": 0.7,  # antes 0.9, bajamos para más robustez
-                        "subsample_freq": 1,
-                        "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
-
-                        "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
-                        "reg_alpha": 0.1,  # L1 ligera
-
-                        "min_split_gain": 0.0,
-                        "random_state": 42,
-                        "n_jobs": -1
-                    },
-                    display_feature_plot=False
+                    model_kwargs=model_kwargs_simple,
+                    display_feature_plot=False,
+                    display_shap=False
                 )
+        else:
+            # model_kwards_experimental = {
+            #     # 1. Control estricto de la complejidad (Crucial para trading)
+            #     "max_depth": 6,  # Muy importante: árboles poco profundos. > 6 es suicidio en crypto.
+            #     "num_leaves": 40,  # Siempre debe ser menor a 2^max_depth (2^5 = 32). 24 es un buen balance.
+            #
+            #     # 2. Regularización extrema (Evita que el modelo se aprenda el ruido)
+            #     # 400K filas son muchas, exigimos que cada hoja del árbol tenga al menos 1000 ejemplos para validar un patrón.
+            #     "min_child_samples": self.n_childs,
+            #
+            #     # 3. Muestreo Aleatorio (Bagging & Subsampling) -> Enseña cosas distintas a cada árbol
+            #     "subsample": 0.6,  # Cada árbol usa solo el 60% de las filas aleatoriamente
+            #     "subsample_freq": 1,  # Aplica el subsample en cada iteración
+            #     "colsample_bytree": 0.5,
+            #     # Usa solo la mitad de los features (aprox 32) por cada árbol. Obliga al modelo a no depender solo de la regresión lineal.
+            #
+            #     # 4. Velocidad de aprendizaje y cantidad de árboles
+            #     "learning_rate": 0.02,  # Aprendizaje lento y constante
+            #     "n_estimators": self.n_estimators,
+            #     # Con 0.02 de LR, 400-500 árboles son suficientes para converger sin sobreajustar.
+            #
+            #     # 5. Penalizaciones matemáticas
+            #     "reg_alpha": 0.5,  # L1 Regularization: Apaga features que no sirven para nada
+            #     "reg_lambda": 1.5,  # L2 Regularization: Suaviza los pesos de los features fuertes
+            #
+            #     # 6. Balanceo de clases (opcional pero muy recomendado)
+            #     # Como tienes TP a 4xATR y SL a 3xATR, vas a tener muchos "lateral" o "stop loss".
+            #     "class_weight": "balanced",
+            #     # Ayuda a que el modelo le preste atención a los aciertos (TP) aunque sean minoría.
+            #
+            #     # 7. Configuración de Hardware/Backbone
+            #     "n_jobs": -1,  # Usar todos los núcleos del procesador
+            #     "random_state": 42,
+            #     "verbosity": -1
+            # }
+            #
+            # model_kwargs_ = {
+            #     "objective": "multiclass",
+            #     "num_class": 3,  # ajusta según tus clases reales
+            #     "n_estimators": self.n_estimators,  # más árboles + LR más bajo
+            #     "learning_rate": 0.03,  # más bajo para mejorar logloss
+            #     "max_depth": self.max_depth,  # Muy importante: árboles poco profundos. > 6 es suicidio en crypto.
+            #     "num_leaves": self.num_leaves,
+            #     # Siempre debe ser menor a 2^max_depth (2^5 = 32). 24 es un buen balance.
+            #     "min_child_samples": self.n_childs,  # regularización clave con 220k filas
+            #
+            #     "subsample": 0.7,  # antes 0.9, bajamos para más robustez
+            #     "subsample_freq": 1,
+            #     "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
+            #
+            #     "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
+            #     "reg_alpha": 0.1,  # L1 ligera
+            #     "class_weight": "balanced",
+            #
+            #     "min_split_gain": 0.0,
+            #     "random_state": 42,
+            #     "n_jobs": -1,
+            #     "verbosity": -1,
+            # }
+            #
+            # defaults_simple = dict(
+            #     random_state=42,
+            #     n_jobs=-1,
+            #     verbosity=-1
+            # )
 
-
+            self.analyzer.create_predictive_model(
+                model_type="lgbm",
+                calibrate_method="sigmoid",
+                N_KEEP=N_KEEP,
+                display_graphic=False,
+                model_kwargs=model_kwargs_simple,
+                display_feature_plot=False,
+                display_shap=False
+            )
 
     # --------------------------
     # Señal offline (M1)
@@ -1220,6 +1154,36 @@ class M1OutputCacheBuilder:
             return None
         last_row_feat = df_ready[features].iloc[-1:]
         last_meta = df_ready.iloc[-1]
+        #
+        # price_change_df = df_ready['price_change'].copy()
+        # price_change_df.iloc[-1] = float('nan')
+        #
+        # def fast_linear_regression_slope(series, window=5):
+        #     """Calcula la pendiente de la regresión lineal de forma vectorizada (ultrarrápida)"""
+        #     y = series
+        #     x = pd.Series(np.arange(len(series)), index=series.index)
+        #
+        #     # Cálculo de promedios móviles
+        #     x_mean = x.rolling(window=window).mean()
+        #     y_mean = y.rolling(window=window).mean()
+        #
+        #     # Covarianza y varianza móvil
+        #     xy_mean = (x * y).rolling(window=window).mean()
+        #     x_squared_mean = (x ** 2).rolling(window=window).mean()
+        #
+        #     covariance = xy_mean - (x_mean * y_mean)
+        #     variance = x_squared_mean - (x_mean ** 2)
+        #
+        #     # Retorna la pendiente (m)
+        #     slope = covariance / variance
+        #     return slope
+        #
+        #     # Creamos modelos de regresión lineal para múltiples ventanas de tiempo
+        #     # (5, 10 y 20 velas) para capturar micro, corta y mediana tendencia
+        #
+        # pred_price_change_lr5 = fast_linear_regression_slope(price_change_df, window=4)
+        # price_change_lr5 = pred_price_change_lr5.iloc[-2]
+        # last_row_feat['price_change'] = price_change_lr5
 
         last_scaled = self.analyzer.scaler.transform(last_row_feat)
         proba_vec = self.analyzer.model.predict_proba(last_scaled)[0]
@@ -1255,7 +1219,7 @@ class M1OutputCacheBuilder:
         return pd.concat([hl, hc, lc], axis=1).max(axis=1)
 
     def _tp_sl_from_adapter_or_atr(
-        self, i: int, side: Literal["long", "short"], maybe_tp: Optional[float], maybe_sl: Optional[float]
+            self, i: int, side: Literal["long", "short"], maybe_tp: Optional[float], maybe_sl: Optional[float]
     ) -> Tuple[float, float]:
         px = float(self.df.loc[i, "close"])
         if self.use_adapter_tp_sl_when_missing and (maybe_tp is not None) and (maybe_sl is not None):
@@ -1274,7 +1238,7 @@ class M1OutputCacheBuilder:
         return tp, sl
 
     def _apply_conflict_policy(
-        self, bar_high: float, bar_low: float, tp: float, sl: float, side: Literal["long","short"]
+            self, bar_high: float, bar_low: float, tp: float, sl: float, side: Literal["long", "short"]
     ) -> Optional[str]:
         hit_tp = bar_high >= tp if side == "long" else bar_low <= tp
         hit_sl = bar_low <= sl if side == "long" else bar_high >= sl
@@ -1293,7 +1257,8 @@ class M1OutputCacheBuilder:
             return "sl"
         return None
 
-    def _resolve_outcome_forward(self, entry_idx: int, side: Literal["long","short"], tp: float, sl: float) -> Tuple[str, float]:
+    def _resolve_outcome_forward(self, entry_idx: int, side: Literal["long", "short"], tp: float, sl: float) -> Tuple[
+        str, float]:
         """
         Barre barras posteriores hasta encontrar TP o SL.
         Devuelve (exit_reason, r_multiple), donde r_multiple se calcula con riesgo por barra de entrada.
@@ -1360,7 +1325,7 @@ class M1OutputCacheBuilder:
         # 3) Hit rates rolling (lagged)
         for W in (50, 200):
             out[f"hit_rate_{W}"] = (
-                win_flag.rolling(W, min_periods=max(5, W//5)).mean().shift(1)
+                win_flag.rolling(W, min_periods=max(5, W // 5)).mean().shift(1)
             )
 
         # 4) Por dirección
@@ -1405,7 +1370,8 @@ class M1OutputCacheBuilder:
     # --------------------------
     # Proceso principal + cache
     # --------------------------
-    def build_and_cache(self, test_start: str, test_end: Optional[str] = None, verbose: int = 1, export_parquet: bool = True, skip_fit: bool = False) -> pd.DataFrame:
+    def build_and_cache(self, test_start: str, test_end: Optional[str] = None, verbose: int = 1,
+                        export_parquet: bool = True, skip_fit: bool = False) -> pd.DataFrame:
         # Alinear fechas a tz del DF
         tz = self.tz
         start = pd.to_datetime(test_start)
@@ -1436,15 +1402,12 @@ class M1OutputCacheBuilder:
         if not idxs:
             raise ValueError("Rango de test vacío. Revisa las fechas.")
 
-
-
-
         # Entrenar UNA VEZ con histórico previo a test_start
         first_i = idxs[0]
         train_slice = self.df.loc[: first_i - 1]
         if len(train_slice) < 200:
             raise ValueError("Histórico previo insuficiente para entrenar antes del test (>=200 velas).")
-        
+
         if not skip_fit:
             self._fit_once(train_slice, suppress_fit_stdout=False)
 
@@ -1545,8 +1508,22 @@ class M1OutputCacheBuilder:
             if verbose and ((pos + 1) % 500 == 0 or (pos + 1) == len(idxs)):
                 print(f"[M1Output] {pos + 1}/{len(idxs)} | {ts} | pred={pred} p_hat={p_hat:.3f} margin={margin:.3f}")
 
-        if not rows and existing is not None:
-            return existing.sort_values("datetime").reset_index(drop=True)
+        # if not rows and existing is not None:
+        #     return existing.sort_values("datetime").reset_index(drop=True)
+
+        if not rows:
+            if existing is not None and not existing.empty:
+                return existing.sort_values("datetime").reset_index(drop=True)
+            else:
+                # Retornamos DataFrame vacío pero con todas las columnas esperadas para no romper downstream (ej: df['result'].value_counts())
+                expected_cols = [
+                    "datetime", "close", "prediction", "proba_bullish", "proba_bearish",
+                    "proba_lateral", "p_hat", "second_p", "margin", "direction",
+                    "direction_sign", "tp", "sl", "result", "pnl_R", "is_operated"
+                ]
+                # Agregar las features que también se esperan mezclar
+                expected_cols.extend([c for c in self._prepared_feature_cols if c not in expected_cols])
+                return pd.DataFrame(columns=expected_cols)
 
         new_df = pd.DataFrame(rows).sort_values("datetime").reset_index(drop=True)
 
@@ -1579,6 +1556,7 @@ class M1OutputCacheBuilder:
                 combo.to_parquet(self.cache.cache_path, engine=self.cache.engine, index=False, **write_kwargs)
 
         return combo.sort_values("datetime").reset_index(drop=True)
+
 
 class TradeSimulator:
     """
@@ -1630,14 +1608,19 @@ class TradeSimulator:
             log_every_bars: int = 250,
             use_tqdm: bool = False,
             m2_model=None,
-            n_estimators=700,
+            n_estimators=100,
+            n_childs=500,
+            max_depth=6,
+            num_leaves=40,
             start_date="2024-01-01",
             end_date="",
             enable_withdrawals: bool = True,  # Nuevo parámetro
-            m2_df: pd.DataFrame = None
+            m2_df: pd.DataFrame = None,
+            both_directions_predit=False,
+            shap_check_enable=False
     ):
         assert {"datetime", "open", "high", "low", "close"}.issubset(candles.columns), \
-            "El DataFrame de velas debe contener: datetime, open, high, low, close"
+            "El DataFrame de 11velas debe contener: datetime, open, high, low, close"
         self.analyzer = analyzer
         self.df = candles.reset_index(drop=True).copy()
         self.m2_model = m2_model
@@ -1688,9 +1671,14 @@ class TradeSimulator:
         self.log_every_bars = int(log_every_bars)
         self.use_tqdm = bool(use_tqdm)
         self.n_estimators = n_estimators
+        self.n_childs = n_childs
+        self.max_depth = max_depth
+        self.num_leaves = num_leaves
         self.start_date = start_date
         self.end_date = end_date
         self.enable_withdrawals = enable_withdrawals  # Guardar parámetro
+        self.both_directions_predit = both_directions_predit  # Guardar parámetro
+        self.shap_check_enable = shap_check_enable
 
         global fees
         fees = bybit_fees
@@ -1701,7 +1689,7 @@ class TradeSimulator:
 
         self.trades: List[Trade] = []
         self.logs: List[str] = []
-        
+
         # Sistema de retiros automáticos
         self.initial_equity_for_withdrawals = float(initial_equity)
         self.withdrawn_capital = 0.0  # Capital total retirado
@@ -1750,6 +1738,32 @@ class TradeSimulator:
         """
         self.analyzer.data = train_df.copy()
         N_KEEP = min(len(train_df), self.n_keep_for_fit)
+
+        # Para optimizar M1, usamos bloques cronológicos (30 pruebas bastan para hallar el core)
+
+        # model_kwargs_simple = {        #     "objective": "multiclass",
+        #     "num_class": 3,  # ajusta según tus clases reales
+        #
+        #     "class_weight": "balanced",
+        #     "random_state": 42,
+        #     "n_jobs": -1,
+        #     "verbosity": -1,
+        #     'num_leaves': 57, 'min_child_samples': 110, 'n_estimators': 530
+        #     # "n_estimators": self.n_estimators,  # más árboles + LR más bajo
+        #     # "min_child_samples": self.n_childs,  # regularización clave con 220k filas
+        #     # "max_depth": self.max_depth,  # Muy importante: árboles poco profundos. > 6 es suicidio en crypto.
+        #     # "num_leaves": self.num_leaves,
+        # }
+        model_kwargs_simple = {
+            "objective": "multiclass",
+            "num_class": 3,  # ajusta según tus clases reales
+            # 'class_weight': 'balanced',
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbosity": -1,
+            'max_depth': 6, 'num_leaves': 10, 'min_child_samples': 40, 'n_estimators': 1000, 'learning_rate': 0.03, 'subsample': 1.0, 'colsample_bytree': 1.0
+            #
+        }
         if self.suppress_fit_stdout:
             import io, contextlib
             buf = io.StringIO()
@@ -1764,33 +1778,93 @@ class TradeSimulator:
                 #                                       })
                 #
                 # # LGBM con beta
+                model_kwargs_ = {
+                    "objective": "multiclass",
+                    "num_class": 3,  # ajusta según tus clases reales
+                    "n_estimators": self.n_estimators,  # más árboles + LR más bajo
+                    "learning_rate": 0.02,  # más bajo para mejorar logloss
+                    "max_depth": self.max_depth,  # Muy importante: árboles poco profundos. > 6 es suicidio en crypto.
+                    "num_leaves": self.num_leaves,
+                    # Siempre debe ser menor a 2^max_depth (2^5 = 32). 24 es un buen balance.
+
+                    "min_child_samples": self.n_childs,  # regularización clave con 220k filas
+
+                    # "subsample": 0.7,  # antes 0.9, bajamos para más robustez
+                    # "subsample_freq": 1,
+                    # "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
+                    #
+                    # "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
+                    # "reg_alpha": 0.1,  # L1 ligera
+                    "class_weight": "balanced",
+                    #
+                    # "min_split_gain": 0.0,
+                    "random_state": 42,
+                    "n_jobs": -1,
+                    "verbosity": -1,
+                }
+
+                model_kwards_experimental = {
+                    # 1. Control estricto de la complejidad (Crucial para trading)
+                    "max_depth": self.max_depth,  # Muy importante: árboles poco profundos. > 6 es suicidio en crypto.
+                    "num_leaves": self.num_leaves,
+                    # Siempre debe ser menor a 2^max_depth (2^5 = 32). 24 es un buen balance.
+
+                    # 2. Regularización extrema (Evita que el modelo se aprenda el ruido)
+                    # 400K filas son muchas, exigimos que cada hoja del árbol tenga al menos 1000 ejemplos para validar un patrón.
+                    "min_child_samples": self.n_childs,
+
+                    # 3. Muestreo Aleatorio (Bagging & Subsampling) -> Enseña cosas distintas a cada árbol
+                    "subsample": 0.6,  # Cada árbol usa solo el 60% de las filas aleatoriamente
+                    "subsample_freq": 1,  # Aplica el subsample en cada iteración
+                    "colsample_bytree": 0.5,
+                    # Usa solo la mitad de los features (aprox 32) por cada árbol. Obliga al modelo a no depender solo de la regresión lineal.
+
+                    # 4. Velocidad de aprendizaje y cantidad de árboles
+                    "learning_rate": 0.02,  # Aprendizaje lento y constante
+                    "n_estimators": self.n_estimators,
+                    # Con 0.02 de LR, 400-500 árboles son suficientes para converger sin sobreajustar.
+
+                    # 5. Penalizaciones matemáticas
+                    "reg_alpha": 0.5,  # L1 Regularization: Apaga features que no sirven para nada
+                    "reg_lambda": 1.5,  # L2 Regularization: Suaviza los pesos de los features fuertes
+
+                    # 6. Balanceo de clases (opcional pero muy recomendado)
+                    # Como tienes TP a 4xATR y SL a 3xATR, vas a tener muchos "lateral" o "stop loss".
+                    "class_weight": "balanced",
+                    # Ayuda a que el modelo le preste atención a los aciertos (TP) aunque sean minoría.
+
+                    # 7. Configuración de Hardware/Backbone
+                    "n_jobs": -1,  # Usar todos los núcleos del procesador
+                    "random_state": 42,
+                    "verbosity": -1
+                }
+
+                # model_kwargs_simple = {
+                #     "objective": "multiclass",
+                #     "num_class": 3,  # ajusta según tus clases reales
+                #     "n_estimators": self.n_estimators,  # más árboles + LR más bajo
+                #     "min_child_samples": self.n_childs,  # regularización clave con 220k filas
+                #     "class_weight": "balanced",
+                #     "random_state": 42,
+                #     "n_jobs": -1,
+                #     "verbosity": -1,
+                # }
+
+                defaults_simple = dict(
+                    random_state=42,
+                    n_jobs=-1,
+                    verbosity=-1
+                )
+
                 self.analyzer.create_predictive_model(
                     model_type="lgbm",
-                    calibrate_method="beta",
+                    calibrate_method="sigmoid",
                     N_KEEP=N_KEEP,
                     display_graphic=False,
-                    model_kwargs={
-                        "objective": "multiclass",
-                        "num_class": 3,  # ajusta según tus clases reales
-                        "n_estimators": self.n_estimators,  # más árboles + LR más bajo
-                        "learning_rate": 0.03,  # más bajo para mejorar logloss
-                        "num_leaves": 96,  # complejidad del árbol
-                        "max_depth": -1,  # deja que LGBM lo maneje
-                        "min_child_samples": 200,  # regularización clave con 220k filas
-
-                        "subsample": 0.7,  # antes 0.9, bajamos para más robustez
-                        "subsample_freq": 1,
-                        "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
-
-                        "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
-                        "reg_alpha": 0.1,  # L1 ligera
-
-                        "min_split_gain": 0.0,
-                        "random_state": 42,
-                        "n_jobs": -1
-                    },
+                    model_kwargs=model_kwargs_simple,
                     display_feature_plot=False,
-                    use_df_parquet=True
+                    use_df_parquet=True,
+                    display_shap=self.shap_check_enable,
                 )
 
                 # XGB con beta (usa LabelEncoder interno)
@@ -1821,7 +1895,7 @@ class TradeSimulator:
         else:
 
             # RF con beta # isotonic, sigmoid, beta
-            # self.analyzer.create_predictive_model(model_type="rf", calibrate_method="sigmoid", N_KEEP=N_KEEP,
+            # self.analyzer.create_predictive_model(model_type="rf", calibrate_method="beta", N_KEEP=N_KEEP,
             #                                       model_kwargs={
             #                                           "n_estimators": self.n_estimators,
             #                                           "max_features": "sqrt",
@@ -1830,33 +1904,43 @@ class TradeSimulator:
             #                                       })
 
             #
+            model_kwargs_ = {
+                "objective": "multiclass",
+                "num_class": 3,  # ajusta según tus clases reales
+                "n_estimators": self.n_estimators,  # más árboles + LR más bajo
+                "learning_rate": 0.03,  # más bajo para mejorar logloss
+                "num_leaves": 96,  # complejidad del árbol
+                "max_depth": -1,  # deja que LGBM lo maneje
+                "min_child_samples": 200,  # regularización clave con 220k filas
+
+                "subsample": 0.7,  # antes 0.9, bajamos para más robustez
+                "subsample_freq": 1,
+                "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
+
+                "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
+                "reg_alpha": 0.1,  # L1 ligera
+
+                "min_split_gain": 0.0,
+                "random_state": 42,
+                "n_jobs": -1,
+                "verbosity": -1,
+            }
+
+            defaults_simple = dict(
+                random_state=42,
+                n_jobs=-1,
+                verbosity=-1
+            )
+
             self.analyzer.create_predictive_model(
-                    model_type="lgbm",
-                    calibrate_method="sigmoid",
-                    N_KEEP=N_KEEP,
-                    display_graphic=False,
-                    model_kwargs={
-                        "objective": "multiclass",
-                        "num_class": 3,  # ajusta según tus clases reales
-                        "n_estimators": self.n_estimators,  # más árboles + LR más bajo
-                        "learning_rate": 0.03,  # más bajo para mejorar logloss
-                        "num_leaves": 96,  # complejidad del árbol
-                        "max_depth": -1,  # deja que LGBM lo maneje
-                        "min_child_samples": 200,  # regularización clave con 220k filas
-
-                        "subsample": 0.7,  # antes 0.9, bajamos para más robustez
-                        "subsample_freq": 1,
-                        "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
-
-                        "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
-                        "reg_alpha": 0.1,  # L1 ligera
-
-                        "min_split_gain": 0.0,
-                        "random_state": 42,
-                        "n_jobs": -1
-                    },
-                    display_feature_plot=False,
-                    use_df_parquet=True
+                model_type="lgbm",
+                calibrate_method="sigmoid",
+                N_KEEP=N_KEEP,
+                display_graphic=False,
+                model_kwargs=model_kwargs_simple,
+                display_feature_plot=False,
+                use_df_parquet=True,
+                display_shap=self.shap_check_enable,
             )
 
             # # XGB con beta (usa LabelEncoder interno)
@@ -1908,12 +1992,48 @@ class TradeSimulator:
         # df_win = self.df.loc[start_i:i, ["datetime", "open", "high", "low", "close", "volume"]].copy()
         df_ready = self.df.loc[start_i:i]
 
-
         features = FEATURES
         if df_ready.empty:
             return None
         last_row_feat = df_ready[features].iloc[-1:]
         last_meta = df_ready.iloc[-1]
+        #
+        # last_row_feat['price_change'] = float('nan')
+        #
+        # price_change_original = df_ready["price_change"].iloc[-1]
+        # price_changelr_original = df_ready["price_change_lr5"].iloc[-1]
+        # # last_price_change = df_ready['close'].iloc[-1] - df_ready['close'].iloc[-2]
+        # # last_price_change2 = df_ready['close'].iloc[-2] - df_ready['close'].iloc[-1]
+        #
+        # price_change_df = df_ready['price_change'].copy()
+        # price_change_df.iloc[-1] = float('nan')
+        #
+        # def fast_linear_regression_slope(series, window=5):
+        #     """Calcula la pendiente de la regresión lineal de forma vectorizada (ultrarrápida)"""
+        #     y = series
+        #     x = pd.Series(np.arange(len(series)), index=series.index)
+        #
+        #     # Cálculo de promedios móviles
+        #     x_mean = x.rolling(window=window).mean()
+        #     y_mean = y.rolling(window=window).mean()
+        #
+        #     # Covarianza y varianza móvil
+        #     xy_mean = (x * y).rolling(window=window).mean()
+        #     x_squared_mean = (x ** 2).rolling(window=window).mean()
+        #
+        #     covariance = xy_mean - (x_mean * y_mean)
+        #     variance = x_squared_mean - (x_mean ** 2)
+        #
+        #     # Retorna la pendiente (m)
+        #     slope = covariance / variance
+        #     return slope
+        #
+        #     # Creamos modelos de regresión lineal para múltiples ventanas de tiempo
+        #     # (5, 10 y 20 velas) para capturar micro, corta y mediana tendencia
+        #
+        # pred_price_change_lr5 = fast_linear_regression_slope(price_change_df, window=5)
+        # price_change_lr5 = pred_price_change_lr5.iloc[-2]
+        # last_row_feat['price_change'] = price_change_lr5
 
         # escalar + predecir
         last_scaled = self.analyzer.scaler.transform(last_row_feat)
@@ -1927,7 +2047,7 @@ class TradeSimulator:
                 default_class="lateral", global_floor=0.5, min_margin=0.03
             )
         else:
-            # fallback simple
+        # fallback simple
             best_idx = int(np.argmax(proba_vec))
             pred_class = classes[best_idx]
 
@@ -1945,18 +2065,15 @@ class TradeSimulator:
         top2 = ordered[1] if len(ordered) > 1 else 0.0
         margin = top1 - top2
 
-
         pred = pred_class
         if pred in ("bullish", "bearish") and getattr(self, "m2_model", None) is not None:
             try:
                 # Determinar set de features para M2
-                feats_m2 = FEATURES + FEATS_M2
+                feats_m2 = FEATURES_M2 + FEATS_M2
 
                 # Construir vector x_m2 con orden exacto
                 # Fuente principal: última fila de df_ready (ya con tus features preparados)
                 src_series = df_ready.iloc[-1]
-
-
 
                 x_dict = {}
                 # soporte para direction_sign / dummies
@@ -1981,7 +2098,7 @@ class TradeSimulator:
                         # Si falta, deja NaN para detección
                         x_dict[f] = np.nan
 
-                x_dict['price_change'] = df_ready["price_change"].iloc[-2]
+                # x_dict['price_change'] = price_change_lr5
                 # Verifica NaNs
                 x_vals = [x_dict[f] for f in feats_m2]
                 if any([not np.isfinite(v) for v in x_vals]):
@@ -1989,10 +2106,30 @@ class TradeSimulator:
                     raise RuntimeError(
                         f"Features M2 con NaN/inf en inferencia: {[feats_m2[i] for i, v in enumerate(x_vals) if not np.isfinite(v)]}")
 
+                # x_dict['price_change'] = float('nan')
                 X_m2 = np.array([x_vals], dtype="float32")
-
                 # Inferencia M2 (RF no requiere scaler)
                 proba_m2 = self.m2_model.predict_proba(X_m2)[0]  # [p0, p1]
+
+                if self.both_directions_predit:
+                    x_dict['direction_sign'] = 1.0
+                    x_dict['p_hat'] = probabilities['bullish']
+                    x_vals_bullish = [x_dict[f] for f in feats_m2]
+                    X_m2_bullish = np.array([x_vals_bullish], dtype="float32")
+                    proba_m2_bullish = self.m2_model.predict_proba(X_m2_bullish)[0]  # [p0, p1]
+
+                    x_dict['direction_sign'] = -1.0
+                    x_dict['p_hat'] = probabilities['bearish']
+                    x_vals_bearish = [x_dict[f] for f in feats_m2]
+                    X_m2_bearish = np.array([x_vals_bearish], dtype="float32")
+                    proba_m2_bearish = self.m2_model.predict_proba(X_m2_bearish)[0]  # [p0, p1]
+                    if proba_m2_bullish[1] > proba_m2_bearish[1]:
+                        proba_m2 = proba_m2_bullish
+                        pred = 'bullish'
+                    else:
+                        proba_m2 = proba_m2_bearish
+                        pred = 'bearish'
+
                 p_meta = float(np.clip(proba_m2[1], 0.0, 1.0))  # prob. de “saldrá bien”
                 p_meta_used = round(p_meta, 4)
 
@@ -2050,7 +2187,7 @@ class TradeSimulator:
         in_day = start <= ts.time() <= end
         thresh = self.proba_threshold_day if in_day else self.proba_threshold_night
         # return proba is not None and thresh <= float(proba)
-        return proba is not None and float(proba) >= thresh < 0.97
+        return proba is not None and 0.82 > float(proba) >= thresh
 
     def _tp_sl_from_adapter_or_atr(self, i: int, proba: int, side: Literal["long", "short"],
                                    maybe_tp: Optional[float], maybe_sl: Optional[float]) -> Tuple[float, float]:
@@ -2070,15 +2207,10 @@ class TradeSimulator:
         if self.use_adapter_tp_sl_when_missing and (maybe_tp is not None) and (maybe_sl is not None):
             return float(maybe_tp), float(maybe_sl)
         atr = float(self.df.loc[i, "ATR"]) if not np.isnan(self.df.loc[i, "ATR"]) else px * 0.005
-        ema_200 = float(self.df.loc[i, "EMA_200"])
         if side == "long":
-            # if px < ema_200 and not (h0 > 0 and s0 > s1):
-            #     self.atr_mult_tp = 3
             tp = px + self.atr_mult_tp * atr
             sl = px - self.atr_mult_sl * atr
         else:
-            # if px > ema_200 and not (h1 < 0 and s0 < s1):
-            #     self.atr_mult_tp = 3
             tp = px - self.atr_mult_tp * atr
             sl = px + self.atr_mult_sl * atr
 
@@ -2126,17 +2258,17 @@ class TradeSimulator:
     def _check_and_process_withdrawal(self, current_time: pd.Timestamp) -> bool:
         """
         Verifica si el equity ha alcanzado el objetivo de duplicación y procesa un retiro.
-        
+
         Lógica:
         - Cada vez que equity >= last_withdrawal_target (el doble del punto anterior)
         - capital_total = withdrawn_capital + equity
         - withdrawal_amount = capital_total / 2
         - Se retira esa cantidad, actualizando equity y withdrawn_capital
         - El nuevo objetivo es equity * 2
-        
+
         Args:
             current_time: Timestamp del momento del retiro
-            
+
         Returns:
             True si se procesó un retiro, False si no
         """
@@ -2146,23 +2278,23 @@ class TradeSimulator:
 
         if self.equity < self.last_withdrawal_target:
             return False
-        
+
         # Calcular capital total
         capital_total = self.withdrawn_capital + self.equity
-        
+
         # Calcular monto a retirar (mitad del total)
         withdrawal_amount = capital_total / 2.0
-        
+
         # Guardar estado previo para logging
         equity_before = self.equity
-        
+
         # Actualizar valores
         self.equity -= withdrawal_amount
         self.withdrawn_capital += withdrawal_amount
-        
+
         # Actualizar próximo objetivo (cuando el equity actual se duplique)
         self.last_withdrawal_target = self.equity * 2.0
-        
+
         # Registrar el retiro
         withdrawal_record = {
             'timestamp': current_time,
@@ -2174,11 +2306,11 @@ class TradeSimulator:
             'next_target': self.last_withdrawal_target
         }
         self.withdrawals.append(withdrawal_record)
-        
+
         # Evento de retiro (si hay callback)
         if self.on_event:
             self.on_event("withdrawal", withdrawal_record)
-        
+
         # Log si verbose
         if self.verbose >= 1:
             print(f"💰 RETIRO @ {current_time} | "
@@ -2186,9 +2318,141 @@ class TradeSimulator:
                   f"Equity: ${equity_before:.2f} → ${self.equity:.2f} | "
                   f"Total withdrawn=${self.withdrawn_capital:.2f} | "
                   f"Next target=${self.last_withdrawal_target:.2f}")
-        
+
         return True
 
+    def _update_m2_model(self, train_slice: pd.DataFrame):
+        try:
+            # 1. Crear builder con skip_fit=True para usar el modelo M1 actual del analyzer
+            #    OJO: train_slice ya tiene las velas hasta el punto actual.
+            #    Necesitamos definir test_start / test_end para que build_and_cache genere
+            #    las predicciones sobre esa ventana.
+            if len(train_slice) < 200:
+                return
+
+            # Determinamos el rango de predicción (M1 output generation)
+            # Por defecto, usamos el inicio del train_slice
+            t0 = train_slice["datetime"].iloc[0]
+            t1 = train_slice["datetime"].iloc[-1]
+
+            # Si ya tenemos m2_df, solo generamos lo nuevo (desde el último datetime conocido)
+            if self.m2_df is not None and not self.m2_df.empty:
+                last_m2_dt = self.m2_df["datetime"].max()
+                # Si el train_slice cubre más allá de lo que tenemos, la fecha de inicio es la última conocida
+                # (build_and_cache usará mask >= start, así que incluiremos esa vela y luego deduplicamos)
+                if last_m2_dt >= t0:
+                    t0 = last_m2_dt
+
+            # Ajuste de fechas a string para build_and_cache
+            ts_start = t0.strftime("%Y-%m-%d %H:%M:%S")
+            ts_end = t1.strftime("%Y-%m-%d %H:%M:%S")
+
+            builder = M1OutputCacheBuilder(
+                self.analyzer,
+                train_slice,  # Pasamos el slice actual como 'df'
+                proba_threshold=0.20,
+                atr_period=14,
+                atr_mult_tp=5.5,
+                atr_mult_sl=3.0,
+                offline_lookback_bars=200,
+                n_keep_for_fit=len(train_slice),  # Usar todo el slice
+                cache=None  # No queremos cache en disco para esto
+            )
+
+            # 2. Generar M2 features (output M1)
+            #    skip_fit=True evita reentrenar M1 (asumimos que tradeSimulator ya lo hizo o usa el vigente)
+            #    export_parquet=False para no escribir en disco
+            new_m2_data = builder.build_and_cache(
+                test_start=ts_start,
+                test_end=ts_end,
+                verbose=0,
+                export_parquet=False,
+                skip_fit=True  # FIX: Estaba en False, lo que provocaba reentrenar M1 innecesariamente
+            )
+
+            if new_m2_data is None or new_m2_data.empty:
+                return
+
+            # 3. Actualizar self.m2_df manteniendo tamano fijo (sliding window)
+            #    Si m2_df inicial existe, concatenamos y cortamos.
+            if self.m2_df is not None and not self.m2_df.empty:
+                # Concatenar
+                combined = pd.concat([self.m2_df, new_m2_data], ignore_index=True)
+                # Eliminar duplicados por datetime
+                if "datetime" in combined.columns:
+                    combined = combined.drop_duplicates(subset=["datetime"], keep="last")
+
+                # Mantener un histórico prudente de M2 (aprox 6-12 meses de trades)
+                # Si iniciaste con 7460 filas, max_len será 7500. Si iniciaste vacío, crecerá hasta 7500.
+                max_len = max(len(self.m2_df), 7500)
+
+                if len(combined) > max_len:
+                    self.m2_df = combined.iloc[-max_len:].copy()
+                else:
+                    self.m2_df = combined.copy()
+            else:
+                self.m2_df = new_m2_data.copy()
+
+            # 4. Reentrenar M2
+            features_m2 = FEATURES_M2 + FEATS_M2
+
+            # Validación de columnas
+            missing_cols = [c for c in features_m2 if c not in self.m2_df.columns]
+            if missing_cols:
+                # print(f"[WARN] Faltan columnas en m2_df: {missing_cols}. Se ignorarán.")
+                features_m2 = [c for c in features_m2 if c in self.m2_df.columns]
+
+            if not features_m2:
+                print("[ERROR] No hay features disponibles para entrenar M2.")
+                return
+
+            # Limpieza para entrenamiento:
+            # - Filtrar trades no resueltos (result None/NaN)
+            # - Filtrar filas con NaNs en features
+
+            df_for_train = self.m2_df.copy()
+
+            # 1) Result debe estar definido ('tp' o 'sl')
+            if "result" in df_for_train.columns:
+                df_for_train = df_for_train.dropna(subset=["result"])
+                # Filtrar valores no válidos si los hubiera
+                df_for_train = df_for_train[df_for_train["result"].isin(["tp", "sl"])]
+            else:
+                print("[ERROR] Columna 'result' no encontrada en m2_df.")
+                return
+
+            # 2) Features no deben ser NaN
+            df_for_train = df_for_train.dropna(subset=features_m2)
+
+            if len(df_for_train) < 200:
+                # print(f"[WARN] Insuficientes datos para entrenar M2 tras limpieza (n={len(df_for_train)}). Se omite actualización.")
+                return
+
+            # print(f"Reentrenando M2 model con {len(df_for_train)} filas limpias...")
+
+            # --- MISMO BLOQUE ANTI-OVERFITTING ---
+            m2_kwargs_safe = dict(
+                random_state=42, n_jobs=-1, verbosity=-1,
+                # class_weight="balanced",
+                # max_depth=4, num_leaves=11, min_child_samples=60,
+                # n_estimators=150, learning_rate=0.03,
+                # colsample_bytree=0.8, subsample=0.8
+            )
+
+            self.m2_model = create_predictive_model_m2(
+                df_model=df_for_train,
+                features=features_m2,
+                model_type='lightgbm',
+                model_kwargs=m2_kwargs_safe,  # FIX: Usar parámetros de estrangulamiento
+                calibrate_method="sigmoid",
+                display_graphic=False,
+                return_metrics=False
+            )
+
+        except Exception as e:
+            print(f"[ERROR] Fallo al actualizar modelo M2: {e}")
+            # import traceback
+            # traceback.print_exc()
 
     def run(self, test_start: str, test_end: Optional[str] = None) -> Dict:
         """
@@ -2196,7 +2460,6 @@ class TradeSimulator:
         Por defecto **entrena una sola vez** con el histórico previo a `test_start`.
         Si `retrain_each_bar=True`, reentrena en cada barra antes de predecir.
         """
-
 
         # Alinear test_start / test_end a la misma tz que el DataFrame
         tz = getattr(self, "tz", None)
@@ -2317,10 +2580,16 @@ class TradeSimulator:
                             if self.on_event: self.on_event("fit_start",
                                                             {"phase": "periodic", "pos": pos + 1, "n": n, "from": t0,
                                                              "to": t1})
+                        print("fit_model train_slice")
                         self.fit_model(train_slice)
+
+                        # >>> NUEVO: Actualizar modelo M2 en paralelo
+                        if self.m2_df is not None and self.m2_model is not None:
+                            print("_update_m2_model train_slice")
+                            self._update_m2_model(train_slice)
+
                         if getattr(self, "announce_fit", False):
                             if self.on_event: self.on_event("fit_end", {"phase": "periodic", "pos": pos + 1})
-
 
             # sig = self.get_signal(i)
             # if sig:
@@ -2374,11 +2643,11 @@ class TradeSimulator:
                     pnl = current_trade.pnl_usdt()
                     fees_paid = current_trade.fees_usdt()
                     self.equity += pnl - fees_paid
-                    
+
                     # Verificar si se debe procesar un retiro
                     ts_here = self.df.loc[i, "datetime"]
                     self._check_and_process_withdrawal(ts_here)
-                    
+
                     # Evento de cierre ANTES de limpiar la variable
                     if self.on_event:
                         dur = (current_trade.exit_time - current_trade.entry_time) if (
@@ -2387,6 +2656,58 @@ class TradeSimulator:
                                                 "price": current_trade.exit_price, "pnl": pnl, "fees": fees_paid,
                                                 "equity": self.equity, "entry_time": current_trade.entry_time,
                                                 "duration": dur})
+
+                    # === SHAP automático cuando se pierde por SL ===
+                    if current_trade.exit_reason == "sl" and hasattr(self,
+                                                                     'analyzer') and self.analyzer.model is not None and self.shap_check_enable:
+                        try:
+                            model_wrapped = self.analyzer.model
+                            # Extraer el estimador subyacente (compatible con TreeExplainer)
+                            if hasattr(model_wrapped, 'calibrated_classifiers_'):
+                                base_model = model_wrapped.calibrated_classifiers_[0].estimator
+                            elif hasattr(model_wrapped, 'estimator'):
+                                base_model = model_wrapped.estimator
+                            else:
+                                base_model = model_wrapped
+
+                            # Buscar la fila de entrada en self.df por entry_time
+                            entry_rows = self.df.index[self.df["datetime"] == current_trade.entry_time].tolist()
+                            if entry_rows:
+                                entry_idx = entry_rows[0]
+                                feat_cols = [f for f in FEATURES if f in self.df.columns]
+                                row_df = self.df.loc[[entry_idx], feat_cols]
+                                row_scaled = self.analyzer.scaler.transform(row_df)
+                                row_scaled_df = pd.DataFrame(row_scaled, columns=feat_cols)
+
+                                explainer = shap.TreeExplainer(base_model)
+                                shap_values = explainer.shap_values(row_scaled_df)
+
+                                classes = list(self.analyzer.model.classes_)
+                                pred_class = 'bullish' if current_trade.side == 'long' else 'bearish'
+                                class_idx = classes.index(pred_class) if pred_class in classes else 0
+
+                                if isinstance(shap_values, list):
+                                    sv = shap_values[class_idx][0]
+                                elif len(np.array(shap_values).shape) == 3:
+                                    sv = np.array(shap_values)[0, :, class_idx]
+                                else:
+                                    sv = shap_values[0]
+
+                                feat_impact = sorted(zip(feat_cols, sv), key=lambda x: abs(x[1]), reverse=True)
+                                print(f"\n{'=' * 55}")
+                                print(
+                                    f"💔 SHAP PÉRDIDA ({current_trade.side.upper()}) | PnL={pnl:.2f} | {current_trade.entry_time}")
+                                print(f"{'=' * 55}")
+                                print(f"{'Feature':<35} {'SHAP':>8}  Dir      Valor")
+                                print(f"{'-' * 55}")
+                                for feat, val in feat_impact[:15]:
+                                    direction = '⬆ PUSH' if val > 0 else '⬇ PULL'
+                                    raw = float(self.df.loc[entry_idx, feat]) if feat in self.df.columns else float(
+                                        'nan')
+                                    print(f"{feat:<35} {val:>+8.4f}  {direction}  ({raw:.4f})")
+                                print(f"{'=' * 55}\n")
+                        except Exception as _shap_e:
+                            print(f"[SHAP-Loss] Error: {_shap_e}")
 
                     if self.verbose >= 2:
                         print(
@@ -2416,7 +2737,7 @@ class TradeSimulator:
                         # Use taker fees for both sides as conservative estimate
                         fee_rate = getattr(self.fees, "taker_open", 0.00055)
                         breakeven_price = current_trade.entry_price * (1 + fee_rate) / (1 - fee_rate)
-                        
+
                         bear_p = probs.get("bearish")
                         if (bear_p is not None) and ((float(bear_p) >= self.early_exit_threshold) or (
                                 float(bear_l) >= self.early_exit_threshold + 0.2)) and (
@@ -2442,7 +2763,7 @@ class TradeSimulator:
                     elif current_trade.side == "short" and current_trade.entry_price > 0:
                         fee_rate = getattr(self.fees, "taker_open", 0.00055)
                         breakeven_price = current_trade.entry_price * (1 - fee_rate) / (1 + fee_rate)
-                        
+
                         bull_p = probs.get("bullish")
                         if (bull_p is not None) and ((float(bull_p) >= self.early_exit_threshold) or (
                                 float(bear_l) >= self.early_exit_threshold + 0.2)) and (
@@ -2470,11 +2791,11 @@ class TradeSimulator:
                     pnl = current_trade.pnl_usdt()
                     fees_paid = current_trade.fees_usdt()
                     self.equity += pnl - fees_paid
-                    
+
                     # Verificar si se debe procesar un retiro
                     ts_here = self.df.loc[i, "datetime"]
                     self._check_and_process_withdrawal(ts_here)
-                    
+
                     if self.on_event:
                         dur = (current_trade.exit_time - current_trade.entry_time) if (
                                 current_trade.exit_time and current_trade.entry_time) else None
@@ -2657,6 +2978,7 @@ class TradeSimulator:
             self.trades.append(current_trade)
 
         wins = sum(1 for t in self.trades if t.exit_reason == "tp")
+        e_o = sum(1 for t in self.trades if t.exit_reason == "early_opposite")
         losses = sum(1 for t in self.trades if t.exit_reason == "sl")
         rr = wins / max(1, losses) if (wins + losses) > 0 else None
 
@@ -2695,7 +3017,7 @@ class TradeSimulator:
             print("\n=== Resumen Backtest ===")
             for k, v in metrics.items():
                 print(f"{k:>18}: {v}")
-            
+
             # Mostrar información de retiros si existen
             if hasattr(self, 'withdrawals') and self.withdrawals:
                 print("\n=== Retiros de Capital ===")
@@ -2706,7 +3028,7 @@ class TradeSimulator:
 
         # al final de run():
         self._finalize_and_print_rule_stats()
-        
+
         # Preparar datos de retiros para el retorno
         withdrawal_summary = None
         if hasattr(self, 'withdrawals') and self.withdrawals:
@@ -2720,7 +3042,8 @@ class TradeSimulator:
         return {
             "final_equity": float(self.equity),
             "n_trades": len(self.trades),
-            "wins": wins,
+            "wins": metrics['wins'],
+            "early_opposite": e_o,
             "losses": losses,
             "win_loss_ratio": float(rr) if rr is not None else None,
             "trades": [asdict(t) for t in self.trades],
@@ -2852,6 +3175,7 @@ class TradeSimulator:
             df['exit_time'] = pd.to_datetime(df['exit_time'])
 
         # --- PnL bruto si falta
+
         if 'pnl' not in df.columns and {'entry_price', 'exit_price', 'qty', 'side'}.issubset(df.columns):
             side = df['side'].str.lower()
             pnl_raw = np.where(side.isin(['short', 'bearish']),
@@ -2860,7 +3184,10 @@ class TradeSimulator:
             df['pnl'] = pnl_raw
 
         # --- PnL neto
-        df['pnl_net'] = df['pnl'] - df['fees'] if 'fees' in df.columns else df['pnl']
+        if 'pnl' in df.columns:
+            df['pnl_net'] = df['pnl'] - df['fees'] if 'fees' in df.columns else df['pnl']
+        else:
+            df['pnl_net'] = 0
 
         # --- r-multiple (si no existe y hay SL)
         if build_r_multiple and 'r_multiple' not in df.columns:
@@ -3421,27 +3748,27 @@ class TradeSimulator:
         else:
             rs["breakeven"] += 1
 
-    def plot_performance(self, 
-                        initial_equity: Optional[float] = None,
-                        save_html: Optional[str] = None,
-                        show_plot: bool = True,
-                        height: int = 2400) -> Optional[go.Figure]:
+    def plot_performance(self,
+                         initial_equity: Optional[float] = None,
+                         save_html: Optional[str] = None,
+                         show_plot: bool = True,
+                         height: int = 2400) -> Optional[go.Figure]:
         """
         Genera visualizaciones interactivas del desempeño de la simulación.
-        
+
         Args:
             initial_equity: Capital inicial (si None, usa self.equity final - sum(pnl))
             save_html: Ruta para guardar el gráfico como HTML interactivo
             show_plot: Si True, muestra el gráfico en navegador
             height: Altura total del gráfico en píxeles
-            
+
         Returns:
             Figura de plotly con todos los subplots
         """
         if not self.trades:
             print("⚠️ No hay trades para graficar. Ejecuta run() primero.")
             return None
-        
+
         # Convertir trades a DataFrame
         trades_rows = []
         for t in self.trades:
@@ -3459,7 +3786,7 @@ class TradeSimulator:
                 "fees": t.fees_usdt() if hasattr(t, "fees_usdt") else 0,
                 "pnl": t.pnl_usdt() if hasattr(t, "pnl_usdt") else 0,
             })
-        
+
         df_trades = pd.DataFrame(trades_rows)
         df_trades['entry_time'] = pd.to_datetime(df_trades['entry_time'])
         df_trades['exit_time'] = pd.to_datetime(df_trades['exit_time'])
@@ -3468,19 +3795,19 @@ class TradeSimulator:
             lambda x: 'win' if x > 0 else ('loss' if x < 0 else 'breakeven')
         )
         df_trades['duration_min'] = (df_trades['exit_time'] - df_trades['entry_time']).dt.total_seconds() / 60
-        
+
         # Calcular equity curve
         if initial_equity is None:
             initial_equity = 1000.0  # Default
-        
+
         df_trades = df_trades.sort_values('exit_time').reset_index(drop=True)
         df_trades['equity'] = initial_equity + df_trades['pnl_net'].cumsum()
         df_trades['cumulative_pnl'] = df_trades['pnl_net'].cumsum()
-        
+
         # Calcular drawdown
         running_max = df_trades['equity'].expanding().max()
         df_trades['drawdown'] = (df_trades['equity'] - running_max) / running_max * 100
-        
+
         # Crear subplots
         fig = make_subplots(
             rows=6, cols=2,
@@ -3503,7 +3830,7 @@ class TradeSimulator:
             horizontal_spacing=0.1,
             row_heights=[0.15, 0.15, 0.15, 0.15, 0.20, 0.20]
         )
-        
+
         # 1. Curva de Equity
         fig.add_trace(
             go.Scatter(
@@ -3516,16 +3843,16 @@ class TradeSimulator:
             ),
             row=1, col=1
         )
-        
+
         # Línea de equity inicial
         fig.add_hline(
-            y=initial_equity, 
-            line_dash="dash", 
-            line_color="gray", 
+            y=initial_equity,
+            line_dash="dash",
+            line_color="gray",
             opacity=0.5,
             row=1, col=1
         )
-        
+
         # ====== VISUALIZACIÓN DE RETIROS ======
         if hasattr(self, 'withdrawals') and self.withdrawals:
             # Agregar marcadores verticales para cada retiro
@@ -3541,23 +3868,23 @@ class TradeSimulator:
                     annotation_text=f"💰${withdrawal['amount']:.0f}",
                     annotation_position="top"
                 )
-            
+
             # Crear DataFrame de retiros para agregar línea de capital total
             df_withdrawals = pd.DataFrame(self.withdrawals)
             df_withdrawals['timestamp'] = pd.to_datetime(df_withdrawals['timestamp'])
-            
+
             # Construir serie de capital total (equity + withdrawn) a lo largo del tiempo
             # Necesitamos sincronizar con df_trades para tener puntos en el tiempo
             df_total_capital = df_trades[['exit_time', 'equity']].copy()
             df_total_capital['total_capital'] = df_total_capital['equity']
-            
+
             # Para cada punto en el tiempo, sumar el capital retirado acumulado hasta ese momento
             for idx in df_total_capital.index:
                 exit_time = df_total_capital.loc[idx, 'exit_time']
                 # Sumar todos los retiros que ocurrieron antes o en este momento
                 withdrawn_so_far = df_withdrawals[df_withdrawals['timestamp'] <= exit_time]['amount'].sum()
                 df_total_capital.loc[idx, 'total_capital'] += withdrawn_so_far
-            
+
             # Agregar línea de capital total (semi-transparente)
             fig.add_trace(
                 go.Scatter(
@@ -3572,7 +3899,6 @@ class TradeSimulator:
                 row=1, col=1
             )
 
-        
         # 2. Drawdown
         fig.add_trace(
             go.Scatter(
@@ -3586,7 +3912,7 @@ class TradeSimulator:
             ),
             row=1, col=2
         )
-        
+
         # 3. PnL por Trade
         colors = df_trades['result'].map({'win': '#06D6A0', 'loss': '#EF476F', 'breakeven': '#FFC43D'})
         fig.add_trace(
@@ -3600,7 +3926,7 @@ class TradeSimulator:
             ),
             row=2, col=1
         )
-        
+
         # 4. PnL Acumulado
         fig.add_trace(
             go.Scatter(
@@ -3614,7 +3940,7 @@ class TradeSimulator:
             ),
             row=2, col=2
         )
-        
+
         # 5. Win Rate por Período (ventana móvil)
         window = 20
         if len(df_trades) >= window:
@@ -3632,16 +3958,16 @@ class TradeSimulator:
                 ),
                 row=3, col=1
             )
-            
+
             # Línea de 50%
             fig.add_hline(
-                y=50, 
-                line_dash="dash", 
-                line_color="gray", 
+                y=50,
+                line_dash="dash",
+                line_color="gray",
                 opacity=0.5,
                 row=3, col=1
             )
-        
+
         # 6. Duración de Trades
         colors_duration = df_trades['result'].map({'win': '#06D6A0', 'loss': '#EF476F', 'breakeven': '#FFC43D'})
         fig.add_trace(
@@ -3660,7 +3986,7 @@ class TradeSimulator:
             ),
             row=3, col=2
         )
-        
+
         # 7. Distribución de PnL (Histograma)
         fig.add_trace(
             go.Histogram(
@@ -3672,7 +3998,7 @@ class TradeSimulator:
             ),
             row=4, col=1
         )
-        
+
         # 8. Trades por Exit Reason
         exit_counts = df_trades['exit_reason'].value_counts()
         fig.add_trace(
@@ -3680,18 +4006,18 @@ class TradeSimulator:
                 x=exit_counts.index,
                 y=exit_counts.values,
                 name='Exit Reason',
-                marker_color=['#06D6A0' if r == 'tp' else '#EF476F' if r == 'sl' else '#FFC43D' 
-                             for r in exit_counts.index],
+                marker_color=['#06D6A0' if r == 'tp' else '#EF476F' if r == 'sl' else '#FFC43D'
+                              for r in exit_counts.index],
                 hovertemplate='%{x}: %{y} trades<extra></extra>'
             ),
             row=4, col=2
         )
-        
+
         # 9. Precio con Entradas/Salidas
         # Tomar últimos N datos para no saturar el gráfico
         n_candles = min(500, len(self.df))
         df_plot = self.df.tail(n_candles).copy()
-        
+
         fig.add_trace(
             go.Scatter(
                 x=df_plot['datetime'],
@@ -3703,11 +4029,11 @@ class TradeSimulator:
             ),
             row=5, col=1
         )
-        
+
         # Marcar entradas y salidas
         df_entries = df_trades[df_trades['entry_time'].isin(df_plot['datetime'])]
         df_exits = df_trades[df_trades['exit_time'].isin(df_plot['datetime'])]
-        
+
         # Entradas Long
         entries_long = df_entries[df_entries['side'] == 'long']
         if not entries_long.empty:
@@ -3722,7 +4048,7 @@ class TradeSimulator:
                 ),
                 row=5, col=1
             )
-        
+
         # Entradas Short
         entries_short = df_entries[df_entries['side'] == 'short']
         if not entries_short.empty:
@@ -3737,9 +4063,10 @@ class TradeSimulator:
                 ),
                 row=5, col=1
             )
-        
+
         # Salidas (TP en verde, SL en rojo, otros en amarillo)
-        for reason, color, symbol in [('tp', '#06D6A0', 'star'), ('sl', '#EF476F', 'x'), ('early_opposite', '#FFC43D', 'circle')]:
+        for reason, color, symbol in [('tp', '#06D6A0', 'star'), ('sl', '#EF476F', 'x'),
+                                      ('early_opposite', '#FFC43D', 'circle')]:
             exits_filtered = df_exits[df_exits['exit_reason'] == reason]
             if not exits_filtered.empty:
                 fig.add_trace(
@@ -3753,7 +4080,7 @@ class TradeSimulator:
                     ),
                     row=5, col=1
                 )
-        
+
         # 10. Probabilidad vs PnL (scatter para ver correlación)
         df_with_proba = df_trades.dropna(subset=['entry_proba'])
         if not df_with_proba.empty:
@@ -3775,22 +4102,22 @@ class TradeSimulator:
                 ),
                 row=6, col=1
             )
-        
+
         # 11. Win Rate por Bucket de Probabilidad
         if not df_with_proba.empty:
             # Crear buckets de probabilidad
             df_with_proba['proba_bucket'] = pd.cut(
-                df_with_proba['entry_proba'], 
+                df_with_proba['entry_proba'],
                 bins=[0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
                 labels=['0.0-0.5', '0.5-0.6', '0.6-0.7', '0.7-0.8', '0.8-0.9', '0.9-1.0']
             )
-            
+
             bucket_stats = df_with_proba.groupby('proba_bucket').agg({
                 'result': lambda x: (x == 'win').sum() / len(x) * 100,
                 'pnl_net': 'count'
             }).reset_index()
             bucket_stats.columns = ['proba_bucket', 'win_rate', 'count']
-            
+
             fig.add_trace(
                 go.Bar(
                     x=bucket_stats['proba_bucket'].astype(str),
@@ -3804,16 +4131,16 @@ class TradeSimulator:
                 ),
                 row=6, col=2
             )
-            
+
             # Línea de 50%
             fig.add_hline(
-                y=50, 
-                line_dash="dash", 
-                line_color="gray", 
+                y=50,
+                line_dash="dash",
+                line_color="gray",
                 opacity=0.5,
                 row=6, col=2
             )
-        
+
         # Actualizar layout
         # Construir título con información de retiros si existen
         title_parts = [
@@ -3821,16 +4148,17 @@ class TradeSimulator:
             f"<sup>Trades: {len(self.trades)} | Final Equity: ${df_trades['equity'].iloc[-1]:.2f} | ",
             f"Win Rate: {(df_trades['result'] == 'win').sum() / len(df_trades) * 100:.1f}%"
         ]
-        
+
         if hasattr(self, 'withdrawals') and self.withdrawals:
             total_withdrawn = self.withdrawn_capital
             n_withdrawals = len(self.withdrawals)
             total_capital = df_trades['equity'].iloc[-1] + total_withdrawn
-            title_parts.append(f" | 💰 Retirado: ${total_withdrawn:.2f} ({n_withdrawals} retiros) | Capital Total: ${total_capital:.2f}")
-        
+            title_parts.append(
+                f" | 💰 Retirado: ${total_withdrawn:.2f} ({n_withdrawals} retiros) | Capital Total: ${total_capital:.2f}")
+
         title_parts.append("</sup>")
         title_text = "".join(title_parts)
-        
+
         fig.update_layout(
             height=height,
             title_text=title_text,
@@ -3839,50 +4167,50 @@ class TradeSimulator:
             template='plotly_white',
             font=dict(size=10)
         )
-        
+
         # Actualizar ejes
         fig.update_xaxes(title_text="Tiempo", row=1, col=1)
         fig.update_yaxes(title_text="Equity ($)", row=1, col=1)
-        
+
         fig.update_xaxes(title_text="Tiempo", row=1, col=2)
         fig.update_yaxes(title_text="Drawdown (%)", row=1, col=2)
-        
+
         fig.update_xaxes(title_text="Trade #", row=2, col=1)
         fig.update_yaxes(title_text="PnL ($)", row=2, col=1)
-        
+
         fig.update_xaxes(title_text="Tiempo", row=2, col=2)
         fig.update_yaxes(title_text="PnL Acumulado ($)", row=2, col=2)
-        
+
         fig.update_xaxes(title_text="Tiempo", row=3, col=1)
         fig.update_yaxes(title_text="Win Rate (%)", row=3, col=1)
-        
+
         fig.update_xaxes(title_text="Trade #", row=3, col=2)
         fig.update_yaxes(title_text="Duración (min)", row=3, col=2)
-        
+
         fig.update_xaxes(title_text="PnL Net ($)", row=4, col=1)
         fig.update_yaxes(title_text="Frecuencia", row=4, col=1)
-        
+
         fig.update_xaxes(title_text="Exit Reason", row=4, col=2)
         fig.update_yaxes(title_text="Count", row=4, col=2)
-        
+
         fig.update_xaxes(title_text="Tiempo", row=5, col=1)
         fig.update_yaxes(title_text="Precio", row=5, col=1)
-        
+
         fig.update_xaxes(title_text="Probabilidad", row=6, col=1)
         fig.update_yaxes(title_text="PnL Net ($)", row=6, col=1)
-        
+
         fig.update_xaxes(title_text="Bucket de Probabilidad", row=6, col=2)
         fig.update_yaxes(title_text="Win Rate (%)", row=6, col=2)
-        
+
         # Guardar si se especificó
         if save_html:
             fig.write_html(save_html)
             print(f"✅ Gráfico guardado en: {save_html}")
-        
+
         # Mostrar si se especificó
         if show_plot:
             fig.show()
-        
+
         return fig
 
 
@@ -4388,7 +4716,8 @@ def select_features_by_correlation(
 
 
 class StochasticAnalyzer:
-    def __init__(self, api_key=None, api_secret=None, atr_mult=4, atr_stop=3, m2_model=None, data=None, early_exit_threshold = 0.95, lookahead = 70):
+    def __init__(self, api_key=None, api_secret=None, atr_mult=4.0, atr_stop=3.0, m2_model=None, data=None,
+                 early_exit_threshold=0.95, lookahead=70):
         self.umbral_strong = None
         self.umbral_soft = None
         self.min_margin = 0.05
@@ -4520,7 +4849,7 @@ class StochasticAnalyzer:
                 except ValueError as e:
                     print(f"Error decoding JSON (private look-back). Status: {r.status_code}, Body: {r.text[:500]}")
                     raise e
-                    
+
                 if data["retCode"] == 0 and data["result"]["list"]:
                     for k in data["result"]["list"]:
                         all_data.append({
@@ -4912,7 +5241,14 @@ class StochasticAnalyzer:
             return macd_line, signal_line, histogram
 
         eps = 1e-9  # para evitar divisiones por cero
-        df["macd"], df["macd_signal"], df["macd_hist"] = calculate(df["close"])
+        _macd_raw, _signal_raw, _hist_raw = calculate(df["close"])
+        # Normalizar MACD por precio de cierre → convierte dólares absolutos en % del precio.
+        # Sin esto, un MACD de $500 en BTC@$100k y $15 en BTC@$30k serían "señales distintas"
+        # cuando en realidad son proporcionales. División por close los hace estacionarios.
+        _close_safe = df["close"].replace(0, np.nan).abs()
+        df["macd"] = _macd_raw / (_close_safe + eps)
+        df["macd_signal"] = _signal_raw / (_close_safe + eps)
+        df["macd_hist"] = _hist_raw / (_close_safe + eps)
         vwap = (df['close'] * df['volume']).cumsum() / df['volume'].cumsum()
         df['VWAP'] = vwap
         df['return_1_raw'] = df['close'].pct_change().replace([np.inf, -np.inf], np.nan)
@@ -4929,7 +5265,6 @@ class StochasticAnalyzer:
         # # Volatilidad
         df['return_1_raw'] = df['close'].pct_change().replace([np.inf, -np.inf], np.nan)
         df['volatility_10'] = df['return_1_raw'].rolling(10).std()
-
 
         # # RSI robusto
         def compute_rsi(series, window):
@@ -4961,6 +5296,46 @@ class StochasticAnalyzer:
 
         # Tendencia simple (siguiente vela)
         df['price_change'] = df['close'].shift(-1) - df['close']
+
+        def fast_linear_regression_slope(series, window=5):
+            """Calcula la pendiente de la regresión lineal de forma vectorizada (ultrarrápida)"""
+            y = series
+            x = pd.Series(np.arange(len(series)), index=series.index)
+
+            # Cálculo de promedios móviles
+            x_mean = x.rolling(window=window).mean()
+            y_mean = y.rolling(window=window).mean()
+
+            # Covarianza y varianza móvil
+            xy_mean = (x * y).rolling(window=window).mean()
+            x_squared_mean = (x ** 2).rolling(window=window).mean()
+
+            covariance = xy_mean - (x_mean * y_mean)
+            variance = x_squared_mean - (x_mean ** 2)
+
+            # Retorna la pendiente (m)
+            slope = covariance / variance
+            return slope
+
+        # Opcional: Si quieres tener literalmente la "predicción del próximo precio de cierre"
+        df['price_change_lr5'] = fast_linear_regression_slope(df['price_change'], window=5)
+        # df['price_change_lr5'] = df['price_change_lr5'].ffill()
+
+        # 1. Variación de precio absoluta de la vela actual respecto a la anterior
+        df['price_change_lag1'] = df['close'].diff(1)  # equivalente a: df['close'] - df['close'].shift(1)
+
+        # 2. Variaciones de precios en las 3 últimas velas (para que el modelo entienda tendencias cortas)
+        df['price_change_lag2'] = df['close'].shift(1).diff(1)
+        df['price_change_lag3'] = df['close'].shift(2).diff(1)
+
+        # 3. Media de los últimos 5 cambios de precio (suaviza la tendencia del precio a corto plazo)
+        df['price_change_ma5'] = df['price_change_lag1'].rolling(window=5).mean()
+
+        # 4. Tendencia del precio pasado (feature categórico/numérico)
+        # Indica si la vela que acaba de cerrar fue alcista o bajista
+        df['past_trend_numeric'] = np.where(df['price_change_lag1'] > 0, 1,
+                                            np.where(df['price_change_lag1'] < 0, -1, 0))
+
         df['trend'] = np.where(df['price_change'] > 0, 'bullish',
                                np.where(df['price_change'] < 0, 'bearish', 'lateral'))
         df.loc[df['price_change'].isna(), 'trend'] = np.nan
@@ -4987,6 +5362,335 @@ class StochasticAnalyzer:
         # Donde no hay futuro, asigna NaN a la tendencia futura
 
         return df
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Feature-building methods (called from add_indicators)
+    # ────────────────────────────────────────────────────────────────────────
+
+    def preparar_features_antigravity(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, list]:
+        """
+        Categoría 1-3: Vela, Momentum, Tendencia EMA.
+        - Estructura de vela (body, mechas, rango)
+        - EMA 21 y 50, distancias, flags de alineación
+        - ROC 5/12/24, momentum, rachas de velas
+        - Aceleración de ATR y ratio de volatilidad
+        """
+        eps = 1e-9
+
+        # Track columns before adding new ones
+        initial_cols = set(df.columns)
+
+        # ── Estructura de vela ──────────────────────────────────────────────
+        df['body'] = df['close'] - df['open']
+        df['body_norm'] = df['body'] / (df['ATR'] + eps)
+        body_high = df[['open', 'close']].max(axis=1)
+        body_low = df[['open', 'close']].min(axis=1)
+        df['upper_wick'] = (df['high'] - body_high) / (df['ATR'] + eps)
+        df['lower_wick'] = (body_low - df['low']) / (df['ATR'] + eps)
+        df['candle_range_norm'] = (df['high'] - df['low']) / (df['ATR'] + eps)
+        # Posición del cierre dentro del rango de la vela (0=mínimo, 1=máximo)
+        df['close_position'] = (df['close'] - df['low']) / (df['high'] - df['low'] + eps)
+
+        # ── EMA 21 / 50 ────────────────────────────────────────────────────
+        for period in [21, 50]:
+            col = f'ema_{period}'
+            df[col] = df['close'].ewm(span=period, adjust=False).mean()
+            df[f'dist_ema_{period}'] = df['close'] / (df[col] + eps) - 1
+
+        # EMA 200 alias con nombre uniforme (ya existe como EMA_200)
+        df['ema_200'] = df['EMA_200']
+        df['dist_ema_200'] = df['close'] / (df['ema_200'] + eps) - 1
+
+        # Flags de alineación
+        df['ema_21_vs_50'] = (df['ema_21'] > df['ema_50']).astype(int)
+        df['ema_50_vs_200'] = (df['ema_50'] > df['ema_200']).astype(int)
+
+        # Inclinación de la EMA 21 (pendiente en 3 barras, normalizada por ATR)
+        df['ema21_slope'] = df['ema_21'].diff(3) / (df['ATR'] + eps)
+
+        # ── ROC y Momentum ─────────────────────────────────────────────────
+        for n in [5, 12, 24]:
+            df[f'roc_{n}'] = df['close'].pct_change(n)
+        df['momentum_10'] = df['close'].pct_change(10)  # % de cambio vs 10 barras atrás (estacionario)
+
+        # Rachas de velas consecutivas alcistas / bajistas
+        df['bullish_streak'] = df['past_trend_numeric'].clip(lower=0).rolling(5).sum()
+        df['bearish_streak'] = df['past_trend_numeric'].clip(upper=0).abs().rolling(5).sum()
+
+        # ── Volatilidad derivada ────────────────────────────────────────────
+        df['vol_10'] = df['close'].pct_change().rolling(10).std()
+        df['vol_20'] = df['close'].pct_change().rolling(20).std()
+
+        # vol_ratio = volatilidad corta / larga (ratio > 1 → expansión de volatilidad)
+        df['vol_ratio'] = df['vol_10'] / (df['vol_20'] + eps)
+        # Aceleración del ATR (¿la volatilidad está aumentando?) — cambio % para ser estacionario
+        df['atr_acceleration'] = df['atr_14'].pct_change(5)
+        # ATR normalizado
+        df['atr_norm'] = df['ATR'] / (df['close'] + eps)
+
+        df['volume_ratio'] = df['volume'] / (df['volume'].rolling(window=20).mean() + eps)
+        df['vol_change_pct'] = (df['volume'] / (df['volume'].shift(1) + eps)) - 1
+        df['vol_oscillator'] = df['volume'].rolling(5).mean() / (df['volume'].rolling(50).mean() + eps)
+        df['vol_cv'] = df['volume'].rolling(window=20).std() / (df['volume'].rolling(window=20).mean() + eps)
+
+        new_cols = list(set(df.columns) - initial_cols)
+        return df, new_cols
+
+    def new_features_complementary_antigravity(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, list]:
+        """
+        Categoría 4-5: Osciladores adicionales y Volumen.
+        - RSI 7 + slope del RSI 14
+        - MACD histograma aceleración
+        - Stochastic cross-flags
+        - CCI 20, Williams %R 14
+        - OBV + slope, VWAP distance, vol relativo
+        """
+        eps = 1e-9
+
+        # Track columns before adding new ones
+        initial_cols = set(df.columns)
+
+        # ── RSI adicional ──────────────────────────────────────────────────
+        def compute_rsi(series, window):
+            delta = series.diff()
+            up = delta.clip(lower=0)
+            down = -delta.clip(upper=0)
+            rs = up.rolling(window).mean() / (down.rolling(window).mean() + eps)
+            return 100 - (100 / (1 + rs))
+
+        df['rsi_7'] = compute_rsi(df['close'], 7)
+        df['rsi_slope'] = df['rsi_14'].diff(3)
+
+        # ── MACD aceleración ───────────────────────────────────────────────
+        df['macd_hist_accel'] = df['macd_hist'].diff(1)
+
+        # ── Stochastic cross-flags ─────────────────────────────────────────
+        df['k_vs_d'] = (df['k'] > df['d']).astype(int)
+        df['k100_vs_d100'] = (df['k100'] > df['d100']).astype(int)
+        df['stoch_trend_aligned'] = (
+                (df['k100'] > df['d100']) & (df['d100'] > df['e100'])
+        ).astype(int)
+
+        # ── CCI 20 ─────────────────────────────────────────────────────────
+        typical = (df['high'] + df['low'] + df['close']) / 3
+        tp_mean = typical.rolling(20).mean()
+        mean_dev = typical.rolling(20).apply(
+            lambda x: np.mean(np.abs(x - x.mean())), raw=True
+        )
+        df['cci_20'] = (typical - tp_mean) / (0.015 * mean_dev + eps)
+
+        # ── Williams %R 14 ─────────────────────────────────────────────────
+        h14 = df['high'].rolling(14).max()
+        l14 = df['low'].rolling(14).min()
+        df['willr_14'] = -100 * (h14 - df['close']) / (h14 - l14 + eps)
+
+        # ── Volumen ────────────────────────────────────────────────────────
+        vol_ma20 = df['volume'].rolling(20).mean()
+        df['vol_ratio_20'] = df['volume'] / (vol_ma20 + eps)
+
+        # OBV (On-Balance Volume)
+        obv = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
+        df['obv'] = obv
+        obv_abs_mean = df['obv'].abs().rolling(20).mean()
+        df['obv_slope'] = df['obv'].diff(5) / (obv_abs_mean + eps)
+
+        # Distancia precio vs VWAP en unidades de ATR
+        df['vwap_dist'] = (df['close'] - df['VWAP']) / (df['ATR'] + eps)
+        df['gap_open_pct_abs'] = np.abs((df['open'] - df['close'].shift(1)) / df['close'].shift(1))
+        # Un pequeño epsilon en el denominador por seguridad (evitar división por 0)
+        # Dividimos el salto de precio por la volatilidad medida de la vela pasada
+        df['gap_open_atr_abs'] = np.abs(df['open'] - df['close'].shift(1)) / (df['atr_14'].shift(1) + eps)
+
+        new_cols = list(set(df.columns) - initial_cols)
+        return df, new_cols
+
+    def build_mathstat_features_antigravity(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, list]:
+        """
+        Categoría 7: Estructura de precio — rangos históricos.
+        - Distancia al máximo/mínimo de 20 y 50 velas (en unidades de ATR)
+        - Posición en el rango de 20 velas
+        - LR slopes mejoradas sobre precio de cierre y sobre price_change histórico
+        """
+        eps = 1e-9
+
+        # Track columns before adding new ones
+        initial_cols = set(df.columns)
+
+        # ── Rangos de 20 velas ─────────────────────────────────────────────
+        high_20 = df['high'].rolling(20).max()
+        low_20 = df['low'].rolling(20).min()
+        df['dist_to_high20'] = (high_20 - df['close']) / (df['ATR'] + eps)
+        df['dist_to_low20'] = (df['close'] - low_20) / (df['ATR'] + eps)
+        df['position_in_range20'] = (df['close'] - low_20) / (high_20 - low_20 + eps)
+
+        # ── Rangos de 50 velas ─────────────────────────────────────────────
+        high_50 = df['high'].rolling(50).max()
+        low_50 = df['low'].rolling(50).min()
+        df['dist_to_high50'] = (high_50 - df['close']) / (df['ATR'] + eps)
+        df['dist_to_low50'] = (df['close'] - low_50) / (df['ATR'] + eps)
+
+        # ── LR slopes sobre precio de cierre ──────────────────────────────
+        def fast_lr_slope(series, window):
+            y = series
+            x = pd.Series(np.arange(len(series)), index=series.index)
+            x_mean = x.rolling(window).mean()
+            y_mean = y.rolling(window).mean()
+            xy_mean = (x * y).rolling(window).mean()
+            x2_mean = (x ** 2).rolling(window).mean()
+            cov = xy_mean - x_mean * y_mean
+            var = x2_mean - x_mean ** 2
+            return cov / (var + 1e-12)
+
+        df['pred_lr5'] = fast_lr_slope(df['close'], 5)
+        df['pred_lr10'] = fast_lr_slope(df['close'], 10)
+        df['pred_lr20'] = fast_lr_slope(df['close'], 20)
+        # LR sobre cambios de precio históricos (usando shift(1) para evitar lookahead)
+        df['lr5_on_change'] = fast_lr_slope(df['price_change'].shift(1), 5)
+
+        new_cols = list(set(df.columns) - initial_cols)
+        return df, new_cols
+
+    def build_impulse_features(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, list]:
+        """
+        El modelo ve el mercado "lateralizado/bajista"
+        en base a los últimos N candles, y cuando ocurre un impulso brusco con volumen,
+        las features actuales no logran capturarlo a tiempo.
+        """
+        eps = 1e-9
+
+        # Track columns before adding new ones
+        initial_cols = set(df.columns)
+
+        # Ratio: volumen actual vs promedio de las últimas 20 velas
+        df['volume_surge_20'] = df['volume'] / df['volume'].rolling(20).mean()
+        df['vol_spike'] = (df['volume_surge_20'] > 2.5).astype(int)  # flag binario
+
+        # El modelo necesita saber si el precio está formando máximos y mínimos crecientes (estructura alcista)
+        # ¿El high actual es mayor que el high de N velas atrás?
+        df['higher_high_3'] = (df['high'] > df['high'].shift(3)).astype(int)
+        df['higher_high_5'] = (df['high'] > df['high'].shift(5)).astype(int)
+        df['higher_low_3'] = (df['low'] > df['low'].shift(3)).astype(int)
+
+        # Score continuo: cuántos de los últimos N highs son crecientes
+        n = 5
+        df['hh_score'] = sum((df['high'] > df['high'].shift(i)).astype(int) for i in range(1, n + 1)) / n
+
+        # Estructura bajista
+        df['lower_low_3'] = (df['low'] < df['low'].shift(3)).astype(int)
+        df['lower_low_5'] = (df['low'] < df['low'].shift(5)).astype(int)
+        df['lower_high_3'] = (df['high'] < df['high'].shift(3)).astype(int)
+        df['ll_score'] = sum((df['low'] < df['low'].shift(i)).astype(int) for i in range(1, n + 1)) / n
+
+        # ⚡ price_acceleration — Aceleración del Precio
+        ret1 = df['close'].pct_change(1)
+        ret3 = df['close'].pct_change(3)
+        df['price_acceleration'] = ret1 - ret3 / 3  # aceleración reciente
+        df['accel_z'] = (df['price_acceleration'] - df['price_acceleration'].rolling(50).mean()) \
+                        / (df['price_acceleration'].rolling(50).std() + 1e-9)
+
+        # 🕯️ candle_body_ratio_vs_atr
+        # Una vela de impulso tiene un cuerpo enormemente grande relativo al ATR reciente.
+        # Esto diferencia un impulso real de movimiento normal
+        df['body_abs'] = (df['close'] - df['open']).abs()
+        df['body_vs_atr'] = df['body_abs'] / (df['ATR'] + 1e-9)
+        # Un candle de impulso alcista tiene body_vs_atr >> 1 Y cierre positivo
+        df['bullish_impulse_candle'] = (
+                (df['body_vs_atr'] > 1.5) & (df['close'] > df['open'])
+        ).astype(int)
+
+        # Un candle de impulso bajista tiene body_vs_atr >> 1 Y cierre negativo
+        df['bearish_impulse_candle'] = (
+                (df['body_vs_atr'] > 1.5) & (df['close'] < df['open'])
+        ).astype(int)
+
+        # ¿Precio cruzó el VWAP en las últimas N velas?
+        above_vwap = (df['close'] > df['VWAP']).astype(int)
+        df['vwap_cross_up'] = ((above_vwap == 1) & (above_vwap.shift(1) == 0)).astype(int)
+        df['vwap_above_bars'] = above_vwap.rolling(5).sum()  # cuántos de últimos 5 cierres sobre VWAP
+
+        below_vwap = (df['close'] < df['VWAP']).astype(int)
+        df['vwap_cross_down'] = ((below_vwap == 1) & (below_vwap.shift(1) == 0)).astype(int)
+        df['vwap_below_bars'] = below_vwap.rolling(5).sum()
+
+        # ¿Están alineadas las EMAs alcistamente? EMA21 > EMA50 > EMA200
+        df['ema_bull_aligned'] = (
+                (df['ema_21'] > df['ema_50']) & (df['ema_50'] > df['ema_200'])
+        ).astype(int)
+
+        df['ema_bear_aligned'] = (
+                (df['ema_21'] < df['ema_50']) & (df['ema_50'] < df['ema_200'])
+        ).astype(int)
+
+        # Score continuo: distancia normalizada EMA21 sobre EMA50
+        df['ema21_vs_50_norm'] = (df['ema_21'] - df['ema_50']) / (df['ATR'] + 1e-9)
+
+        up = (df['close'] > df['open']).astype(int)
+        df['consec_up'] = up * (up.groupby((up != up.shift()).cumsum()).cumcount() + 1)
+        df['consec_dn'] = (1 - up) * ((1 - up).groupby(((1 - up) != (1 - up).shift()).cumsum()).cumcount() + 1)
+
+        new_cols = list(set(df.columns) - initial_cols)
+        return df, new_cols
+
+    def build_regime_features_antigravity(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, list]:
+        """
+        Categoría 6+: Sesión/Tiempo y features de régimen de mercado.
+        - Componentes cíclicos del día y semana
+        - Flags de sesión (Londres, NY, Asia)
+        - Precio de cierre normalizado vs promedio 8h
+        """
+        eps = 1e-9
+
+        # Track columns before adding new ones
+        initial_cols = set(df.columns)
+
+        # ── Sesión y tiempo ────────────────────────────────────────────────
+        dt = df['datetime']
+
+        # Asegurar que se calculan las horas en UTC, dado que los threshold (8-17, etc) son UTC
+        if getattr(dt.dt, "tz", None) is not None:
+            dt_utc = dt.dt.tz_convert("UTC")
+        else:
+            dt_utc = dt  # Si por algún motivo no tiene tz, asumimos UTC por defecto
+
+        # Para las sesiones, calculamos explícitamente usando la hora UTC
+        hour_utc = dt_utc.dt.hour
+        df['session_london'] = ((hour_utc >= 8) & (hour_utc < 17)).astype(int)
+        df['session_ny'] = ((hour_utc >= 13) & (hour_utc < 22)).astype(int)
+        df['session_asia'] = (hour_utc < 8).astype(int)
+
+        # ── Precio relativo a promedio de 8 horas (96 velas de 5 min) ─────
+        df['close_vs_8h_mean'] = df['close'] / (df['close'].rolling(96).mean() + eps) - 1
+
+        # ── Ratio precio vs VWAP diario ────────────────────────────────────
+        # (complementa vwap_dist usando %, más interpretable)
+        df['close_vs_vwap_pct'] = df['close'] / (df['VWAP'] + eps) - 1
+
+        # ==== FEATURES ANTI-SESGOS (COUNTER-BIAS) ====
+        k100 = df.get('k100', pd.Series(50.0, index=df.index))
+        # Si ADX_14 no existe, intentamos usar rsi u otra cosa que indique fuerza de tendencia.
+        adx = df.get('ADX_14', df.get('trend_slope_norm_100', pd.Series(0.0, index=df.index)).abs() * 100)
+
+        # 1. k100 x ADX: penaliza el estocástico cuando hay tendencia fuerte en contra
+        df['k100_x_adx'] = (100 - k100) * adx  # Sube si estocástico es bajo y ADX es alto
+
+        # 2. k100 x trend: Interacción explícita entre estocástico y la pendiente de tendencia
+        trend_slope = df.get('trend_slope_norm_100', df.get('trend_slope_ema', pd.Series(0.0, index=df.index)))
+        df['k100_x_trend_slope'] = k100 * trend_slope
+
+        # 3. Penalización de baja volatilidad (evitar ir corto ciegamente en consolidaciones largas)
+        # El SHAP de atr_norm explotaba en valores menores a 0.002
+        atr_n = df.get('atr_norm', pd.Series(0.005, index=df.index))
+        df['low_vol_squeeze_danger'] = np.where(atr_n < 0.002, 1.0, 0.0)
+
+        # 4. Rechazos falsos de soportes/resistencias en baja volatilidad
+        min_dist = df.get('min_dist_level_atr', pd.Series(10.0, index=df.index))
+        df['level_in_low_vol'] = np.where((atr_n < 0.002) & (min_dist < 2.0), 1.0, 0.0)
+
+        # 5. Interacción entre Estocástico y baja volatilidad
+        df['k100_in_low_vol'] = k100 * df['low_vol_squeeze_danger']
+
+        new_cols = list(set(df.columns) - initial_cols)
+        return df, new_cols
 
     def assign_future_trend_with_dd_first_event(self, df,
                                                 lookahead=60,
@@ -5838,7 +6542,8 @@ class StochasticAnalyzer:
             calibrate_method: str = "isotonic",  # "isotonic" o "sigmoid"
             return_metrics: bool = False,
             display_feature_plot: bool = False,
-            use_df_parquet: bool = True
+            use_df_parquet: bool = True,
+            display_shap: bool = False
     ):
         if self.data is None:
             print("No hay datos para entrenar el modelo")
@@ -6080,6 +6785,62 @@ class StochasticAnalyzer:
         )
         print("\nImportancia de características:")
         print(feature_importance)
+
+        # === Análisis SHAP Avanzado ===
+        if display_shap:
+            try:
+                print("\nGenerando SHAP Summary Plot (puede tardar unos segundos)...")
+                explainer = shap.TreeExplainer(base_model)
+
+                n_samples = min(1000, len(X_test_scaled))
+                X_test_df = pd.DataFrame(X_test_scaled, columns=features)
+                X_test_sample = X_test_df.sample(n=n_samples, random_state=42)
+
+                shap_values = explainer.shap_values(X_test_sample)
+
+                # --- En lugar de graficar, calculamos e imprimimos el ranking ---
+                if isinstance(shap_values, list):
+                    # Formato antiguo multiclase: lista de arrays (n_samples, n_features)
+                    shap_abs = np.zeros(X_test_sample.shape[1])
+                    for sf in shap_values:
+                        shap_abs += np.abs(sf).mean(axis=0)
+                elif len(shap_values.shape) == 3:
+                    # Formato nuevo multiclase: array 3D (n_samples, n_features, n_classes)
+                    # Promediamos sobre las muestras (axis=0) y sumamos sobre las clases (axis=1)
+                    shap_abs = np.abs(shap_values).mean(axis=0).sum(axis=1)
+                else:
+                    # Binario o regresión: (n_samples, n_features)
+                    shap_abs = np.abs(shap_values).mean(axis=0)
+
+                shap_imp_df = pd.DataFrame({
+                    'feature': features,
+                    'shap_importance': shap_abs
+                }).sort_values(by='shap_importance', ascending=False)
+
+                print("\n" + "=" * 50)
+                print("👑 RANKING SHAP DE FEATURES (TOP 30) 👑")
+                print("=" * 50)
+                print(shap_imp_df.head(170).to_string(index=False))
+                print("=" * 50 + "\n")
+
+                # --- Graficar también ---
+                # plt.figure(figsize=(10, 8))
+                #
+                # # Si shap_values es 3D (n_samples, n_features, n_classes),
+                # # summary_plot clásico a veces pide una lista por clase. Lo adaptamos:
+                # if isinstance(shap_values, np.ndarray) and len(shap_values.shape) == 3:
+                #     shap_values_plot = [shap_values[:, :, i] for i in range(shap_values.shape[2])]
+                # else:
+                #     shap_values_plot = shap_values
+                #
+                # shap.summary_plot(shap_values_plot, X_test_sample, show=False)
+                # plt.title("Análisis SHAP Global (Test Set Sample)")
+                # plt.tight_layout()
+                # plt.show()
+            except ImportError:
+                print("\n[INFO] Librería 'shap' no encontrada. Instálala con: pip install shap")
+            except Exception as e:
+                print(f"\n[WARN] Error generando SHAP plot: {e}")
 
         # X_sel, selected_cols, dropped_cols, corr_matrix = select_features_by_correlation(
         #     X=df_model,
@@ -6862,7 +7623,7 @@ class StochasticAnalyzer:
 
         # Umbrales por defecto si no se pasan
         if thresholds is None:
-            thresholds = {"bearish": 0.55, "bullish": 0.55, "lateral": 0.40}
+            thresholds = {"bearish": 0.6, "bullish": 0.6, "lateral": 0.40}
 
         # 1) Descargar datos nuevos (solo OHLCV crudo)
         df_new = self.get_bybit_data_private(symbol, interval, start_date=None, end_date=None, limit=lookback_bars)
@@ -6905,6 +7666,8 @@ class StochasticAnalyzer:
         # 4) Última fila válida (del dataset completo)
         last_row = df_ready[features].iloc[-1:]
         last_meta = df_ready.iloc[-1]
+
+        # last_row['price_change_lr5'] = df_ready["price_change_lr5"].iloc[-2]
 
         # 5) Escalar y obtener probabilidades
         last_scaled = self.scaler.transform(last_row)
@@ -6967,13 +7730,11 @@ class StochasticAnalyzer:
         if pred in ("bullish", "bearish") and getattr(self, "m2_model", None) is not None:
             try:
                 # Determinar set de features para M2
-                feats_m2 = FEATURES + FEATS_M2
+                feats_m2 = FEATURES_M2 + FEATS_M2
 
                 # Construir vector x_m2 con orden exacto
                 # Fuente principal: última fila de df_ready (ya con tus features preparados)
                 src_series = df_ready.iloc[-1]
-
-
 
                 x_dict = {}
                 # soporte para direction_sign / dummies
@@ -6999,7 +7760,6 @@ class StochasticAnalyzer:
                         x_dict[f] = np.nan
 
                 # Verifica NaNs
-                x_dict['price_change'] = df_ready["price_change"].iloc[-2]
                 x_vals = [x_dict[f] for f in feats_m2]
                 if any([not np.isfinite(v) for v in x_vals]):
                     # puedes cambiar por imputación si quieres continuar igual
@@ -7026,7 +7786,6 @@ class StochasticAnalyzer:
                 # if getattr(self, "verbose", 0) > 0:
                 print(f"[M2] Inferencia omitida: {e}")
 
-
         result = {
             "prediction": pred,
             "probabilities": probabilities,
@@ -7035,7 +7794,8 @@ class StochasticAnalyzer:
             "last_row_atr": float(last_meta['ATR']),
             "last_row_close": float(last_meta['close']),
             "last_row_ema200": ema_200,
-            "raw_df": df_ready.tail(lookback_bars)[["datetime", "open", "high", "low", "close", "volume", "macd", "macd_signal", "macd_hist"]].copy()
+            "raw_df": df_ready.tail(lookback_bars)[
+                ["datetime", "open", "high", "low", "close", "volume", "macd", "macd_signal", "macd_hist"]].copy()
         }
 
         return result
@@ -7151,7 +7911,7 @@ class StochasticAnalyzer:
         except Exception:
             last_check_dt = None
 
-        # Comenzar 1 intervalo antes para cubrir “apertura dentro de vela”
+        # Comenzar 1 intervalo antes para cubrir "apertura dentro de vela"
         candidates = []
         if opened_dt is not None:
             candidates.append(opened_dt - pd.Timedelta(minutes=interval_minutes))
@@ -7166,101 +7926,12 @@ class StochasticAnalyzer:
         # ---- Slicing de velas a revisar ----
         df = df_last[df_last["datetime"] >= start_dt].copy()
         if df.empty:
-            # Aun así, actualizamos last_check_dt a la última de df_last para no reprocesar en loop
+            # Aun así actualizamos last_check_dt a la última de df_last
             try:
                 self.tradelogger.enrich_open_position(symbol, last_check_dt=str(df_last["datetime"].iloc[-1]))
             except Exception:
                 pass
             return
-
-        # ---- Recorrer en orden cronológico y evaluar TP/SL ----
-        for _, row in df.iterrows():
-            bar_high = float(row["high"])
-            bar_low = float(row["low"])
-            bar_open_dt = pd.to_datetime(row["datetime"])
-            bar_end_dt = bar_open_dt + pd.Timedelta(minutes=interval_minutes)
-
-            hit_tp = (bar_high >= tp) if side == "long" else (bar_low <= tp)
-            hit_sl = (bar_low <= sl) if side == "long" else (bar_high >= sl)
-
-            if not hit_tp and not hit_sl:
-                continue
-
-            # Si ambos en la misma vela: resolver con 1m
-            if hit_tp and hit_sl:
-                # Debe existir este método en tu clase; si devuelve None, priorizamos SL
-                first = self._resolve_tp_sl_order_in_bar(symbol, bar_open_dt, bar_end_dt, side, tp, sl)
-                if first is None:
-                    first = "sl"
-            else:
-                first = "tp" if hit_tp else "sl"
-
-            exit_reason = first
-            exit_price = tp if first == "tp" else sl
-
-            # ---- PnL ----
-            pnl_usdt = self._pnl_usdt_linear(
-                side, entry_price, exit_price, qty, fee_rate=fee_rate, include_both_sides=True
-            )
-
-            # PnL en R (opcional)
-            pnl_r = None
-            try:
-                R = abs(entry_price - sl) if side == "long" else abs(sl - entry_price)
-                sign = 1 if side == "long" else -1
-                pnl_r = ((exit_price - entry_price) * sign) / (R if R != 0 else 1e-6)
-            except Exception:
-                pass
-
-            # ---- Log de cierre y limpieza ----
-            self.tradelogger.log_close(
-                symbol=symbol,
-                exit_reason=exit_reason,
-                exit_price=exit_price,
-                pnl_usdt=float(pnl_usdt) if pnl_usdt is not None else None,
-                pnl_r=float(pnl_r) if pnl_r is not None else None,
-                order_id=order_id,
-                trade_id=trade_id
-            )
-            print(f"\n exit_reason={exit_reason} exit_price={exit_price} \n")
-            return  # ya cerramos
-
-        # Si no cerró, actualizar last_check_dt a la última vela procesada
-        try:
-            self.tradelogger.enrich_open_position(symbol, last_check_dt=str(df["datetime"].iloc[-1]))
-        except Exception:
-            pass
-
-        # Si no cerró, actualizar last_check_dt a la última vela procesada
-        try:
-            self.tradelogger.enrich_open_position(symbol, last_check_dt=str(df["datetime"].iloc[-1]))
-        except Exception:
-            pass
-        """
-        Usa la última/s velas (5m) ya descargadas para verificar si el TP/SL de la posición abierta se tocó.
-        Si cierra, calcula PnL y llama tradelogger.log_close(...).
-        """
-        pos = self.tradelogger.get_open_position(symbol)
-        if not pos:
-            return  # no hay posición
-
-        side = pos.get("side")
-        entry_price = float(pos.get("entry_price", 0))
-        tp = float(pos.get("take_profit", 0))
-        sl = float(pos.get("stop_loss", 0))
-        qty = pos.get("qty")
-        fee_rate = pos.get("fee_rate", getattr(self, "fee_rate", 0.0006))
-        trade_id = pos.get("trade_id")
-        if not side or not entry_price or not qty or not tp or not sl:
-            return  # info insuficiente
-
-        # Asegúrate de tener al menos 1 vela cerrada reciente:
-        if df_last is None or df_last.empty:
-            return
-
-        # Tomamos la última vela cerrada y, opcionalmente, también la anterior por si la posición se abrió “entre velas”
-        # (si quieres, puedes filtrar desde la hora de apertura de la posición)
-        df = df_last.sort_values("datetime").tail(2)
 
         # Recorremos las velas en orden cronológico
         for i in range(len(df)):
@@ -7322,6 +7993,12 @@ class StochasticAnalyzer:
             # Si además cierras en el broker vía API, puedes dispararlo aquí.
             break  # ya cerramos; sal del loop
 
+        # Si no cerró, actualizar last_check_dt a la última vela procesada
+        try:
+            self.tradelogger.enrich_open_position(symbol, last_check_dt=str(df["datetime"].iloc[-1]))
+        except Exception:
+            pass
+
     def send_email(self, subject, body):
         msg = MIMEText(body)
         msg['Subject'] = subject
@@ -7377,113 +8054,6 @@ class StochasticAnalyzer:
         return qty
 
     def monitor_predictions(self, symbol="AVAXUSDT", interval="5"):
-
-        def prepare_rule_inputs(df: pd.DataFrame, window: int = 2000, min_periods: int = 200) -> pd.DataFrame:
-            """
-            Precalcula:
-            - Cuartiles rodantes (Q1..Q4) para las columnas necesarias (past-only).
-            - Señales derivadas simples (vwap_up, k100<e100, etc.).
-
-            Devuelve un DataFrame con columnas originales + *_q (labels) + señales.
-            """
-            need_quartiles = [
-                "dist_R1", "dist_R2", "dist_S1", "dist_S2",
-                "volatility_10", "volatility_50",
-                "VWAP", "dist_PP", "atr_norm"
-            ]
-            # <- CAMBIO MINIMO: columnas opcionales si existen en df
-            optional_quartiles = [
-                "VWAP", "k", "e", "e100", "k100", "rsi_14", "macd", "macd_signal", "dist_R2", "atr_norm",
-                "dist_PP",
-            ]
-
-            def rolling_ntile_labels_past_only(
-                    s: pd.Series,
-                    n: int = 5,
-                    window: int = 4300,
-                    min_periods: int = 200,
-            ) -> pd.Series:
-                """
-                Discretiza s en n-tiles usando sólo historia (shift(1)) y cuantiles rolling.
-                Devuelve etiquetas 'Q1'..'Qn' (category). Sin fuga temporal.
-                """
-                s_shift = s.shift(1)
-
-                # cortes interiores: p = 1/n, 2/n, ..., (n-1)/n
-                probs = [(k / n) for k in range(1, n)]
-                # calculamos cada cuantila rolling una sola vez
-                cuts = []
-                for p in probs:
-                    cuts.append(s_shift.rolling(window=window, min_periods=min_periods).quantile(p))
-
-                labels = pd.Series(index=s.index, dtype="object")
-                valid_mask = pd.Series(True, index=s.index)
-                for c in cuts:
-                    valid_mask &= c.notna()
-
-                # Asignación por tramos (Q1..Qn)
-                # Caso Q1: s <= cut1
-                labels.loc[valid_mask & (s <= cuts[0])] = "Q1"
-                # Casos intermedios: cut(k-1) < s <= cut(k)
-                for k in range(1, n - 1):
-                    lower = cuts[k - 1]
-                    upper = cuts[k]
-                    labels.loc[valid_mask & (s > lower) & (s <= upper)] = f"Q{k + 1}"
-                # Caso Qn: s > cut(n-1)
-                labels.loc[valid_mask & (s > cuts[-1])] = f"Q{n}"
-
-                return labels.astype("category")
-
-            out = df.copy()
-
-            # Etiquetas de cuartil rodante (una sola vez por columna)
-            for col in need_quartiles:
-                out[f"{col}_q"] = rolling_ntile_labels_past_only(out[col], window=window, min_periods=min_periods)
-
-            # <- CAMBIO MINIMO: genera *_q sólo si esas columnas existen
-            for col in optional_quartiles:
-                if col in out.columns and f"{col}_q" not in out.columns:
-                    out[f"{col}_q"] = rolling_ntile_labels_past_only(out[col], window=window, min_periods=min_periods)
-
-            # Señales derivadas (vectorizadas)
-            out["vwap_up"] = out["VWAP"].diff().gt(0)  # True si VWAP sube vs vela previa
-            out["vwap_down"] = out["VWAP"].diff().lt(0)
-            out["e_down"] = out["e"].diff().lt(0)
-            out["d_down"] = out["d"].diff().lt(0)
-
-            out["e100_up"] = out["e100"].diff().gt(0)
-            out["e100_down"] = out["e100"].diff().lt(0)
-            out["macd_up"] = out["macd"].diff().gt(0)
-            out["macd_down"] = out["macd"].diff().lt(0)
-
-            out["atr_down"] = out["ATR"].diff().lt(0)
-            out["macd_hist_down"] = out["macd_hist"].diff().lt(0)
-            out["macd_signal_down"] = out["macd_signal"].diff().lt(0)
-            out["macd_signal_up"] = out["macd_signal"].diff().gt(0)
-
-
-
-            out["k100_lt_e100"] = out["k100"] < out["e100"]
-            out["k100_gt_e100"] = out["k100"] > out["e100"]
-            out["k_gt_e"] = out["k"] > out["e"]
-            out["k_lt_e"] = out["k"] < out["e"]
-            out["d_lt_e"] = out["d"] < out["e"]
-            out["d_gt_e"] = out["d"] > out["e"]
-
-
-            out["macd_gt_signal"] = out["macd"] > out["macd_signal"]
-            out["e_lt_25"] = out["e"] < 25
-            out["e100_lt_25"] = out["e100"] <= 25
-            out["dist_PP_lt_0"] = out["dist_PP"] < 0
-
-            out["dist_R1_gt_0"] = out["dist_R1"] > 0
-            out["dist_R2_gt_0"] = out["dist_R2"] > 0
-
-            out["dist_S1_gt_0"] = out["dist_S1"] > 0
-            out["dist_S2_gt_0"] = out["dist_S2"] > 0
-            out["rsi_40_60"] = out["rsi_14"].between(40, 60, inclusive="left").fillna(False)
-
-            return out
 
         last_prediction = None
         last_minute_checked = None
@@ -7567,11 +8137,11 @@ class StochasticAnalyzer:
 
                 # Gate sólo si es elegible
                 self.umbral_strong = 0.6
-                self.umbral_soft = 0.6
+                self.umbral_soft = self.umbral_strong
 
                 gate = None
                 if eligible:
-                    gate = "strong" if self.umbral_strong <= proba_pred < 0.99 else None
+                    gate = "strong" if self.umbral_strong <= proba_pred < 0.9 else None
 
                 # 1) Log de señal (marca elegibilidad)
                 trade_id = self.tradelogger.log_signal(
@@ -7588,7 +8158,7 @@ class StochasticAnalyzer:
                 # =========================
                 # (A) RUTAS DE CIERRE (independientes de eligible/gate)
                 # =========================
-                is_real_account = False
+                is_real_account = True
                 # A1) Cierre por LATERAL fuerte
                 lateral_close_trigger = (pred == "lateral" and proba_pred >= 0.9)
                 if lateral_close_trigger and self.tradelogger.has_open_position(symbol):
@@ -7681,7 +8251,7 @@ class StochasticAnalyzer:
                         # For LONG: Exit > Entry * (1+fee) / (1-fee)
                         # For SHORT: Exit < Entry * (1-fee) / (1+fee)
                         fee_rate = getattr(self, "fee_rate", 0.00055)
-                        
+
                         if side_position == "long" and entry_price is not None:
                             breakeven_price = entry_price * (1 + fee_rate) / (1 - fee_rate)
                             if close_price > breakeven_price:
@@ -7756,7 +8326,6 @@ class StochasticAnalyzer:
                           f"(prob: {proba_pred * 100:.1f}%) | margen: {margin_pp:.1f} pp")
                     print("Detalle probabilidades:", probs)
 
-
                     # =========================
                     # (B) ENTRADA/RE-ENTRADA (requiere eligible + gate)
                     # =========================
@@ -7770,11 +8339,12 @@ class StochasticAnalyzer:
                             if True:
                                 # print(validate_order["rule"])
                                 self.start_order(pred, symbol, bogota_time, proba_pred, probs,
-                                             atr, df=data_df, close_price=close_price, real_account=is_real_account, ema200=ema200, trade_id=trade_id)
+                                                 atr, df=data_df, close_price=close_price, real_account=is_real_account,
+                                                 ema200=ema200, trade_id=trade_id)
                             # else:
                             #     print(f"Prevent enter {validate_order["rule"]}")
                     else:
-                         print("Señal no elegible (lateral, sin margen, sin ATR o bajo umbral).")
+                        print("Señal no elegible (lateral, sin margen, sin ATR o bajo umbral).")
                     last_prediction = pred
 
                 else:
@@ -7793,7 +8363,8 @@ class StochasticAnalyzer:
                             if True:
                                 # print(validate_order["rule"])
                                 self.start_order(pred, symbol, bogota_time, proba_pred, probs,
-                                             atr, df=data_df, close_price=close_price, real_account=is_real_account, ema200=ema200, trade_id=trade_id)
+                                                 atr, df=data_df, close_price=close_price, real_account=is_real_account,
+                                                 ema200=ema200, trade_id=trade_id)
                             # else:
                             #     print(f"Prevent enter {validate_order["rule"]}")
                     else:
@@ -7807,9 +8378,10 @@ class StochasticAnalyzer:
             # === Recalcula 'now' aquí también antes de ventanas de reinicio ===
             now = datetime.now()
 
-            # Ventanas de reinicio
+            # # Ventanas de reinicio
             if now.hour in {RESTART_HOUR_1 - 1} and now.minute == 56:
                 break
+            # @ TODO automatizar proceso cada 10 dias y automatizar actualizacion del csv con datos diariamente
 
             if now.hour == 0 and now.minute == 59:
                 today_str_ = f"{now.day:02d}"
@@ -7906,7 +8478,7 @@ class StochasticAnalyzer:
                     available_balance = usdt_balance * 0.95
                     order_qty = 0.0
                     metodo = ""
-                    
+
                     # 1. Calcular Qty usando Kelly Fraction (si aplica)
                     if kelly_fraction > 0:
                         order_qty = available_balance * kelly_fraction
@@ -7928,31 +8500,57 @@ class StochasticAnalyzer:
                         openOnly=0,
                         limit=1,
                     )
-                    
+
                     pos_list = positions['result']['list']
                     print(f"Posiciones abiertas: {len(pos_list)}")
-                    
+
                     place_new_order = False
-                    
+
                     if len(pos_list) != 0:
-                        new_position_side = pos_list[0]['side'] # "Buy" or "Sell"
-                        
+                        new_position_side = pos_list[0]['side']  # "Buy" or "Sell"
+
                         # Strict logic from main_tesnet.py:
                         target_side_cap = action_str.capitalize()
-                        
+
                         if new_position_side == target_side_cap:
+                            # FIX #3: Obtener info de la posición ANTES de cerrar para poder loguear el cierre
+                            pos_open = self.tradelogger.get_open_position(symbol)
                             # Cerrar usando la 'action' (que es igual al side de la posición actual)
                             self.close_order(action_str, real_account=real_account)
+                            # Registrar el cierre en TradeLogger para limpiar open_positions en memoria
+                            if pos_open:
+                                try:
+                                    pnl_usdt_close = self._pnl_usdt_linear(
+                                        pos_open.get("side"),
+                                        float(pos_open.get("entry_price", 0) or 0),
+                                        close_price,
+                                        pos_open.get("qty"),
+                                        fee_rate=pos_open.get("fee_rate", getattr(self, "fee_rate", 0.00055)),
+                                        include_both_sides=True
+                                    )
+                                except Exception:
+                                    pnl_usdt_close = None
+                                self.tradelogger.log_close(
+                                    symbol=symbol,
+                                    exit_reason="closed_same_side",
+                                    exit_price=close_price,
+                                    pnl_usdt=float(pnl_usdt_close) if pnl_usdt_close is not None else None,
+                                    pnl_r=None,
+                                    order_id=pos_open.get("order_id"),
+                                    trade_id=pos_open.get("trade_id")
+                                )
+                                print(
+                                    f"[FIX] Posición cerrada por mismo lado → log_close registrado. PnL: {pnl_usdt_close}")
                             place_new_order = True
                         else:
-                             print("Cambio de posición no permitido (Strict Logic).")
-                             response_data = {
-                                 "success": False,
-                                 "error": "Cambio de posición no permitido",
-                                 "bybit_response": "Cambio de posición no permitido",
-                                 "qty": qty
-                             }
-                             success = False
+                            print("Cambio de posición no permitido (Strict Logic).")
+                            response_data = {
+                                "success": False,
+                                "error": "Cambio de posición no permitido",
+                                "bybit_response": "Cambio de posición no permitido",
+                                "qty": qty
+                            }
+                            success = False
                     else:
                         # No hay posiciones, abrir directo
                         place_new_order = True
@@ -7993,13 +8591,13 @@ class StochasticAnalyzer:
                     bybit_resp = response_data.get('bybit_response', {})
                     order_id = None
                     try:
-                         # Ajuste según estructura de respuesta
-                         if isinstance(bybit_resp, dict) and 'result' in bybit_resp:
-                             order_id = bybit_resp['result']['orderId']
-                             print(f"bybit_resp {bybit_resp}")
-                             print(f'order id {order_id}')
+                        # Ajuste según estructura de respuesta
+                        if isinstance(bybit_resp, dict) and 'result' in bybit_resp:
+                            order_id = bybit_resp['result']['orderId']
+                            print(f"bybit_resp {bybit_resp}")
+                            print(f'order id {order_id}')
                     except Exception:
-                         pass
+                        pass
 
                     qty_final = response_data.get("qty")
 
@@ -8032,8 +8630,6 @@ class StochasticAnalyzer:
                         trade_id=trade_id, symbol=symbol, side=side, qty=response_data.get("qty"),
                         broker_raw=response_data
                     )
-
-
 
     def close_order(self, side, real_account=False):
         """
@@ -8365,346 +8961,6 @@ class StochasticAnalyzer:
 
         return trades_df, resumen
 
-
-    # def preparar_features(self, df, lags=[1]):
-    #     """
-    #     Feature set 'trader-like':
-    #       - Precio y lags básicos
-    #       - Volumen y volatilidad (ATR/volatility, atr_norm)
-    #       - Soporte/Resistencia (distancias continuas)
-    #       - Tiempo/Sesiones (sin/cos + flags de sesiones)
-    #       - Tendencia (EMA ratio + líneas de tendencia normalizadas + distancia)
-    #       - Momentum (RSI/ROC/momentum_diff)
-    #       - Patrones de velas (doji, pinbar, engulfing)
-    #       - Canales de tendencia (slopes high/low + ancho)
-    #       - Confluencias (RSI + cercanía a SR)
-    #     Retorna: (df, features_final)
-    #     """
-    #     dfx = df.copy()
-    #
-    #     eps = 1e-9
-    #
-    #     # =========================
-    #     # CONFIG (ajusta a tu mercado)
-    #     # =========================
-    #     # Ventanas para tendencia/canales
-    #     trend_windows = [100]
-    #     channel_window = 50
-    #
-    #     # Sesiones (UTC) — AJUSTA si tu dataset no está en UTC
-    #     # NY Open aproximada (13:30–15:30 UTC), London (07:00–09:00), Asia/Tokyo (23:00–01:00)
-    #     session_defs = {
-    #         "session_ny_open": [(8, 30), (10, 30)],  # 08:30–10:30 hora local NY
-    #         "session_london_open": [(2, 0), (4, 0)],  # 02:00–04:00 hora local NY
-    #         "session_asia_open": [(18, 0), (20, 0)]  # 18:00–20:00 hora local NY
-    #     }
-    #
-    #     # Confluencias (umbrales)
-    #     rsi_oversold = 30
-    #     rsi_overbought = 70
-    #     sr_threshold_frac = 0.25  # "cerca de SR" = distancia < 0.25*ATR (ejemplo)
-    #
-    #     # =========================
-    #     # Utilidades
-    #     # =========================
-    #     def _ensure_datetime(d):
-    #         if 'datetime' in d.columns and not pd.api.types.is_datetime64_any_dtype(d['datetime']):
-    #             d['datetime'] = pd.to_datetime(d['datetime'], utc=True, errors='coerce')
-    #         return d
-    #
-    #     def _safe_pct_change(s, periods=1):
-    #         prev = s.shift(periods)
-    #         return (s - prev) / (np.abs(prev) + eps)
-    #
-    #     def _rsi(series, window=14):
-    #         delta = series.diff()
-    #         up = delta.clip(lower=0)
-    #         down = -delta.clip(upper=0)
-    #         ma_up = up.rolling(window).mean()
-    #         ma_down = down.rolling(window).mean()
-    #         rs = ma_up / (ma_down + eps)
-    #         return 100 - (100 / (1 + rs))
-    #
-    #     def _trend_slope_norm(arr):
-    #         y = arr.reshape(-1, 1)
-    #         X = np.arange(len(arr), dtype=float).reshape(-1, 1)
-    #         reg = LinearRegression().fit(X, y)
-    #         slope = float(reg.coef_[0][0])
-    #         mean_price = float(np.mean(arr)) if np.isfinite(np.mean(arr)) else np.nan
-    #         return slope / (mean_price + eps)
-    #
-    #     def _trend_r2(arr):
-    #         y = arr.reshape(-1, 1)
-    #         X = np.arange(len(arr), dtype=float).reshape(-1, 1)
-    #         reg = LinearRegression().fit(X, y)
-    #         return float(reg.score(X, y))
-    #
-    #     def _trend_dist_pct(arr):
-    #         y = arr.reshape(-1, 1)
-    #         X = np.arange(len(arr), dtype=float).reshape(-1, 1)
-    #         reg = LinearRegression().fit(X, y)
-    #         y_hat_last = float(reg.predict(np.array([[len(arr) - 1]], dtype=float)))
-    #         y_last = float(arr[-1])
-    #         return (y_last - y_hat_last) / (abs(y_last) + eps)
-    #
-    #     def _linreg_line(arr):
-    #         """Devuelve (coef, intercept) de y ~ a*x + b sobre array 1-D."""
-    #         y = arr.reshape(-1, 1)
-    #         X = np.arange(len(arr), dtype=float).reshape(-1, 1)
-    #         reg = LinearRegression().fit(X, y)
-    #         return float(reg.coef_[0][0]), float(reg.intercept_)
-    #
-    #     dfx = _ensure_datetime(dfx)
-    #
-    #     # =========================
-    #     # Precio / Volumen / Volatilidad / ATR básicos (si faltan)
-    #     # =========================
-    #     # Asumimos close/high/low/volume existen en df fuente. Si no, fallará arriba en tu pipeline.
-    #     # volatility simple (si no existe)
-    #     if 'volatility' not in dfx.columns:
-    #         dfx['volatility'] = dfx['close'].pct_change().abs().rolling(20).mean()
-    #
-    #     # ATR clásico (si no existe)
-    #     if 'ATR' not in dfx.columns:
-    #         tr = np.maximum(dfx['high'] - dfx['low'],
-    #                         np.maximum(np.abs(dfx['high'] - dfx['close'].shift(1)),
-    #                                    np.abs(dfx['low'] - dfx['close'].shift(1))))
-    #         dfx['ATR'] = tr.rolling(14).mean()
-    #
-    #     if 'atr_norm' not in dfx.columns:
-    #         dfx['atr_norm'] = dfx['ATR'] / (np.abs(dfx['close']) + eps)
-    #
-    #     # Medias de volatilidad
-    #     if 'volatility_10' not in dfx.columns:
-    #         dfx['volatility_10'] = dfx['close'].pct_change().rolling(10).std()
-    #     if 'volatility_50' not in dfx.columns:
-    #         dfx['volatility_50'] = dfx['close'].pct_change().rolling(50).std()
-    #
-    #     # Volume promedio (si no existe)
-    #     if 'avg_volume_last_n' not in dfx.columns:
-    #         dfx['avg_volume_last_n'] = dfx['volume'].rolling(20).mean()
-    #
-    #     # RSI, ROC, momentum si faltan
-    #     if 'rsi_14' not in dfx.columns:
-    #         dfx['rsi_14'] = _rsi(dfx['close'], 14)
-    #     if 'rsi_50' not in dfx.columns:
-    #         dfx['rsi_50'] = _rsi(dfx['close'], 50)
-    #     if 'roc_10' not in dfx.columns:
-    #         dfx['roc_10'] = _safe_pct_change(dfx['close'], 10)
-    #     if 'roc_30' not in dfx.columns:
-    #         dfx['roc_30'] = _safe_pct_change(dfx['close'], 30)
-    #     if 'momentum_diff' not in dfx.columns:
-    #         dfx['momentum_diff'] = dfx['roc_10'] - dfx['roc_30']
-    #
-    #     # EMA ratio (si no existe)
-    #     if 'ema_ratio' not in dfx.columns:
-    #         ema_10 = dfx['close'].ewm(span=10, adjust=False).mean()
-    #         ema_50 = dfx['close'].ewm(span=50, adjust=False).mean()
-    #         dfx['ema_ratio'] = ema_10 / (ema_50 + eps)
-    #
-    #     # =========================
-    #     # Tiempo / Ciclos y Sesiones
-    #     # =========================
-    #     if 'datetime' in dfx.columns:
-    #         # sin/cos intradía
-    #         minutes = dfx['datetime'].dt.hour * 60 + dfx['datetime'].dt.minute
-    #         dfx['minute_sin'] = np.sin(2 * np.pi * minutes / 1440.0)
-    #         dfx['minute_cos'] = np.cos(2 * np.pi * minutes / 1440.0)
-    #         # sin/cos día de la semana (0–6)
-    #         dow = dfx['datetime'].dt.dayofweek
-    #         dfx['dow_sin'] = np.sin(2 * np.pi * dow / 7.0)
-    #         dfx['dow_cos'] = np.cos(2 * np.pi * dow / 7.0)
-    #
-    #         # Flags de sesiones
-    #         # Nota: si una sesión cruza medianoche, tratamos ese caso especial
-    #         def _in_interval(h, m, start, end):
-    #             sh, sm = start;
-    #             eh, em = end
-    #             start_min = sh * 60 + sm
-    #             end_min = eh * 60 + em
-    #             t = h * 60 + m
-    #             if start_min <= end_min:
-    #                 return (t >= start_min) & (t < end_min)
-    #             else:
-    #                 # cruza medianoche
-    #                 return (t >= start_min) | (t < end_min)
-    #
-    #         hh = dfx['datetime'].dt.hour
-    #         mm = dfx['datetime'].dt.minute
-    #         for flag, (start, end) in session_defs.items():
-    #             dfx[flag] = _in_interval(hh, mm, start, end).astype(int)
-    #     else:
-    #         # Si no hay datetime, crea columnas nulas para mantener el contrato
-    #         dfx['minute_sin'] = 0.0;
-    #         dfx['minute_cos'] = 0.0
-    #         dfx['dow_sin'] = 0.0;
-    #         dfx['dow_cos'] = 0.0
-    #         for flag in ["session_ny_open", "session_london_open", "session_asia_open"]:
-    #             dfx[flag] = 0
-    #
-    #     # =========================
-    #     # Soportes / Resistencias (se asume ya están en df):
-    #     # dist_PP, dist_S1, dist_R1, dist_S2, dist_R2, dist_resist_rl, dist_support_rl
-    #     # más dist_*_8h_atr: distancias normalizadas por ATR (ya en tu dataset)
-    #     # =========================
-    #     dfx = add_sr_features_8h(dfx)  # ← NUEVO (8h)
-    #     dfx = add_stoch_extreme_features(dfx)
-    #     # =========================
-    #     # Líneas de tendencia (close)
-    #     # =========================
-    #     for w in trend_windows:
-    #         dfx[f"trend_slope_norm_{w}"] = (
-    #             dfx["close"].rolling(window=w, min_periods=w)
-    #             .apply(lambda a: _trend_slope_norm(a), raw=True)
-    #         )
-    #         dfx[f"trend_r2_{w}"] = (
-    #             dfx["close"].rolling(window=w, min_periods=w)
-    #             .apply(lambda a: _trend_r2(a), raw=True)
-    #         )
-    #         dfx[f"trend_dist_pct_{w}"] = (
-    #             dfx["close"].rolling(window=w, min_periods=w)
-    #             .apply(lambda a: _trend_dist_pct(a), raw=True)
-    #         )
-    #
-    #     # =========================
-    #     # Canales de tendencia (regresión sobre highs/lows en ventana)
-    #     # =========================
-    #     def _channel_feats(high_series, low_series, w):
-    #         # slope_high, slope_low y ancho (línea_high - línea_low) en el último punto
-    #         hs = high_series.rolling(window=w, min_periods=w).apply(
-    #             lambda a: _linreg_line(a)[0], raw=True)
-    #         ls = low_series.rolling(window=w, min_periods=w).apply(
-    #             lambda a: _linreg_line(a)[0], raw=True)
-    #
-    #         # reconstruir predicciones al último punto para estimar ancho del canal
-    #         def _last_line_val(s, w):
-    #             # devuelve y_hat en x=w-1
-    #             return s.rolling(window=w, min_periods=w).apply(
-    #                 lambda a: _linreg_line(a)[0] * (w - 1) + _linreg_line(a)[1], raw=True)
-    #
-    #         high_last = _last_line_val(high_series, w)
-    #         low_last = _last_line_val(low_series, w)
-    #         width = (high_last - low_last) / (np.abs(dfx['close']) + eps)
-    #
-    #         return hs, ls, width
-    #
-    #     ch_w = channel_window
-    #     ch_high_slope, ch_low_slope, ch_width = _channel_feats(dfx['high'], dfx['low'], ch_w)
-    #     dfx['trend_channel_slope_high'] = ch_high_slope
-    #     dfx['trend_channel_slope_low'] = ch_low_slope
-    #     dfx['trend_channel_width'] = ch_width
-    #
-    #     # =========================
-    #     # Patrones de velas (simples y reproducibles)
-    #     # =========================
-    #     body = (dfx['close'] - dfx['open']).abs()
-    #     range_ = (dfx['high'] - dfx['low']).replace(0, eps)
-    #     upper_wick = dfx['high'] - dfx[['close', 'open']].max(axis=1)
-    #     lower_wick = dfx[['close', 'open']].min(axis=1) - dfx['low']
-    #
-    #     # Doji: cuerpo pequeño relativo al rango
-    #     dfx['candle_doji'] = (body / range_ < 0.1).astype(int)
-    #
-    #     # Pin bar: mecha larga en un lado
-    #     dfx['candle_pinbar'] = (
-    #             ((upper_wick / range_) > 0.6) | ((lower_wick / range_) > 0.6))
-    #     dfx['candle_pinbar'] = dfx['candle_pinbar'].astype(int)
-    #
-    #     # Engulfing: cuerpo actual envuelve al anterior (simplificado)
-    #     prev_open = dfx['open'].shift(1);
-    #     prev_close = dfx['close'].shift(1)
-    #     bull_engulf = (dfx['close'] > dfx['open']) & (prev_close < prev_open) & \
-    #                   (dfx['close'] >= prev_open) & (dfx['open'] <= prev_close)
-    #     bear_engulf = (dfx['close'] < dfx['open']) & (prev_close > prev_open) & \
-    #                   (dfx['open'] >= prev_close) & (dfx['close'] <= prev_open)
-    #     dfx['candle_engulfing'] = (bull_engulf | bear_engulf).astype(int)
-    #
-    #     # =========================
-    #     # Confluencias (RSI + cercanía a SR)
-    #     # =========================
-    #     # "Cerca" = distancia < sr_threshold_frac * ATR
-    #     near_S1 = (dfx['dist_S1'].abs() < sr_threshold_frac * (dfx['ATR'] + eps))
-    #     near_R1 = (dfx['dist_R1'].abs() < sr_threshold_frac * (dfx['ATR'] + eps))
-    #     dfx['rsi14_oversold_near_support'] = ((dfx['rsi_14'] < rsi_oversold) & near_S1).astype(int)
-    #     dfx['rsi14_overbought_near_resist'] = ((dfx['rsi_14'] > rsi_overbought) & near_R1).astype(int)
-    #
-    #     # =========================
-    #     # Dummies (si existen en tu dataset)
-    #     # =========================
-    #     # trend_ema200 / trend_vwap eran categóricas; conviértelas a dummies si están
-    #     dummy_cols_base = ['trend_ema200']
-    #     for col in dummy_cols_base:
-    #         if col in dfx.columns and dfx[col].dtype == 'object':
-    #             dfx = pd.get_dummies(dfx, columns=[col])
-    #     # aseguremos flags esperados si quieres forzar columnas
-    #     for col in ['trend_ema200_up']:
-    #         if col not in dfx.columns:
-    #             dfx[col] = 0
-    #
-    #     # =========================
-    #     # Lags básicos de OHLC
-    #     # =========================
-    #     for lag in lags:
-    #         dfx[f'close_lag{lag}'] = dfx['close'].shift(lag)
-    #         dfx[f'high_lag{lag}'] = dfx['high'].shift(lag)
-    #         dfx[f'low_lag{lag}'] = dfx['low'].shift(lag)
-    #         dfx[f'e100_lag{lag}'] = dfx['e100'].shift(lag)
-    #         dfx[f'volume_lag{lag}'] = dfx['e100'].shift(lag)
-    #
-    #
-    #
-    #     # =========================
-    #     # New day features
-    #     # =========================
-    #     dfx = self.add_new_day_features(dfx)
-    #
-    #     # =========================
-    #     # Lista final de features
-    #     # =========================
-    #
-    #
-    #     features_price = [
-    #         'close', 'high', 'low', 'e100', 'volume'
-    #     ]
-    #     # === Generar lag features ===
-    #     for col in features_price:
-    #         for lag in lags:
-    #             df[f'{col}_lag{lag}'] = df[col].shift(lag)
-    #     lag_feature_names = [f'{col}_lag{lag}' for col in features_price for lag in lags]
-    #
-    #     features_vol = ['avg_volume_last_n', 'volatility', 'volatility_50', 'atr_norm']
-    #     features_sr = ['dist_PP', 'dist_S1', 'dist_R1', 'dist_S2', 'dist_R2', 'dist_resist_rl', 'dist_support_rl',
-    #                    'dist_P_8h_atr', 'dist_S1_8h_atr', 'dist_R1_8h_atr', 'dist_S2_8h_atr', 'dist_R2_8h_atr']
-    #     features_time = ['minute_sin', 'minute_cos', 'dow_sin', 'dow_cos']
-    #     features_trend = ['ema_ratio'] + \
-    #                      [f"trend_slope_norm_{w}" for w in trend_windows] + \
-    #                      [f"trend_r2_100"] + \
-    #                      [f"trend_dist_pct_{w}" for w in trend_windows] + \
-    #                      ['trend_channel_slope_high', 'trend_channel_slope_low', 'trend_channel_width']
-    #     features_momentum = ['rsi_50', 'roc_30', 'k', 'd']
-    #     features_candles = ['candle_engulfing']
-    #     features_conflu = ['rsi14_oversold_near_support', 'rsi14_overbought_near_resist']
-    #
-    #     new_day_feats = ['range_prev_day_abs', 'range_prev_day_pct',
-    #                      'overnight_range_abs', 'overnight_range_pct']
-    #     if 'ATR' in dfx.columns:
-    #         new_day_feats += ['range_prev_day_atr', 'overnight_range_atr']
-    #     # Dummies si existen (no obligatorias)
-    #     # optional_dummies = [c for c in ['trend_ema200_up'] if c in dfx.columns]
-    #
-    #     features_final = features_price + features_vol + features_sr + features_time + \
-    #                      features_trend + new_day_feats + lag_feature_names + features_candles + features_momentum
-    #
-    #     # =========================
-    #     # Limpieza robusta
-    #     # =========================
-    #     # Reemplaza inf/-inf por NaN en las columnas de interés y deja que tu pipeline downstream dropee NaNs
-    #     dfx[features_final] = dfx[features_final].replace([np.inf, -np.inf], np.nan)
-    #
-    #     print("Datos preparados para el entrenamiento")
-    #
-    #     return dfx, features_final
-
     def preparar_features_trader(self, df, lags=[1]):
         """
         Feature set 'trader-like':
@@ -8747,8 +9003,15 @@ class StochasticAnalyzer:
         # Utilidades
         # =========================
         def _ensure_datetime(d):
-            if 'datetime' in d.columns and not pd.api.types.is_datetime64_any_dtype(d['datetime']):
-                d['datetime'] = pd.to_datetime(d['datetime'], utc=True, errors='coerce')
+            if 'datetime' in d.columns:
+                if not pd.api.types.is_datetime64_any_dtype(d['datetime']):
+                    d['datetime'] = pd.to_datetime(d['datetime'], utc=True, errors='coerce')
+
+                # Forzar conversión a Bogotá para alinear backtest (CSV) con Live Trading
+                if getattr(d['datetime'].dt, 'tz', None) is None:
+                    d['datetime'] = d['datetime'].dt.tz_localize('UTC').dt.tz_convert('America/Bogota')
+                elif str(d['datetime'].dt.tz) != 'America/Bogota':
+                    d['datetime'] = d['datetime'].dt.tz_convert('America/Bogota')
             return d
 
         def _safe_pct_change(s, periods=1):
@@ -9103,7 +9366,13 @@ class StochasticAnalyzer:
         # === NEW: banda neutral RSI (contexto de mean-reversion vs. trend) ===
         dfx['rsi_40_60'] = ((dfx['rsi_14'] >= 40) & (dfx['rsi_14'] <= 60)).astype(int)
 
+        # === NEW: volatilidad ===
+        dfx['atr_pct'] = dfx['ATR'] / (dfx['close'] + eps)
+        dfx['atr_vs_ema200'] = dfx['ATR'] / (dfx['ATR'].ewm(span=200, adjust=False).mean() + eps)
+
         features = [
+            'atr_pct',
+            'atr_vs_ema200',
             'macd_minus_signal',
             'vol_ratio',
             'z_atr_norm',
@@ -9433,17 +9702,17 @@ class StochasticAnalyzer:
         # DEBUG: Ver qué se está marcando como constante
         if verbose:
             print("\n[DEBUG] Análisis de constantes:")
-        
+
         constant_cols = []
         for col in num_df.columns:
             unique_with_nan = num_df[col].nunique(dropna=False)
             unique_no_nan = num_df[col].nunique(dropna=True)
             variance = num_df[col].var()
             nan_count = num_df[col].isna().sum()
-            
+
             # Una columna es constante si tiene ≤1 valor único (excluyendo NaN) O varianza 0
             is_constant = (unique_no_nan <= 1) or (variance == 0 or pd.isna(variance))
-            
+
             if is_constant:
                 constant_cols.append(col)
                 if verbose:
@@ -9455,7 +9724,6 @@ class StochasticAnalyzer:
                     sample_vals = num_df[col].dropna().head(10).tolist()
                     print(f"     - Sample values: {sample_vals}")
 
-        
         if constant_cols:
             info["dropped_constant"] = constant_cols
             num_df = num_df.drop(columns=constant_cols, errors="ignore")
@@ -9598,14 +9866,14 @@ class StochasticAnalyzer:
         # Esto ocurre cuando algunos estados nunca tienen transiciones observadas
         transmat = hmm.transmat_.copy()
         row_sums = transmat.sum(axis=1, keepdims=True)
-        
+
         # Para filas con suma 0, distribuir uniformemente
         zero_rows = (row_sums == 0).flatten()
         if zero_rows.any():
             print(f"[HMM] Warning: {zero_rows.sum()} estados sin transiciones observadas. Normalizando...")
             transmat[zero_rows] = 1.0 / n_hmm_components  # Distribución uniforme
             row_sums = transmat.sum(axis=1, keepdims=True)
-        
+
         # Normalizar todas las filas para asegurar suma = 1
         hmm.transmat_ = transmat / (row_sums + 1e-12)
 
@@ -9616,14 +9884,20 @@ class StochasticAnalyzer:
         # llenamos solo donde había datos válidos
         df_regime.loc[mask_valid, "hmm_state"] = hidden_states.astype(float)
 
-
         df_regime["buy_pressure"] = df_regime["volume"] * (df_regime["close"] > df_regime["open"]).astype(int)
         df_regime["sell_pressure"] = df_regime["volume"] * (df_regime["close"] < df_regime["open"]).astype(int)
 
-        df_regime["vol_imbalance"] = (df_regime["buy_pressure"] - df_regime["sell_pressure"]) / (df_regime["volume"] + 1e-9)
+        df_regime["vol_imbalance"] = (df_regime["buy_pressure"] - df_regime["sell_pressure"]) / (
+                df_regime["volume"] + 1e-9)
 
         df_regime["signed_volume"] = np.sign(df_regime["close"].diff()) * df_regime["volume"]
-        df_regime["signed_volume_ema"] = df_regime["signed_volume"].ewm(span=30).mean()
+        # Normalizar por el volumen medio de los últimos 200 períodos → convierte unidades
+        # absolutas (BTC/AVAX vendidos) en un ratio puro (+1 = toda la presión fue compradora,
+        # -1 = toda fue vendedora). Sin esto el EMA cambia de escala con el volumen del exchange.
+        _vol_ma200 = df_regime["volume"].rolling(200, min_periods=10).mean().replace(0, np.nan)
+        df_regime["signed_volume_ema"] = (
+                df_regime["signed_volume"].ewm(span=30).mean() / (_vol_ma200 + 1e-9)
+        )
 
         df_regime["upper_wick"] = df_regime["high"] - np.maximum(df_regime["close"], df_regime["open"])
         df_regime["lower_wick"] = np.minimum(df_regime["close"], df_regime["open"]) - df_regime["low"]
@@ -9638,7 +9912,8 @@ class StochasticAnalyzer:
 
         df_regime["dist_S2_ema"] = df_regime["dist_S2"].ewm(span=40).mean()
 
-        df_regime["shock_ema"] = ((df_regime["ret"].abs() > df_regime["ret"].abs().rolling(200).mean() * 2).astype(int)).ewm(span=50).mean()
+        df_regime["shock_ema"] = (
+            (df_regime["ret"].abs() > df_regime["ret"].abs().rolling(200).mean() * 2).astype(int)).ewm(span=50).mean()
 
         df_regime["trend_slope_ema"] = df_regime["delta_trend_slope_100"].ewm(span=30).mean()
 
@@ -9675,6 +9950,30 @@ class StochasticAnalyzer:
         # df_features = df_math[feature_cols].copy()
         return df_regime, regime_cols
 
+    def add_lagged_features_antigravity(self, df: pd.DataFrame, lags: List[int] = [1, 2, 3]) -> Tuple[
+        pd.DataFrame, List[str]]:
+        """
+        Agrega rezagos (lags) a características clave de Price Action, Volumen y Osciladores Rápidos.
+        """
+        out = df.copy()
+        target_features = [
+            'body_norm', 'upper_wick', 'lower_wick', 'close_position', 'candle_range_norm',
+            'rsi_7', 'rsi_14', 'macd_hist', 'k', 'd',
+            'volume', 'z_volume', 'buy_pressure', 'sell_pressure', 'vol_ratio',
+            'return_1_raw', 'ret_abs'
+        ]
+
+        new_cols = []
+        for col in target_features:
+            if col in out.columns:
+                for lag in lags:
+                    new_col_name = f"{col}_lag{lag}"
+                    if new_col_name not in out.columns:
+                        out[new_col_name] = out[col].shift(lag)
+                    new_cols.append(new_col_name)
+
+        return out, new_cols
+
     def preparar_features(
             self,
             df_final: pd.DataFrame,
@@ -9689,12 +9988,18 @@ class StochasticAnalyzer:
             """
 
         df_final, trader_cols = self.preparar_features_trader(df_final)
+        df_final, trader_cols = self.preparar_features_antigravity(df_final)
         df_final, complementary_cols = self.new_features_complementary(df_final)
+        df_final, complementary_cols = self.new_features_complementary_antigravity(df_final)
         df_final, math_cols = self.build_mathstat_features(df_final)
+        df_final, math_cols = self.build_mathstat_features_antigravity(df_final)
+        df_final, impulse_cols = self.build_impulse_features(df_final)
 
         df_final, regime_cols = self.build_regime_features(df_final)
+        df_final, regime_cols = self.build_regime_features_antigravity(df_final)
 
-
+        # ======== Antigravity Lagged Features ========
+        df_final, lag_cols = self.add_lagged_features_antigravity(df_final, lags=[1, 2, 3])
 
         # features_trader = ['dist_S2', 'dist_R2', 'close', 'dist_PP', 'volatility_50', 'minute_sin', 'minute_cos',
         #                    'overnight_range_pct', 'trend_slope_norm_100', 'dist_S2_8h_atr', 'avg_volume_last_n',
@@ -9713,13 +10018,13 @@ class StochasticAnalyzer:
         #                    'ema_ratio', 'rsi_50', 'dist_resist_rl', 'roc_30', 'dist_support_rl',
         #                    'd', 'dow_sin', 'volume', 'dow_cos']
 
-
+        # Añadimos localmente los lags recien creados a FEATURES para que el modelo los use.
         features_final = FEATURES
 
         # Reemplaza inf/-inf por NaN en las columnas de interés y deja que tu pipeline downstream dropee NaNs
         df_final[features_final] = df_final[features_final].replace([np.inf, -np.inf], np.nan)
 
-        # self.drop_highly_correlated_features(df_final[features_final], threshold=0.9)
+        # self.drop_highly_correlated_features(df_final[features_final], threshold=1)
 
         print("Datos preparados para el entrenamiento")
 
@@ -9854,6 +10159,7 @@ class StochasticAnalyzer:
         # --- 3) Gap de apertura ---
         daily['gap_open_abs'] = daily['day_open'] - daily['day_close'].shift(1)
         daily['gap_open_pct'] = daily['gap_open_abs'] / (daily['day_close'].shift(1).abs() + eps)
+        # El tamaño del salto en porcentaje (siempre positivo gracias al np.abs)
 
         # --- 4) Volatilidad overnight (20:00–06:59) ---
         overnight_flag = (dfx['__hour'] >= 20) | (dfx['__hour'] < 7)
@@ -9918,6 +10224,19 @@ class StochasticAnalyzer:
                     dfx[c] = np.nan
             dfx['range_prev_day_atr'] = dfx['range_prev_day_abs'] / (dfx['ATR'] + eps)
             dfx['overnight_range_atr'] = dfx['overnight_range_abs'] / (dfx['ATR'] + eps)
+
+        # --- 6.5) Decaimiento intradiario del gap (Time Decay) ---
+        # Calculamos horas transcurridas desde el inicio del día (00:00)
+        hours_elapsed = dfx['__hour'] + dfx['__minute'] / 60.0
+        # Half-life de 4 horas: en 4hs el gap pesa la mitad, en 8hs pesa 1/4
+        half_life_hours = 4.0
+        decay_factor = np.exp(-np.log(2) / half_life_hours * hours_elapsed)
+        dfx['gap_open_pct_abs'] = np.abs((dfx['open'] - dfx['close'].shift(1)) / (dfx['close'].shift(1) + eps))
+
+        if 'gap_open_pct' in dfx.columns:
+            dfx['gap_open_pct_decay'] = dfx['gap_open_pct'] * decay_factor
+        if 'gap_open_abs' in dfx.columns:
+            dfx['gap_open_abs'] = dfx['gap_open_abs'] * decay_factor
 
         # --- 7) Limpieza auxiliares ---
         dfx.drop(columns=['__date', '__hour', '__minute', '__overnight_date'], errors='ignore', inplace=True)
@@ -11069,19 +11388,177 @@ def _build_base_model(model_type: str, random_state: int = 42, model_kwargs: Opt
     if model_type in ("lgbm", "lightgbm"):
         if not _HAS_LGBM:
             raise ImportError("LightGBM no está instalado. Ejecuta: pip install lightgbm")
-        # valores razonables; puedes ajustarlos vía model_kwargs
         defaults = dict(
-            n_estimators=700,
-            learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            random_state=random_state,
-            n_jobs=-1
+            random_state=42,
+            n_jobs=-1,
+            verbosity=-1
         )
         defaults.update(model_kwargs)
         return LGBMClassifier(**defaults), "lgbm"
 
     raise ValueError(f"model_type desconocido: {model_type}. Usa: 'rf', 'lgbm' o 'xgb'.")
+
+
+def analyze_model_failures_shap(model, X_test, y_test, feature_names, title="🔍 Análisis de Fallos (Falsos Positivos)"):
+    """
+    Identifica operaciones donde el modelo tuvo confianza (Pred > 0.5) pero fallaron (SL),
+    y analiza con SHAP qué features causaron ese error.
+    """
+    import shap
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+
+    try:
+        # 1. Obtener probabilidades (clase 1 es acierto/TP)
+        probs = model.predict_proba(X_test)[:, 1]
+        preds = (probs >= 0.5).astype(int)
+        
+        # 2. Máscara de Falsos Positivos
+        y_test_bin = np.array(y_test).astype(int)
+        false_positives_mask = (y_test_bin == 0) & (preds == 1)
+        
+        if not np.any(false_positives_mask):
+            print("\n[SHAP Info] No se encontraron Falsos Positivos claros para analizar.")
+            return
+
+        X_failures = X_test[false_positives_mask]
+        print(f"\n[🚨 SHAP] Analizando {len(X_failures)} operaciones fallidas (SL) que el modelo calificó como ganadoras...")
+
+        # 3. Extraer el modelo base para el explainer
+        base_model = model
+        if hasattr(model, 'base_model'): 
+            base_model = model.base_model 
+        elif hasattr(model, 'calibrated_classifiers_'):
+            cal_obj = model.calibrated_classifiers_[0]
+            base_model = getattr(cal_obj, 'estimator', getattr(cal_obj, 'base_estimator', model))
+        elif hasattr(model, 'estimator'):
+            base_model = model.estimator
+        elif hasattr(model, 'base_estimator'): 
+            base_model = model.base_estimator
+
+        # 4. Cálculo de SHAP
+        explainer = shap.TreeExplainer(base_model)
+        shap_vals = explainer.shap_values(X_failures)
+
+        if isinstance(shap_vals, list):
+            s_val = shap_vals[1] if len(shap_vals) > 1 else shap_vals[0]
+        else:
+            s_val = shap_vals
+
+        # 5. Reporte de Texto (Diagnóstico)
+        mean_shap_failures = np.mean(np.abs(s_val), axis=0)
+        direction_bias = []
+        for i in range(len(feature_names)):
+            feat_values = X_failures[:, i]
+            shap_impact = s_val[:, i]
+            if np.std(feat_values) > 1e-8:
+                bias = np.corrcoef(feat_values, shap_impact)[0, 1]
+            else:
+                bias = 0
+            direction_bias.append(bias)
+
+        df_report = pd.DataFrame({
+            'Feature': feature_names,
+            'Impacto_Error': mean_shap_failures,
+            'Bias_Direccional': direction_bias
+        }).sort_values(by='Impacto_Error', ascending=False)
+
+        print("\n" + "="*60)
+        print(f"📋 REPORTE DE DIAGNÓSTICO DE FALLOS (n={len(X_failures)})")
+        print("Variables que más 'engañan' al modelo hacia el Falso Positivo:")
+        print("="*60)
+        
+        for _, row in df_report.head(12).iterrows():
+            dir_str = "ALTO" if row['Bias_Direccional'] > 0.2 else ("BAJO" if row['Bias_Direccional'] < -0.2 else "MIXTO/CUALQUIER VALOR")
+            print(f" -> {row['Feature']:<20} | Impacto: {row['Impacto_Error']:.4f} | El modelo falla cuando es: {dir_str}")
+        
+        print("="*60)
+        print("💡 CONSEJO: Las variables de arriba 'inflan' artificialmente la probabilidad de acierto.")
+        print("Si el valor es ALTO/BAJO, considera aplicar restricciones monotónicas.")
+        print("="*60 + "\n")
+
+        # 6. Visualización
+        plt.figure(figsize=(10, 8))
+        shap.summary_plot(s_val, X_failures, feature_names=feature_names, show=False)
+        plt.title(f"{title} - n={len(X_failures)}")
+        plt.tight_layout()
+        plt.show(block=False)
+
+    except Exception as e:
+        print(f"\n[⚠️ SHAP Error] No se pudo realizar el análisis de fallos: {e}")
+
+
+def generate_auto_monotone_constraints(df_model, features, target_col='result', bias_threshold=0.2, kwargs={}):
+    """
+    Entrena un modelo LightGBM rápido, analiza los Falsos Positivos con SHAP,
+    y devuelve una tupla de monotone_constraints lista para usar en el modelo principal.
+    """
+    import lightgbm as lgb
+    import shap
+    import numpy as np
+    from sklearn.model_selection import train_test_split
+    
+    print("\n" + "="*60)
+    print("🤖 GENERANDO REGLAS MONOTÓNICAS AUTOMÁTICAS (AUTO-SHAP)")
+    print("="*60)
+    
+    # LightGBM no necesita StandardScaler, trabajamos con datos crudos
+    df_clean = df_model.dropna(subset=features + [target_col]).copy()
+    X = df_clean[features]
+    y = np.where(df_clean[target_col].eq('tp'), 1, 0)
+    
+    # Split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    
+    # Entrenar modelo diagnóstico (rápido y superficial para evitar overfitting)
+    # model = lgb.LGBMClassifier(n_estimators=100, max_depth=5, random_state=42, n_jobs=-1, verbosity=-1)
+    # LGBMClassifier(**defaults)
+    model = lgb.LGBMClassifier(**kwargs)
+    model.fit(X_train, y_train)
+    
+    # Buscar Falsos Positivos (Predice >= 0.5, Realidad 0)
+    probs = model.predict_proba(X_test)[:, 1]
+    preds = (probs >= 0.5).astype(int)
+    false_positives_mask = (y_test == 0) & (preds == 1)
+    X_failures = X_test[false_positives_mask]
+    
+    if len(X_failures) == 0:
+        print("[INFO] No se encontraron suficientes falsos positivos para analizar. Retornando neutro.")
+        return tuple([0] * len(features)), [], []
+        
+    # SHAP
+    explainer = shap.TreeExplainer(model)
+    shap_vals = explainer.shap_values(X_failures)
+    s_val = shap_vals[1] if isinstance(shap_vals, list) and len(shap_vals) > 1 else (shap_vals[0] if isinstance(shap_vals, list) else shap_vals)
+        
+    # Analizar bias
+    problematic_high = []
+    problematic_low = []
+    constraints = []
+    
+    for i, feat in enumerate(features):
+        feat_values = X_failures.iloc[:, i].values
+        shap_impact = s_val[:, i]
+        
+        bias = np.corrcoef(feat_values, shap_impact)[0, 1] if np.std(feat_values) > 1e-8 else 0
+            
+        if bias > bias_threshold:
+            problematic_high.append(feat)
+            constraints.append(-1) # Alto valor causa error -> Forzar relación negativa/plana
+        elif bias < -bias_threshold:
+            problematic_low.append(feat)
+            constraints.append(1)  # Bajo valor causa error -> Forzar relación positiva/plana
+        else:
+            constraints.append(0)
+            
+    print(f"✅ Análisis completado en {len(X_failures)} fallos.")
+    print(f" -> Features restringidas si son ALTAS ({len(problematic_high)}): {problematic_high}")
+    print(f" -> Features restringidas si son BAJAS ({len(problematic_low)}): {problematic_low}")
+    print("="*60 + "\n")
+    
+    return tuple(constraints), problematic_high, problematic_low
+
 
 def create_predictive_model_m2(
         df_model,
@@ -11109,7 +11586,6 @@ def create_predictive_model_m2(
         if df_model.empty:
             raise RuntimeError("[META] No hay datos previos a 'as_of'.")
 
-
     # Alinear tz del df_model a la de self.data (si hiciera falta)
     tz_raw = getattr(df_model["datetime"].dt, "tz", None)
     tz_mod = getattr(df_model["datetime"].dt, "tz", None)
@@ -11117,7 +11593,6 @@ def create_predictive_model_m2(
         df_model["datetime"] = df_model["datetime"].dt.tz_localize(tz_raw)
     elif (tz_raw is not None) and (tz_mod is not None) and (str(tz_raw) != str(tz_mod)):
         df_model["datetime"] = df_model["datetime"].dt.tz_convert(tz_raw)
-
 
     try:
         n_total = len(df_model)
@@ -11138,18 +11613,15 @@ def create_predictive_model_m2(
     except Exception as e:
         print(f"No se pudo obtener rango de fechas: {e}")
 
-
     # 1) Etiqueta binaria si no existe
     if "y_meta" not in df_model.columns:
         # Solo positivo (1) cuando es 'tp', 0 en caso contrario (incluyendo 'sl')
         df_model["y_meta"] = np.where(df_model["result"].eq("tp"), 1, 0)
 
-
     # Excluir últimas L para evitar fuga de datos
     df_train = df_model.copy()
     df_train = df_train[df_train["y_meta"].notna()]
     df_train = df_train.dropna(subset=features + ["y_meta"])
-
 
     X = df_train[features]
     y = df_train["y_meta"]
@@ -11286,17 +11758,19 @@ def create_predictive_model_m2(
     # print(f"Log loss: {logloss_calib:.6f}")
     print(f"ECE: {ece_calib:.6f}")
 
-
     # Importancias
     feature_importance = _safe_feature_importance(base_model, X_tr, y_tr, features, display_feature_plot)
     print("\nImportancia de características:")
     print(feature_importance)
 
+    # NUEVO: Análisis de fallos con SHAP
+    if display_graphic:
+        analyze_model_failures_shap(model, X_test_scaled, y_test, features)
+
     print(f"\nModelo base: {model_tag.upper()} | calibración: {calibrate_method}")
 
-
     # Gráficas de calibración
-    if display_graphic:
+    if False:
         proba_base = proba_vanilla
         proba_calib = proba_cal
         clases = classes_cal  # o classes; ambas deberían coincidir en orden
@@ -11340,6 +11814,833 @@ def create_predictive_model_m2(
     return model
 
 
+def select_features_by_shap(df, features, target_col='y_meta', threshold=0.0, verbose=True):
+    """
+    Selecciona las mejores features basadas en importancia SHAP.
+    - threshold: Importancia mínima (por defecto > 0).
+    """
+    import lightgbm as lgb
+    import numpy as np
+    import pandas as pd
+    import shap
+
+    # Preparar target binario si no existe (asumiendo formato M2)
+    if target_col not in df.columns and 'result' in df.columns:
+        df[target_col] = np.where(df["result"].eq("tp"), 1, 0)
+
+    df_clean = df.dropna(subset=features + [target_col])
+    if len(df_clean) < 100:
+        if verbose: print(f"[⚠️ SHAP] Muy pocos datos ({len(df_clean)}) para análisis fiable. Saltando.")
+        return features
+
+    X = df_clean[features]
+    y = df_clean[target_col]
+
+    # Modelo base rápido para obtener importancias
+    # model = lgb.LGBMClassifier(n_estimators=100, random_state=42, n_jobs=-1, verbosity=-1)
+    model = lgb.LGBMClassifier(random_state=42, n_jobs=-1, verbosity=-1)
+    model.fit(X, y)
+
+    explainer = shap.TreeExplainer(model)
+    shap_vals = explainer.shap_values(X)
+
+    if isinstance(shap_vals, list) and len(shap_vals) == 2:
+        vals = np.abs(shap_vals[1]).mean(axis=0)
+    else:
+        vals = np.abs(shap_vals).mean(axis=0)
+
+    importance_df = pd.DataFrame({
+        'feature': features,
+        'importance': vals
+    }).sort_values(by='importance', ascending=False)
+
+    selected = importance_df[importance_df['importance'] > threshold]['feature'].tolist()
+
+    if verbose:
+        print(f"\n[📊 SHAP] Selección terminada. Manteniendo {len(selected)}/{len(features)} features.")
+        print("Features seleccionadas e importancia:")
+        top_df = importance_df[importance_df['importance'] > threshold]
+        for _, row in top_df.iterrows():
+            print(f"  - {row['feature']}: {row['importance']:.6f}")
+
+        discarded = list(set(features) - set(selected))
+        if discarded:
+            print(f"Features descartadas (imp <= {threshold}): {discarded}")
+
+    return selected
+
+
+def get_best_kwargs_by_df(df_general, df_data, trials=50, features=FEATURES, analyzer=None, n_keep=410000, target_pnl=None,
+                          timeout_mins=30, initial_params=None) -> dict:
+    """
+    Optimizador unificado Optuna (HPO).
+    - target_pnl: Si se alcanza este beneficio acumulado, se detiene la búsqueda.
+    - timeout_mins: Tiempo máximo de búsqueda en minutos.
+    - initial_params: Diccionario con parámetros para empezar la búsqueda (semilla).
+    """
+    import lightgbm as lgb
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.metrics import log_loss
+    from sklearn.preprocessing import LabelEncoder
+    import optuna
+    import random
+    import numpy as np
+
+    # Callback para parada temprana por puntaje
+    def stop_at_score_callback(study, trial):
+        if target_pnl is not None:
+            # Optuna minimiza -PnL, así que pnl de 50 es -50.0
+            if study.best_value <= -target_pnl:
+                print(
+                    f"\n🎯 OBJETIVO ALCANZADO ({study.best_value * -1:.2f} >= {target_pnl}). Deteniendo búsqueda temprana...")
+                study.stop()
+
+    timeout_secs = timeout_mins * 60
+
+    # =========================================================
+    # RUTA M1: Modelo Principal (Bloque Continuo Aleatorio)
+    # =========================================================
+    if analyzer is not None:
+        print("\n[⚡ HPO] Optuna detectó dataset M1. Extrayendo bloque continuo aleatorio...")
+
+        # 1. Preparar features usando la caché incremental (MUCHO más rápido)
+        try:
+            df_model = df_data
+            feats = FEATURES
+
+        except Exception as e:
+            print("[WARN] Info: Usando preparación de features tradicional (lenta)...")
+            df_model, feats = analyzer.preparar_features(df_data.copy())
+
+        # 2. Descartar Nulos. No se requiere lookahead manual porque ya viene recortado por fit_once.
+        df_model = df_model[df_model["future_trend"].notna()]
+        df_model = df_model.dropna(subset=feats + ["future_trend"])
+
+        # 3. FORMATO HOLD-OUT (PROPUESTA DE USUARIO)
+        BLOQUE_VAL = min(5_000, int(len(df_model) * 0.2))
+        SCAN_PAD = 300  # Velas extras para poder simular el TP del final del bloque
+
+        # El punto donde cortamos el pasado para el Entrenamiento y el presente para Optuna
+        split_idx = len(df_model) - BLOQUE_VAL - SCAN_PAD
+
+        df_train = df_model.iloc[:split_idx].copy()
+        df_simulate = df_model.iloc[split_idx:].copy()
+
+        n_total = len(df_train)
+
+        # Recorte a las últimas N_KEEP
+        if n_total > n_keep:
+            df_train = df_train.iloc[-n_keep:].copy()
+
+        print("\n" + "=" * 50)
+        print(f"🎯 MODO HOLD-OUT: Optimizador PnL Inteligente M1")
+        print(f" -> Entrenando sobre un pasado masivo: {len(df_train)} velas.")
+        print(f" -> Optimizando simulado sobre el futuro reciente: {BLOQUE_VAL} velas.")
+        print("=" * 50)
+
+        print("   -> 🧮 Pre-calculando resultados TP/SL reales para las velas recientes...")
+
+        # Asegurar existencia de ATR para el cálculo de comisiones
+        if 'ATR' not in df_simulate.columns:
+            print("   [INFO] 'ATR' no encontrada en df_simulate. Calculando aproximación...")
+            
+            # Extraer columnas faltantes de df_general si es necesario
+            cols_necesarias = ['high', 'low', 'close']
+            cols_a_extraer = [col for col in cols_necesarias if col not in df_simulate.columns and col in df_general.columns]
+            
+            if cols_a_extraer:
+                if 'datetime' in df_simulate.columns and 'datetime' in df_general.columns:
+                    df_temp = df_general[['datetime'] + cols_a_extraer].drop_duplicates(subset=['datetime'])
+                    df_simulate = pd.merge(df_simulate, df_temp, on='datetime', how='left')
+                elif df_simulate.index.name == 'datetime' and df_general.index.name == 'datetime':
+                    df_simulate = df_simulate.join(df_general[cols_a_extraer], how='left')
+                else:
+                    for col in cols_a_extraer:
+                        df_simulate[col] = df_general[col]
+                    
+            if 'high' in df_simulate.columns and 'low' in df_simulate.columns and 'close' in df_simulate.columns:
+                prev_close = df_simulate['close'].shift(1)
+                tr = pd.concat([
+                    df_simulate['high'] - df_simulate['low'],
+                    (df_simulate['high'] - prev_close).abs(),
+                    (df_simulate['low'] - prev_close).abs()
+                ], axis=1).max(axis=1)
+                df_simulate['ATR'] = tr.rolling(14).mean()
+                df_simulate['ATR'] = df_simulate['ATR'].bfill()
+            else:
+                print("   [WARN] Columnas 'high/low/close' ausentes incluso tras revisar df_general. Usando proxy 0.5% para ATR de comisiones si existe 'close'.")
+                if 'close' in df_simulate.columns:
+                    df_simulate['ATR'] = df_simulate['close'] * 0.005
+                else:
+                    df_simulate['ATR'] = 0.005
+
+        high_vals = df_simulate["high"].values
+        low_vals = df_simulate["low"].values
+        close_vals = df_simulate["close"].values
+
+        # Usar ATR existente en el dataframe (asegurando .values para resetear el índice)
+        atr = df_simulate["ATR"].values
+
+        tp_mult = 5.5
+        sl_mult = 3.0
+
+        long_results = np.zeros(len(df_simulate))  # 1: TP_hit, -1: SL_hit
+        short_results = np.zeros(len(df_simulate))
+
+        for i in range(len(df_simulate)):
+            if np.isnan(atr[i]): continue
+            if atr[i] == 0: continue
+
+            long_tp = close_vals[i] + tp_mult * atr[i]
+            long_sl = close_vals[i] - sl_mult * atr[i]
+            short_tp = close_vals[i] - tp_mult * atr[i]
+            short_sl = close_vals[i] + sl_mult * atr[i]
+
+            end_limit = min(len(df_simulate), i + SCAN_PAD)  # Maximo tiempo esperando TP/SL
+
+            # Scan Long
+            for j in range(i + 1, end_limit):
+                hit_tp = high_vals[j] >= long_tp
+                hit_sl = low_vals[j] <= long_sl
+                if hit_tp and hit_sl:
+                    long_results[i] = -1  # Conservador asume stop-loss en empate
+                    break
+                elif hit_tp:
+                    long_results[i] = 1
+                    break
+                elif hit_sl:
+                    long_results[i] = -1
+                    break
+
+            # Scan Short
+            for j in range(i + 1, end_limit):
+                hit_tp = low_vals[j] <= short_tp
+                hit_sl = high_vals[j] >= short_sl
+                if hit_tp and hit_sl:
+                    short_results[i] = -1
+                    break
+                elif hit_tp:
+                    short_results[i] = 1
+                    break
+                elif hit_sl:
+                    short_results[i] = -1
+                    break
+
+        df_simulate['long_res'] = long_results
+        df_simulate['short_res'] = short_results
+
+        # Ahora recortamos a nuestro Bloque de Validación oficial (quitando el padding)
+        df_val_opt = df_simulate.iloc[:BLOQUE_VAL]
+
+        # PREPARAR MATRICES
+        X_tr = df_train[feats]
+        X_val = df_val_opt[feats]
+
+        long_res_opt = df_val_opt['long_res'].values
+        short_res_opt = df_val_opt['short_res'].values
+
+        close_opt = df_val_opt['close'].values
+        atr_opt = df_val_opt['ATR'].values
+        fees_rate = fees.taker_open + fees.taker_close
+        atr_opt_safe = np.where(atr_opt == 0, 1e-8, atr_opt)
+        costo_comision_R = (close_opt * fees_rate) / (3.0 * atr_opt_safe)
+
+        encoder = LabelEncoder()
+        encoder.fit(df_model["future_trend"])
+        n_clases = len(encoder.classes_)
+
+        y_tr = encoder.transform(df_train["future_trend"])
+        y_val = encoder.transform(df_val_opt["future_trend"])
+
+        def m1_objective(trial):
+            params = {
+                'objective': 'multiclass' if n_clases > 2 else 'binary',
+                'num_class': n_clases if n_clases > 2 else 1,
+                'verbosity': -1,
+                'random_state': 42,
+                'n_jobs': -1,
+                # 'class_weight': 'None',
+                'class_weight': trial.suggest_categorical('class_weight', ['balanced', None]),
+                'max_depth': trial.suggest_int('max_depth', 5, 8),
+                'num_leaves': trial.suggest_int('num_leaves', 8, 150),
+                'min_child_samples': trial.suggest_int('min_child_samples', 20, 500, step=20),
+                'n_estimators': trial.suggest_int('n_estimators', 100, 1000, step=50),
+                # 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.05, step=0.01),
+                # 'subsample': trial.suggest_float('subsample', 0.7, 1, step=0.1),
+                # 'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 1, step=0.1)
+            }
+
+            bull_idx, bear_idx = -1, -1
+            try:
+                bull_idx = list(encoder.classes_).index('bullish')
+            except ValueError:
+                pass
+            try:
+                bear_idx = list(encoder.classes_).index('bearish')
+            except ValueError:
+                pass
+
+            model = lgb.LGBMClassifier(**params)
+
+            model.fit(
+                X_tr, y_tr,
+                eval_set=[(X_val, y_val)],
+                callbacks=[lgb.early_stopping(stopping_rounds=15, verbose=False)]
+            )
+
+            preds = model.predict_proba(X_val)
+
+            val_pnl = 0.0
+            total_trades = 0
+            thresh = 0.2
+
+            if bull_idx != -1:
+                prob_long = preds[:, bull_idx]
+                mask = prob_long >= thresh
+                total_trades += np.sum(mask)
+                val_pnl += np.sum(np.where(mask, np.where(long_res_opt == 1, 5.5 - costo_comision_R,
+                                                          np.where(long_res_opt == -1, -3.0 - costo_comision_R, 0)), 0))
+
+            if bear_idx != -1:
+                prob_short = preds[:, bear_idx]
+                mask = prob_short >= thresh
+                total_trades += np.sum(mask)
+                val_pnl += np.sum(np.where(mask, np.where(short_res_opt == 1, 5.5 - costo_comision_R,
+                                                          np.where(short_res_opt == -1, -3.0 - costo_comision_R, 0)),
+                                           0))
+
+            if total_trades < 1:
+                return 1000.0
+
+            return -val_pnl - (total_trades * 1e-6)
+
+        optuna.logging.set_verbosity(optuna.logging.INFO)
+        # optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study = optuna.create_study(direction='minimize', pruner=optuna.pruners.HyperbandPruner())
+
+        # Encolar parámetros iniciales si existen
+        if initial_params:
+            study.enqueue_trial(initial_params)
+
+        study.optimize(m1_objective, n_trials=trials, callbacks=[stop_at_score_callback], timeout=timeout_secs)
+
+        print("\n🏆 ¡Mejores parámetros encontrados por Optuna para M1!")
+        print(study.best_params)
+        print("-" * 50)
+
+        best_m1_params = study.best_params
+        best_m1_params['objective'] = 'multiclass' if n_clases > 2 else 'binary'
+        best_m1_params['num_class'] = n_clases if n_clases > 2 else 1
+        best_m1_params['random_state'] = 42
+        best_m1_params['n_jobs'] = -1
+        best_m1_params['verbosity'] = -1
+        return best_m1_params
+
+
+    # =========================================================
+    # RUTA M2: Meta-Modelo Guardián
+    # =========================================================
+    else:
+        if len(df_data) > 200:
+            print("\n[⚡ HPO] Optuna detectó dataset M2. Iniciando búsqueda...")
+
+            # Asegurar existencia de ATR para el cálculo de comisiones
+            if 'ATR' not in df_data.columns:
+                print("   [INFO] 'ATR' no encontrada en df_data. Extrayendo columnas faltantes de df_general...")
+                
+                # Extraer columnas faltantes de df_general si es necesario
+                cols_necesarias = ['high', 'low', 'close']
+                cols_a_extraer = [col for col in cols_necesarias if col not in df_data.columns and col in df_general.columns]
+                
+                if cols_a_extraer:
+                    if 'datetime' in df_data.columns and 'datetime' in df_general.columns:
+                        df_temp = df_general[['datetime'] + cols_a_extraer].drop_duplicates(subset=['datetime'])
+                        df_data = pd.merge(df_data, df_temp, on='datetime', how='left')
+                    elif df_data.index.name == 'datetime' and df_general.index.name == 'datetime':
+                        df_data = df_data.join(df_general[cols_a_extraer], how='left')
+                    else:
+                        for col in cols_a_extraer:
+                            df_data[col] = df_general[col]
+                        
+                if 'high' in df_data.columns and 'low' in df_data.columns and 'close' in df_data.columns:
+                    prev_close = df_data['close'].shift(1)
+                    tr = pd.concat([
+                        df_data['high'] - df_data['low'],
+                        (df_data['high'] - prev_close).abs(),
+                        (df_data['low'] - prev_close).abs()
+                    ], axis=1).max(axis=1)
+                    df_data['ATR'] = tr.rolling(14).mean()
+                    df_data['ATR'] = df_data['ATR'].bfill()
+                else:
+                    print("   [WARN] Columnas 'high/low/close' ausentes incluso tras revisar df_general. Usando proxy 0.5% para ATR de comisiones si existe 'close'.")
+                    if 'close' in df_data.columns:
+                        df_data['ATR'] = df_data['close'] * 0.005
+                    else:
+                        df_data['ATR'] = 0.005
+
+            df_optuna = df_data.dropna(subset=features + ['result']).copy()
+            df_optuna = df_optuna[df_optuna['result'].isin(['tp', 'sl'])]
+
+            X_opt = df_optuna[features]
+            encoder = LabelEncoder()
+            y_opt = encoder.fit_transform(df_optuna['result'])
+
+            fees_rate = fees.taker_open + fees.taker_close
+            close_opt = df_optuna['close'].values
+            atr_opt = df_optuna['ATR'].values
+            atr_opt_safe = np.where(atr_opt == 0, 1e-8, atr_opt)
+            costo_comision_R = (close_opt * fees_rate) / (3.0 * atr_opt_safe)
+
+            pnl_results_full = df_optuna['pnl_R'].values - costo_comision_R
+
+            tp_idx = -1
+            try:
+                tp_idx = list(encoder.classes_).index('tp')
+            except ValueError:
+                pass
+
+            def m2_objective(trial):
+                params = {
+                    'objective': 'multiclass' if len(encoder.classes_) > 2 else 'binary',
+                    'num_class': len(encoder.classes_) if len(encoder.classes_) > 2 else 1,
+                    'verbosity': -1,
+                    'random_state': 42,
+                    'n_jobs': -1,
+                    # 'class_weight': trial.suggest_categorical('class_weight', ['balanced', None]),
+                    'class_weight': None,
+                    'max_depth': trial.suggest_int('max_depth', 4, 6),
+                    'num_leaves': trial.suggest_int('num_leaves', 8, 60),
+                    'min_child_samples': trial.suggest_int('min_child_samples', 20, 500, step=10),
+                    'n_estimators': trial.suggest_int('n_estimators', 220, 500, step=10),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.03, 0.05, step=0.01),
+                    'subsample': trial.suggest_float('subsample', 0.7, 1, step=0.1),
+                    'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 1, step=0.1)
+                }
+
+                tscv = TimeSeriesSplit(n_splits=4)
+                fold_pnls = []
+                fold_trades = []
+
+                for train_idx, valid_idx in tscv.split(X_opt):
+                    X_tr, X_val = X_opt.iloc[train_idx], X_opt.iloc[valid_idx]
+                    y_tr, y_val = y_opt[train_idx], y_opt[valid_idx]
+                    pnl_val = pnl_results_full[valid_idx]
+
+                    model = lgb.LGBMClassifier(**params)
+                    model.fit(
+                        X_tr, y_tr,
+                        eval_set=[(X_val, y_val)],
+                        callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)]
+                    )
+
+                    preds = model.predict_proba(X_val)
+
+                    val_pnl = 0.0
+                    total_trades = 0
+                    thresh = 0.4
+
+                    if tp_idx != -1:
+                        prob_tp = preds[:, tp_idx]
+                        mask = prob_tp >= thresh
+                        total_trades += np.sum(mask)
+                        val_pnl = np.sum(np.where(mask, pnl_val, 0))
+
+                    fold_pnls.append(val_pnl)
+                    fold_trades.append(total_trades)
+
+                avg_pnl = sum(fold_pnls) / len(fold_pnls)
+                avg_trades = sum(fold_trades) / len(fold_trades)
+
+                if avg_trades < 10:
+                    return 1000.0
+
+                return -avg_pnl - (avg_trades * 1e-6)
+
+            # optuna.logging.set_verbosity(optuna.logging.INFO)
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+            study = optuna.create_study(direction='minimize')
+            if initial_params:
+                study.enqueue_trial(initial_params)
+            study.optimize(m2_objective, n_trials=trials, callbacks=[stop_at_score_callback], timeout=timeout_secs)
+
+            print("\n🏆 ¡Mejores parámetros encontrados por Optuna para M2!")
+            print(study.best_params)
+            print(study.best_value)
+            print("-" * 50)
+
+            antigravity_kwargs = study.best_params
+            antigravity_kwargs['random_state'] = 42
+            antigravity_kwargs['n_jobs'] = -1
+            antigravity_kwargs['verbosity'] = -1
+
+        else:
+            antigravity_kwargs = {
+                'random_state': 42,
+                'n_jobs': -1,
+                'verbosity': -1,
+            }
+
+        return antigravity_kwargs
+
+
+def get_best_features_by_pnl(
+        df_data,
+        fixed_features: list,
+        candidate_features: list,
+        analyzer=None,
+        fixed_model_kwargs: dict = None,
+        trials: int = 200,
+        min_features: int = 5,
+        n_keep: int = 410_000,
+        timeout_mins: int = 60,
+        thresh_optuna: float = 0.50  # Bajamos el umbral para que Optuna "vea" más señal
+) -> list:
+    """
+    Optimizador Optuna para selección de features.
+    """
+    import lightgbm as lgb
+    from sklearn.preprocessing import LabelEncoder
+    import optuna
+    import numpy as np
+
+    if fixed_model_kwargs is None:
+        fixed_model_kwargs = {}
+
+    global FEATURES
+
+    print("\n" + "=" * 60)
+    print("🔬 INICIANDO OPTUNA FEATURE SELECTION (Hybrid Mode)")
+    print(f" -> Fijas: {len(fixed_features)} | Candidatas: {len(candidate_features)}")
+    print(f" -> Umbral de búsqueda: {thresh_optuna} | Metodología: Hold-Out (60k velas)")
+    print("=" * 60)
+
+    # 1. Preparar datos y sanear nombres
+    def sanitize(s):
+        return str(s).replace('[', '_').replace(']', '_').replace('<', '_').replace('>', '_').replace(':', '_').replace(' ', '_')
+
+    # Sanear nombres en las listas y eliminar duplicados
+    fixed_features = [sanitize(f) for f in fixed_features]
+    candidate_features = [sanitize(f) for f in candidate_features if sanitize(f) not in fixed_features]
+    all_needed = list(set(fixed_features + candidate_features))
+
+    # Sanear nombres en el DataFrame para que coincidan
+    df_data = df_data.copy()
+    df_data.columns = [sanitize(c) for c in df_data.columns]
+    missing = [f for f in all_needed if f not in df_data.columns]
+    print(missing)
+
+    if (len(missing) > 0 or "future_trend" not in df_data.columns) and analyzer is not None:
+        print(f" -> 🛠️ Preparando {len(missing)} features faltantes...")
+        df_model, _ = analyzer.preparar_features(df_data.copy())
+    else:
+        df_model = df_data.copy()
+
+    df_model = df_model.dropna(subset=all_needed + ["future_trend"])
+
+    # 2. Split Hold-Out
+    BLOQUE_VAL = min(60_000, int(len(df_model) * 0.2))
+    SCAN_PAD = 300
+    split_idx = len(df_model) - BLOQUE_VAL - SCAN_PAD
+    df_train = df_model.iloc[:split_idx].copy()
+    df_simulate = df_model.iloc[split_idx:].copy()
+
+    if len(df_train) > n_keep:
+        df_train = df_train.iloc[-n_keep:].copy()
+
+    # 3. Pre-calcular resultados
+    high_vals = df_simulate["high"].values
+    low_vals = df_simulate["low"].values
+    close_vals = df_simulate["close"].values
+    atr = df_simulate["ATR"].values
+    tp_mult, sl_mult = 5.5, 3.0
+
+    long_results = np.zeros(len(df_simulate))
+    short_results = np.zeros(len(df_simulate))
+
+    for i in range(len(df_simulate)):
+        if np.isnan(atr[i]) or atr[i] == 0: continue
+        l_tp, l_sl = close_vals[i] + tp_mult * atr[i], close_vals[i] - sl_mult * atr[i]
+        s_tp, s_sl = close_vals[i] - tp_mult * atr[i], close_vals[i] + sl_mult * atr[i]
+        end = min(len(df_simulate), i + SCAN_PAD)
+        for j in range(i + 1, end):
+            if high_vals[j] >= l_tp: long_results[i] = 1; break
+            if low_vals[j] <= l_sl: long_results[i] = -1; break
+        for j in range(i + 1, end):
+            if low_vals[j] <= s_tp: short_results[i] = 1; break
+            if high_vals[j] >= s_sl: short_results[i] = -1; break
+
+    df_val_opt = df_simulate.iloc[:BLOQUE_VAL].copy()
+    long_res_opt = long_results[:BLOQUE_VAL]
+    short_res_opt = short_results[:BLOQUE_VAL]
+
+    close_opt = df_val_opt['close'].values
+    atr_opt = df_val_opt['ATR'].values
+    fees_rate = fees.taker_open + fees.taker_close
+    atr_opt_safe = np.where(atr_opt == 0, 1e-8, atr_opt)
+    costo_comision_R = (close_opt * fees_rate) / atr_opt_safe
+
+    encoder = LabelEncoder()
+    y_train = encoder.fit_transform(df_train["future_trend"])
+    y_val = encoder.transform(df_val_opt["future_trend"])
+    classes = list(encoder.classes_)
+    n_clases = len(classes)
+    bull_idx = classes.index('bullish') if 'bullish' in classes else -1
+    bear_idx = classes.index('bearish') if 'bearish' in classes else -1
+
+    def objective(trial):
+        trial_features = [feat for feat in candidate_features if
+                          trial.suggest_categorical(f"use_{feat}", [True, False])]
+        selected_features = fixed_features + trial_features
+
+        if len(selected_features) < min_features: return 1e6
+
+        params = fixed_model_kwargs.copy()
+        params.update({
+            "objective": "multiclass" if n_clases > 2 else "binary",
+            "num_class": n_clases if n_clases > 2 else 1,
+            "random_state": 42, "n_jobs": -1, "verbosity": -1,
+        })
+
+        model = lgb.LGBMClassifier(**params)
+        model.fit(df_train[selected_features], y_train, eval_set=[(df_val_opt[selected_features], y_val)],
+                  callbacks=[lgb.early_stopping(stopping_rounds=15, verbose=False)])
+
+        probs = model.predict_proba(df_val_opt[selected_features])
+        pnl = 0.0
+        n_longs, n_shorts = 0, 0
+
+        if bull_idx != -1:
+            p_bull = probs[:, bull_idx]
+            mask = p_bull >= thresh_optuna
+            n_longs = np.sum(mask)
+            pnl += np.sum(np.where(mask, np.where(long_res_opt == 1, 5.5 - costo_comision_R,
+                                                  np.where(long_res_opt == -1, -3.0 - costo_comision_R, 0)), 0))
+
+        if bear_idx != -1:
+            p_bear = probs[:, bear_idx]
+            mask = p_bear >= thresh_optuna
+            n_shorts = np.sum(mask)
+            pnl += np.sum(np.where(mask, np.where(short_res_opt == 1, 5.5 - costo_comision_R,
+                                                  np.where(short_res_opt == -1, -3.0 - costo_comision_R, 0)), 0))
+
+        # Log de diagnóstico
+        total_trades = n_longs + n_shorts
+
+        # Penalizar si hay muy pocos trades (evita el "mínimo local" de 1 trade suertudo)
+        if total_trades < 10:
+            return 1000.0
+        else:
+            if trial.number % 5 == 0:
+                print(f"   [Trial {trial.number}] Trades: {total_trades} (L:{n_longs} S:{n_shorts}) | PnL: {pnl:.1f}")
+
+        return -pnl - (total_trades * 1e-6)
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=trials, timeout=timeout_mins * 60)
+
+    print("\n🏆 MEJOR SUBCONJUNTO ENCONTRADO:")
+    best_trial_feats = [feat for feat in candidate_features if study.best_params[f"use_{feat}"]]
+    best_final_set = fixed_features + best_trial_feats
+
+    print(f" -> Features fijas: {len(fixed_features)}")
+    print(f" -> Features extras elegidas: {len(best_trial_feats)}")
+    for f in best_trial_feats: print(f"      ✨ {f}")
+
+    print(f" -> Total final: {len(best_final_set)} | PnL Validacion: {-study.best_value:.2f}")
+
+    FEATURES = best_final_set
+    return best_final_set
+
+
+def get_best_features_by_pnl_m2(
+        df_general,
+        df_data,
+        fixed_features: list,
+        candidate_features: list,
+        fixed_model_kwargs: dict = None,
+        trials: int = 500,
+        min_features: int = 5,
+        timeout_mins: int = 60,
+        thresh_optuna: float = 0.50,
+        target_pnl = None
+) -> list:
+    """
+    Optimizador Optuna para selección de features en M2 (evalúa rentabilidad con TimeSeriesSplit).
+    """
+    import lightgbm as lgb
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.model_selection import TimeSeriesSplit
+    import optuna
+    import numpy as np
+
+    # Callback para parada temprana por puntaje
+    def stop_at_score_callback(study, trial):
+        if target_pnl is not None:
+            # Optuna minimiza -PnL, así que pnl de 50 es -50.0
+            if study.best_value <= -target_pnl:
+                print(
+                    f"\n🎯 OBJETIVO ALCANZADO ({study.best_value * -1:.2f} >= {target_pnl}). Deteniendo búsqueda temprana...")
+                study.stop()
+
+    if fixed_model_kwargs is None:
+        fixed_model_kwargs = {
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbosity": -1,
+            # 'class_weight': 'balanced',
+            # 'max_depth': 6,
+            # 'num_leaves': 15,
+            # 'learning_rate': 0.05,
+            # 'min_child_samples': 30,
+            # 'n_estimators': 200
+        }
+
+    print("\n" + "=" * 60)
+    print("🔬 INICIANDO OPTUNA FEATURE SELECTION M2 (Hybrid Mode)")
+    print(f" -> Fijas: {len(fixed_features)} | Candidatas: {len(candidate_features)}")
+    print(f" -> Umbral de búsqueda: {thresh_optuna} | Metodología: TimeSeriesSplit")
+    print("=" * 60)
+
+    # Asegurar existencia de ATR para el cálculo de comisiones
+    if 'ATR' not in df_data.columns:
+        print("   [INFO] 'ATR' no encontrada en df_data. Calculando aproximación...")
+        
+        # Extraer columnas faltantes de df_general si es necesario
+        cols_necesarias = ['high', 'low', 'close']
+        cols_a_extraer = [col for col in cols_necesarias if col not in df_data.columns and col in df_general.columns]
+        
+        if cols_a_extraer:
+            if 'datetime' in df_data.columns and 'datetime' in df_general.columns:
+                df_temp = df_general[['datetime'] + cols_a_extraer].drop_duplicates(subset=['datetime'])
+                df_data = pd.merge(df_data, df_temp, on='datetime', how='left')
+            elif df_data.index.name == 'datetime' and df_general.index.name == 'datetime':
+                df_data = df_data.join(df_general[cols_a_extraer], how='left')
+            else:
+                for col in cols_a_extraer:
+                    df_data[col] = df_general[col]
+                
+        if 'high' in df_data.columns and 'low' in df_data.columns and 'close' in df_data.columns:
+            prev_close = df_data['close'].shift(1)
+            tr = pd.concat([
+                df_data['high'] - df_data['low'],
+                (df_data['high'] - prev_close).abs(),
+                (df_data['low'] - prev_close).abs()
+            ], axis=1).max(axis=1)
+            df_data['ATR'] = tr.rolling(14).mean()
+            df_data['ATR'] = df_data['ATR'].bfill()
+        else:
+            print("   [WARN] Columnas 'high/low/close' ausentes incluso tras revisar df_general. Usando proxy 0.5% para ATR de comisiones si existe 'close'.")
+            if 'close' in df_data.columns:
+                df_data['ATR'] = df_data['close'] * 0.005
+            else:
+                # Fallback extremo si no hay close
+                df_data['ATR'] = 0.005
+
+    # 1. Preparar datos y sanear nombres (Deduplicación)
+    def sanitize(s):
+        return str(s).replace('[', '_').replace(']', '_').replace('<', '_').replace('>', '_').replace(':', '_').replace(' ', '_')
+
+    # Sanear nombres en las listas y eliminar duplicados
+    fixed_features = [sanitize(f) for f in fixed_features]
+    candidate_features = [sanitize(f) for f in candidate_features if sanitize(f) not in fixed_features]
+    all_needed = list(set(fixed_features + candidate_features))
+
+    # Sanear nombres en el DataFrame para que coincidan
+    df_data = df_data.copy()
+    df_data.columns = [sanitize(c) for c in df_data.columns]
+
+    # 1. Preparar datos (cont.)
+
+    df_optuna = df_data.dropna(subset=all_needed + ['result', 'pnl_R']).copy()
+    df_optuna = df_optuna[df_optuna['result'].isin(['tp', 'sl'])]
+
+    # 2. Setup Optuna data variables
+    X_opt_full = df_optuna[all_needed]
+    encoder = LabelEncoder()
+    y_opt = encoder.fit_transform(df_optuna['result'])
+
+    fees_rate = fees.taker_open + fees.taker_close
+    close_opt = df_optuna['close'].values
+    atr_opt = df_optuna['ATR'].values
+    atr_opt_safe = np.where(atr_opt == 0, 1e-8, atr_opt)
+    costo_comision_R = (close_opt * fees_rate) / (3.0 * atr_opt_safe)
+
+    pnl_results_full = df_optuna['pnl_R'].values - costo_comision_R
+
+    classes = list(encoder.classes_)
+    n_clases = len(classes)
+    tp_idx = classes.index('tp') if 'tp' in classes else -1
+
+    def objective(trial):
+        trial_features = [feat for feat in candidate_features if
+                          trial.suggest_categorical(f"use_{feat}", [True, False])]
+        selected_features = fixed_features + trial_features
+
+        if len(selected_features) < min_features: return 1000.0
+
+        params = fixed_model_kwargs.copy()
+        params.update({
+            "objective": "multiclass" if n_clases > 2 else "binary",
+            "num_class": n_clases if n_clases > 2 else 1,
+            "random_state": 42, "n_jobs": -1, "verbosity": -1,
+        })
+
+        tscv = TimeSeriesSplit(n_splits=4)
+        fold_pnls = []
+        total_trades = 0
+
+        X_sel = df_optuna[selected_features]
+
+        for train_idx, valid_idx in tscv.split(X_sel):
+            X_tr, X_val = X_sel.iloc[train_idx], X_sel.iloc[valid_idx]
+            y_tr, y_val = y_opt[train_idx], y_opt[valid_idx]
+            pnl_val = pnl_results_full[valid_idx]
+
+            model = lgb.LGBMClassifier(**params)
+            model.fit(
+                X_tr, y_tr,
+                eval_set=[(X_val, y_val)],
+                callbacks=[lgb.early_stopping(stopping_rounds=15, verbose=False)]
+            )
+
+            preds = model.predict_proba(X_val)
+            val_pnl = 0.0
+
+            if tp_idx != -1:
+                prob_tp = preds[:, tp_idx]
+                mask = prob_tp >= thresh_optuna
+                total_trades += np.sum(mask)
+                val_pnl = np.sum(np.where(mask, pnl_val, 0))
+
+            fold_pnls.append(val_pnl)
+
+        avg_pnl = sum(fold_pnls) / len(fold_pnls)
+
+        if trial.number % 5 == 0:
+            print(
+                f"   [Trial {trial.number}] Trades Totales (4 Folds): {total_trades} | Avg PnL por Fold: {avg_pnl:.1f}")
+
+        if total_trades < 5:  # Exigimos iterabilidad mínima
+            return 1000.0
+
+        return -avg_pnl - (total_trades * 1e-6)
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=trials, callbacks=[stop_at_score_callback], timeout=timeout_mins * 60)
+
+    print("\n🏆 MEJOR SUBCONJUNTO ENCONTRADO (M2):")
+    best_trial_feats = [feat for feat in candidate_features if study.best_params[f"use_{feat}"]]
+    best_final_set = fixed_features + best_trial_feats
+
+    print(f" -> Features fijas: {len(fixed_features)}")
+    print(f" -> Features extras elegidas: {len(best_trial_feats)}")
+    for f in best_trial_feats: print(f"      ✨ {f}")
+
+    print(f" -> Total final: {len(best_final_set)} | Avg PnL Validacion: {-study.best_value:.2f}")
+
+    return best_final_set
+
+
 if __name__ == "__main__":
     now = datetime.now()
     # ===========Script automatizado===========
@@ -11347,7 +12648,7 @@ if __name__ == "__main__":
     # tomorrow = datetime.now() + timedelta(days=1)
     # tomorrow_day = f"{tomorrow.day:02d}"
     # mont_str = f"{datetime.now().month:02d}"
-    # filename = f'AVAXUSDT_5m_2022-01-01_2026-{mont_str}-{today_str}.csv'
+    # filename = f'AVAXUSDT_5m_2021-09-15_2026-{mont_str}-{today_str}.csv'
     # if os.path.exists(filename):
     #     nombre, extension = os.path.splitext(filename)
     #     new_name = nombre[:-2] + tomorrow_day + extension
@@ -11357,39 +12658,38 @@ if __name__ == "__main__":
     # end_date = f"2026-{mont_str}-{tomorrow_day}"
     # # end_date = f"2026-01-01"
     #
-    # filename_tomorrow = f'AVAXUSDT_5m_2022-01-01_{end_date}.csv'
+    # filename_tomorrow = f'AVAXUSDT_5m_2021-09-15_{end_date}.csv'
     # if os.path.exists(filename_tomorrow):
     #     print(f"iniciando script a las {now.hour}:{now.minute}:{now.second} horas")
     #     analyzer = StochasticAnalyzer(
     #         api_key=api_key,
     #         api_secret=api_secret,
     #         m2_model=None,
-    #         atr_mult=4,
+    #         atr_mult=5.5,
     #         atr_stop=3,
     #         lookahead=50
     #     )
     #     analyzer.run_analysis(
     #         symbol="AVAXUSDT",
-    #         start_date="2022-01-01",
+    #         start_date="2021-09-15",
     #         end_date=end_date,
     #         interval="5",
     #     )
     #     print("KPIs:", analyzer.tradelogger.compute_stats(True, True))
     #     df = analyzer.data
     #
-    #     #===============================Creacion del dataset M1 Output===============================================
+    #     # ===============================Creacion del dataset M1 Output===============================================
     #     print("Iniciando M1 Output dataframe")
     #     builder = M1OutputCacheBuilder(
     #         analyzer,
     #         df,
-    #         proba_threshold=0.60,  # único umbral
+    #         proba_threshold=0.6,  # único umbral
     #         atr_period=14,
-    #         atr_mult_tp=4.0,
+    #         atr_mult_tp=5.5,
     #         atr_mult_sl=3.0,
-    #         offline_lookback_bars=200,
-    #         n_keep_for_fit=122_000,
-    #         # cache=CacheConfig(cache_path="m1_outputs_2026.parquet"),
-    #         cache=None,
+    #         offline_lookback_bars=50,
+    #         n_keep_for_fit=370000,
+    #         cache=CacheConfig(None),
     #     )
     #     today_str = datetime.now().day
     #     tomorrow = datetime.now() + timedelta(days=1)
@@ -11398,11 +12698,11 @@ if __name__ == "__main__":
     #
     #     end_limit = datetime(2026, mont_str, tomorrow_day)  # último test_end deseado (exclusivo)
     #     # start = end_limit - relativedelta(years=1)
-    #     start = end_limit - relativedelta(years=1)
+    #     start = end_limit - relativedelta(months=12)
     #
     #     chunks = []
     #     while start < end_limit:
-    #         end = start + relativedelta(months=1)
+    #         end = start + relativedelta(days=2)
     #         if end > end_limit:
     #             end = end_limit  # por si el último tramo fuese parcial
     #         ts, te = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
@@ -11417,14 +12717,14 @@ if __name__ == "__main__":
     #     if "datetime" in m1_output.columns:
     #         m1_output = m1_output.drop_duplicates(subset=["datetime"], keep="first")
     #     else:
-    #          m1_output = m1_output.drop_duplicates()
+    #         m1_output = m1_output.drop_duplicates()
     #     # (opcional) Ordenar por columna temporal si existe
     #     if "datetime" in m1_output.columns:
     #         m1_output = m1_output.sort_values("datetime").reset_index(drop=True)
     #     print("M1 Output listo")
     #     print(m1_output.tail())
-    #
-    #     #==============================Creacion de modelo predictivo 2 con output M1========================================
+    #     #     #
+    #     #     # #==============================Creacion de modelo predictivo 2 con output M1========================================
     #     features = FEATURES + FEATS_M2
     #     # print("Creando modelo predictivo 2 con output M1")
     #     df_cache = m1_output
@@ -11446,11 +12746,20 @@ if __name__ == "__main__":
     #     print(f"Stop Loss (SL): {sl_count} ({sl_count / total_trades * 100:.2f}%)")
     #     print(f"Winrate: {winrate:.2f}%")
     #     print(f"{'=' * 50}\n")
+    #
+    #     m2_optimized_features = FEATURES_M2 + FEATS_M2
+    #
+    #     optuna_kwargs = {
+    #         "random_state": 42,
+    #         "n_jobs": -1,
+    #         "verbosity": -1,
+    #     }
+    #
     #     model_m2 = create_predictive_model_m2(
     #         df_model=df_cache,
-    #         features=features,
+    #         features=m2_optimized_features,
     #         model_type='lightgbm',
-    #         model_kwargs=None,
+    #         model_kwargs=optuna_kwargs,
     #         calibrate_method="sigmoid",
     #         display_graphic=False,
     #         return_metrics=False
@@ -11458,7 +12767,7 @@ if __name__ == "__main__":
     #     analyzer2 = StochasticAnalyzer(
     #         api_key=api_key,
     #         api_secret=api_secret,
-    #         atr_mult=4,
+    #         atr_mult=5.5,
     #         atr_stop=3,
     #         m2_model=model_m2,
     #         data=df,
@@ -11466,32 +12775,20 @@ if __name__ == "__main__":
     #         lookahead=50
     #     )
     #
+    #     model_kwargs_simple = {
+    #         "objective": "multiclass",
+    #         "num_class": 3,
+    #         "random_state": 42,
+    #         "n_jobs": -1,
+    #     }
+    #
     #     print("Creando modelo predictivo 1")
     #     analyzer2.create_predictive_model(
     #         model_type="lgbm",
     #         calibrate_method="sigmoid",
-    #         N_KEEP=122_000,
+    #         N_KEEP=370000,
     #         display_graphic=False,
-    #         model_kwargs={
-    #             "objective": "multiclass",
-    #             "num_class": 3,  # ajusta según tus clases reales
-    #             "n_estimators": 1000,  # más árboles + LR más bajo
-    #             "learning_rate": 0.03,  # más bajo para mejorar logloss
-    #             "num_leaves": 96,  # complejidad del árbol
-    #             "max_depth": -1,  # deja que LGBM lo maneje
-    #             "min_child_samples": 200,  # regularización clave con 220k filas
-    #
-    #             "subsample": 0.7,  # antes 0.9, bajamos para más robustez
-    #             "subsample_freq": 1,
-    #             "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
-    #
-    #             "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
-    #             "reg_alpha": 0.1,  # L1 ligera
-    #
-    #             "min_split_gain": 0.0,
-    #             "random_state": 42,
-    #             "n_jobs": -1
-    #         },
+    #         model_kwargs=model_kwargs_simple,
     #         display_feature_plot=False,
     #         use_df_parquet=True,
     #     )
@@ -11504,13 +12801,14 @@ if __name__ == "__main__":
     #             print("Reiniciando script programado a las ", now.hour, " horas")
     #             now = datetime.now()
     #             #
-    #             analyzer = StochasticAnalyzer(api_key=api_key, api_secret=api_secret, m2_model=None, atr_mult=4, atr_stop=3)
+    #             analyzer = StochasticAnalyzer(api_key=api_key, api_secret=api_secret, m2_model=None, atr_mult=5.5,
+    #                                           atr_stop=3)
     #
     #             today_str = f"{datetime.now().day:02d}"
     #             tomorrow = datetime.now() + timedelta(days=1)
     #             tomorrow_day = f"{tomorrow.day:02d}"
     #             mont_str = f"{datetime.now().month:02d}"
-    #             filename = f'AVAXUSDT_5m_2022-01-01_2026-{mont_str}-{today_str}.csv'
+    #             filename = f'AVAXUSDT_5m_2021-09-15_2026-{mont_str}-{today_str}.csv'
     #             if os.path.exists(filename):
     #                 nombre, extension = os.path.splitext(filename)
     #                 new_name = nombre[:-2] + tomorrow_day + extension
@@ -11518,36 +12816,38 @@ if __name__ == "__main__":
     #                 print("Nuevo nombre de archivo:", new_name)
     #
     #             end_date = f"2026-{mont_str}-{tomorrow_day}"
-    #             filename_tomorrow = f'AVAXUSDT_5m_2022-01-01_{end_date}.csv'
+    #             # end_date = f"2026-03-31"
+    #             filename_tomorrow = f'AVAXUSDT_5m_2021-09-15_{end_date}.csv'
     #             if os.path.exists(filename_tomorrow):
     #                 print(f"iniciando script a las {now.hour}:{now.minute}:{now.second} horas")
     #                 analyzer = StochasticAnalyzer(
     #                     api_key=api_key,
     #                     api_secret=api_secret,
     #                     m2_model=None,
-    #                     atr_mult=4,
+    #                     atr_mult=5.5,
     #                     atr_stop=3,
     #                     lookahead=50
     #                 )
     #                 analyzer.run_analysis(
     #                     symbol="AVAXUSDT",
-    #                     start_date="2022-01-01",
+    #                     start_date="2021-09-15",
     #                     end_date=end_date,
     #                     interval="5",
     #                 )
     #                 print("KPIs:", analyzer.tradelogger.compute_stats(True, True))
     #                 df = analyzer.data
-    #             # ===========M2===========
+    #                 # ===============================Creacion del dataset M1 Output===============================================
+    #                 print("Iniciando M1 Output dataframe")
     #                 builder = M1OutputCacheBuilder(
     #                     analyzer,
     #                     df,
-    #                     proba_threshold=0.60,  # único umbral
+    #                     proba_threshold=0.6,  # único umbral
     #                     atr_period=14,
-    #                     atr_mult_tp=4.0,
+    #                     atr_mult_tp=5.5,
     #                     atr_mult_sl=3.0,
-    #                     offline_lookback_bars=200,
-    #                     n_keep_for_fit=122_000,
-    #                     cache=None,
+    #                     offline_lookback_bars=50,
+    #                     n_keep_for_fit=370000,
+    #                     cache=CacheConfig(None),
     #                 )
     #                 today_str = datetime.now().day
     #                 tomorrow = datetime.now() + timedelta(days=1)
@@ -11555,16 +12855,16 @@ if __name__ == "__main__":
     #                 mont_str = int(datetime.now().month)
     #
     #                 end_limit = datetime(2026, mont_str, tomorrow_day)  # último test_end deseado (exclusivo)
-    #                 start = end_limit - relativedelta(months=1)
+    #                 start = end_limit - relativedelta(months=12)
     #
     #                 chunks = []
     #                 while start < end_limit:
-    #                     end = start + relativedelta(months=1)
+    #                     end = start + relativedelta(days=2)
     #                     if end > end_limit:
     #                         end = end_limit  # por si el último tramo fuese parcial
     #                     ts, te = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
     #                     print(f">>> Ejecutando ventana {ts} -> {te}")
-    #                     meta_i = builder.build_and_cache(test_start=ts, test_end=te, verbose=1)
+    #                     meta_i = builder.build_and_cache(test_start=ts, test_end=te, verbose=1, export_parquet=True)
     #                     chunks.append(meta_i)
     #                     start = end  # avanza a la siguiente ventana
     #
@@ -11575,16 +12875,15 @@ if __name__ == "__main__":
     #                     m1_output = m1_output.drop_duplicates(subset=["datetime"], keep="first")
     #                 else:
     #                     m1_output = m1_output.drop_duplicates()
-    #
     #                 # (opcional) Ordenar por columna temporal si existe
     #                 if "datetime" in m1_output.columns:
     #                     m1_output = m1_output.sort_values("datetime").reset_index(drop=True)
-    #
+    #                 print("M1 Output listo")
     #                 print(m1_output.tail())
-    #                 features = FEATURES + FEATS_M2
     #
+    #                 # ==============================Creacion de modelo predictivo 2 con output M1========================================
+    #                 features = FEATURES + FEATS_M2
     #                 print("Creando modelo predictivo 2 con output M1")
-    #                 # df_cache = pd.read_parquet("m1_outputs_2year_dec7.parquet")
     #                 df_cache = m1_output
     #                 result_counts = df_cache['result'].value_counts()
     #                 print("\nDistribución de resultados:")
@@ -11602,54 +12901,49 @@ if __name__ == "__main__":
     #                 print(f"Stop Loss (SL): {sl_count} ({sl_count / total_trades * 100:.2f}%)")
     #                 print(f"Winrate: {winrate:.2f}%")
     #                 print(f"{'=' * 50}\n")
+    #
+    #                 m2_optimized_features = FEATURES_M2 + FEATS_M2
+    #
+    #                 optuna_kwargs = {
+    #                     "random_state": 42,
+    #                     "n_jobs": -1,
+    #                     "verbosity": -1,
+    #                 }
+    #
     #                 model_m2 = create_predictive_model_m2(
     #                     df_model=df_cache,
-    #                     features=features,
+    #                     features=m2_optimized_features,
     #                     model_type='lightgbm',
-    #                     model_kwargs=None,
+    #                     model_kwargs=optuna_kwargs,
     #                     calibrate_method="sigmoid",
     #                     display_graphic=False,
     #                     return_metrics=False
     #                 )
-    #                 print("Creando modelo predictivo 1")
     #                 analyzer2 = StochasticAnalyzer(
     #                     api_key=api_key,
     #                     api_secret=api_secret,
-    #                     atr_mult=4,
+    #                     atr_mult=5.5,
     #                     atr_stop=3,
     #                     m2_model=model_m2,
     #                     data=df,
     #                     early_exit_threshold=0.75,
     #                     lookahead=50
     #                 )
-    #
+    #                 model_kwargs_simple = {
+    #                     "objective": "multiclass",
+    #                     "num_class": 3,  # ajusta según tus clases reales
+    #                     "random_state": 42,
+    #                     "n_jobs": -1,
+    #                 }
+    #                 print("Creando modelo predictivo 1")
     #                 analyzer2.create_predictive_model(
     #                     model_type="lgbm",
     #                     calibrate_method="sigmoid",
-    #                     N_KEEP=122_000,
+    #                     N_KEEP=370000,
     #                     display_graphic=False,
-    #                     model_kwargs={
-    #                         "objective": "multiclass",
-    #                         "num_class": 3,  # ajusta según tus clases reales
-    #                         "n_estimators": 1000,  # más árboles + LR más bajo
-    #                         "learning_rate": 0.03,  # más bajo para mejorar logloss
-    #                         "num_leaves": 96,  # complejidad del árbol
-    #                         "max_depth": -1,  # deja que LGBM lo maneje
-    #                         "min_child_samples": 200,  # regularización clave con 220k filas
-    #
-    #                         "subsample": 0.7,  # antes 0.9, bajamos para más robustez
-    #                         "subsample_freq": 1,
-    #                         "colsample_bytree": 0.7,  # menos columnas por árbol, menos overfit
-    #
-    #                         "reg_lambda": 15.0,  # L2 fuerte → baja variancia, mejora logloss
-    #                         "reg_alpha": 0.1,  # L1 ligera
-    #
-    #                         "min_split_gain": 0.0,
-    #                         "random_state": 42,
-    #                         "n_jobs": -1
-    #                     },
+    #                     model_kwargs=model_kwargs_simple,
     #                     display_feature_plot=False,
-    #                     use_df_parquet=False
+    #                     use_df_parquet=None,
     #                 )
     #                 print("Iniciando predicciones")
     #                 analyzer2.monitor_predictions()
@@ -11665,7 +12959,7 @@ if __name__ == "__main__":
     tomorrow = datetime.now() + timedelta(days=1)
     tomorrow_day = f"{tomorrow.day:02d}"
     mont_str = f"{datetime.now().month:02d}"
-    filename = f'AVAXUSDT_5m_2022-01-01_2026-{mont_str}-{today_str}.csv'
+    filename = f'AVAXUSDT_5m_2021-09-15_2026-{mont_str}-{today_str}.csv'
     if os.path.exists(filename):
         nombre, extension = os.path.splitext(filename)
         new_name = nombre[:-2] + tomorrow_day + extension
@@ -11673,274 +12967,281 @@ if __name__ == "__main__":
         print("Nuevo nombre de archivo:", new_name)
 
     end_date = f"2026-{mont_str}-{tomorrow_day}"
-    # end_date = f"2026-01-01"
+    # end_date = f"2026-03-31"
 
-    filename_tomorrow = f'AVAXUSDT_5m_2022-01-01_{end_date}.csv'
+    filename_tomorrow = f'AVAXUSDT_5m_2021-09-15_{end_date}.csv'
     if os.path.exists(filename_tomorrow):
         print(f"iniciando script a las {now.hour}:{now.minute}:{now.second} horas")
-        analyzer = StochasticAnalyzer(api_key=api_key_roge, api_secret=api_secret_roge, m2_model=None, atr_mult=4,
+        analyzer = StochasticAnalyzer(api_key=api_key_roge, api_secret=api_secret_roge, m2_model=None, atr_mult=5.5,
                                       atr_stop=3, lookahead=50)
         analyzer.run_analysis(
             symbol="AVAXUSDT",
-            start_date="2022-01-01",
+            start_date="2021-09-15",
             end_date=end_date,
             interval="5",
         )
         print("KPIs:", analyzer.tradelogger.compute_stats(True, True))
         df = analyzer.data
 
-        # #=============================Creacion del Dataset M1===============================================
-        print("Creando Dataset M1")
-        builder = M1OutputCacheBuilder(
-            analyzer,
-            df,
-            proba_threshold=0.60,  # único umbral
-            atr_period=14,
-            atr_mult_tp=4.0,
-            atr_mult_sl=3.0,
-            offline_lookback_bars=200,
-            n_keep_for_fit=122_000,
-            cache=CacheConfig(cache_path="m1_outputs_12month_2025.parquet"),
-            # cache=CacheConfig(None),
-        )
-        today_str = datetime.now().day
-        tomorrow = datetime.now() + timedelta(days=1)
-        tomorrow_day = tomorrow.day
-        mont_str = int(datetime.now().month)
 
-        start = datetime(2024, 1, 1)  # cambia a diario
-        end_limit = datetime(2025, 1, 1)  # último test_end deseado (exclusivo)
+        # analyzer.preparar_features(df.iloc[-1000:])
+        # analyzer.preparar_features(df.iloc[-100000:])
 
-        chunks = []
-        while start < end_limit:
-            end = start + relativedelta(months=1)
-            if end > end_limit:
-                end = end_limit  # por si el último tramo fuese parcial
-            ts, te = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
-            print(f">>> Ejecutando ventana {ts} -> {te}")
-            meta_i = builder.build_and_cache(test_start=ts, test_end=te, verbose=1, export_parquet=True)
-            chunks.append(meta_i)
-            start = end  # avanza a la siguiente ventana
-        # Unir todos los resultados en un solo DataFrame
-        m1_output = pd.concat(chunks, ignore_index=True)
-        # FIX: Eliminamos duplicados por si los chunks se solapan
-        if "datetime" in m1_output.columns:
-            m1_output = m1_output.drop_duplicates(subset=["datetime"], keep="first")
-        else:
-            m1_output = m1_output.drop_duplicates()
-        # (opcional) Ordenar por columna temporal si existe
-        if "datetime" in m1_output.columns:
-            m1_output = m1_output.sort_values("datetime").reset_index(drop=True)
-        print("M1 Output listo")
-        print(m1_output.tail())
-        #         # # #
+        #     # #     # =============================Creacion del Dataset M1===============================================
+        # print("Creando Dataset M1")
+        # builder = M1OutputCacheBuilder(
+        #     analyzer,
+        #     df,
+        #     proba_threshold=0.2,  # único umbral
+        #     atr_period=14,
+        #     atr_mult_tp=5.5,
+        #     atr_mult_sl=3.0,
+        #     offline_lookback_bars=50,
+        #     n_keep_for_fit=370000,
+        #     cache=CacheConfig(cache_path=f"m1_outputs_2days_370k_feb_5_6months_tp5_5sl3_18features.parquet"),
+        #     # cache=CacheConfig(None),
+        # )
         #
+        # end_limit = datetime(2026, 3, 5)
+        # start = end_limit - relativedelta(months=1)  # último test_end deseado (exclusivo)
         #
-        print("Creando modelo predictivo 2 con output M1")
-        # df_cache = pd.read_parquet("m1_outputs_12month_2026.parquet")
-        df_cache = m1_output
-        print("df_cache_parquet")
-        # print(len(df_cache_parquet))
-        print("df_cache")
-        print(len(df_cache))
-        # Calcular winrate basado en la columna result
-        # Contar los valores de la columna result
-        result_counts = df_cache['result'].value_counts()
-        print("\nDistribución de resultados:")
-        print(result_counts)
-        # Calcular winrate (porcentaje de tp sobre el total)
-        total_trades = len(df_cache[df_cache['result'].notna()])
-        tp_count = len(df_cache[df_cache['result'] == 'tp'])
-        sl_count = len(df_cache[df_cache['result'] == 'sl'])
-        winrate = (tp_count / total_trades * 100) if total_trades > 0 else 0
-        print(f"\n{'=' * 50}")
-        print(f"ESTADÍSTICAS DE TRADING")
-        print(f"{'=' * 50}")
-        print(f"Total de operaciones: {total_trades}")
-        print(f"Take Profit (TP): {tp_count} ({tp_count / total_trades * 100:.2f}%)")
-        print(f"Stop Loss (SL): {sl_count} ({sl_count / total_trades * 100:.2f}%)")
-        print(f"Winrate: {winrate:.2f}%")
-        print(f"{'=' * 50}\n")
-        # print(m1_output.iloc[-1])
+        # chunks = []
+        # while start < end_limit:
+        #     end = start + relativedelta(days=2)
+        #     if end > end_limit:
+        #         end = end_limit  # por si el último tramo fuese parcial
+        #     ts, te = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+        #     print(f">>> Ejecutando ventana {ts} -> {te}")
+        #     meta_i = builder.build_and_cache(test_start=ts, test_end=te, verbose=1, export_parquet=True)
+        #     chunks.append(meta_i)
+        #     start = end  # avanza a la siguiente ventana
+        # # Unir todos los resultados en un solo DataFrame
+        # m1_output = pd.concat(chunks, ignore_index=True)
+        # # FIX: Eliminamos duplicados por si los chunks se solapan
+        # if "datetime" in m1_output.columns:
+        #     m1_output = m1_output.drop_duplicates(subset=["datetime"], keep="first")
+        # else:
+        #     m1_output = m1_output.drop_duplicates()
+        # # (opcional) Ordenar por columna temporal si existe
+        # if "datetime" in m1_output.columns:
+        #     m1_output = m1_output.sort_values("datetime").reset_index(drop=True)
+        # print("M1 Output listo")
+        # print(m1_output.tail())
+        # #
+        # # print("Creando modelo predictivo 2 con output M1")
+        # # df_cache = pd.read_parquet("m1_outputs_2days_53k_april_1_2_month_tp5_5sl3_17features_kwargs_custom.parquet")
+        # df_cache = m1_output
+        # print("df_cache")
+        # print(len(df_cache))
+        # # Calcular winrate basado en la columna result
+        # # Contar los valores de la columna result
+        # result_counts = df_cache['result'].value_counts()
+        # print("\nDistribución de resultados:")
+        # print(result_counts)
+        # # Calcular winrate (porcentaje de tp sobre el total)
+        # total_trades = len(df_cache[df_cache['result'].notna()])
+        # tp_count = len(df_cache[df_cache['result'] == 'tp'])
+        # sl_count = len(df_cache[df_cache['result'] == 'sl'])
+        # winrate = (tp_count / total_trades * 100) if total_trades > 0 else 0
+        # print(f"\n{'=' * 50}")
+        # print(f"ESTADÍSTICAS DE TRADING")
+        # print(f"{'=' * 50}")
+        # print(f"Total de operaciones: {total_trades}")
+        # print(f"Take Profit (TP): {tp_count} ({tp_count / total_trades * 100:.2f}%)")
+        # print(f"Stop Loss (SL): {sl_count} ({sl_count / total_trades * 100:.2f}%)")
+        # print(f"Winrate: {winrate:.2f}%")
+        # print(f"{'=' * 50}\n")
+        # print(df_cache.iloc[-1])
+        # #
+        # #
+        # #
+        # #
+        # # print("\n[🎯 M2] Iniciando Optimización de FEATURES para M2")
+        # # FEATURES_M2 = get_best_features_by_pnl_m2(
+        # #     df_data=df_cache,
+        # #     fixed_features=[],  # Se puede ajustar si quieres dejar "fechas fuertes" de M2 fijas
+        # #     candidate_features=FEATURES,
+        # #     trials=3000,
+        # #     min_features=5,
+        # #     thresh_optuna=0.6
+        # # )
+        # FEATURES_M2 = FEATURES
+        m2_optimized_features = FEATURES_M2 + FEATS_M2
+        # #
+        # # print("[🎯 M2] Features optimizados listos.\n")
+        # #
+        # # print("\n[🎯 M2] Iniciando Optimización de KWARGS para M2 con las features ganadoras")
+        # optuna_kwargs = get_best_kwargs_by_df(df_general=df, df_data=df_cache, trials=4000, features=FEATURES_M2, timeout_mins=30, target_pnl=50)
+        # # #
+        optuna_kwargs = {
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbosity": -1,
+        }
 
-        features = FEATURES + FEATS_M2
+        # model_m2 = create_predictive_model_m2(
+        #     df_model=df_cache,
+        #     features=m2_optimized_features,
+        #     model_type='lightgbm',
+        #     model_kwargs=optuna_kwargs,
+        #     calibrate_method="sigmoid",
+        #     display_graphic=False,
+        #     return_metrics=False
+        # )
 
-        model_m2 = create_predictive_model_m2(
-            df_model=df_cache,
-            features=features,
-            model_type='lightgbm',
-            model_kwargs=None,
-            calibrate_method="sigmoid",
-            display_graphic=False,
-            return_metrics=False
-        )
-
-
-        # # ==================== simulator
+        # # # ==================== simulator
         def logger(event, payload):
             if event == "progress":
                 print(f"[{payload['i']}/{payload['total']}] {payload['time']} | "
                       f"equity={payload['equity']:.2f} | trades={payload['trades']}")
-            # elif event == "open":
-            #     print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
-            #           f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
-            #           f"proba={payload['prob'] * 100:.1f} | "
-            #           f"margin={payload['margin']:.2f} | "
-            #           f"kelly={payload['kelly'] if payload['kelly'] is not None else 1.0:.3f}")
-            # elif event == "close":
-            #     dur = payload.get("duration")
-            #     print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
-            #           f"PnL={payload['pnl']:.2f} | "
-            #           f"equity={payload['equity']:.2f} | "
-            #           f"in={payload['entry_time']} out={payload['time']} "
-            #           f"dur={dur}")
-            # elif event == "early_opposite":
-            #     print(
-            #         f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
-            #         f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
-            #         f"| in={payload['entry_time']} out={payload['time']} "
-            #         f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
-            #     )
-            # elif event == "withdrawal":
-            #     print(
-            #         f"💰 RETIRO DETECTADO ({payload['timestamp']}) | "
-            #         f"Monto: ${payload['amount']:.2f} | "
-            #         f"Total Retirado: ${payload['total_withdrawn']:.2f} | "
-            #         f"Capital Total (Eq+Ret): ${payload['capital_total']:.2f}"
-            #     )
-        # # #
-        # print("Iniciando simulacion sin m2")
+            elif event == "open":
+                print(f"OPEN  {payload['side']} @ {payload['price']:.4f} | "
+                      f"tp={payload['tp']:.4f} sl={payload['sl']:.4f} | "
+                      f"proba={payload['prob'] * 100:.1f} | "
+                      f"margin={payload['margin']:.2f} | "
+                      f"kelly={payload['kelly'] if payload['kelly'] is not None else 1.0:.3f}")
+            if event == "close":
+                dur = payload.get("duration")
+                print(f"CLOSE {payload['reason']} @ {payload['price']:.4f} | "
+                      f"PnL={payload['pnl']:.2f} | "
+                      f"equity={payload['equity']:.2f} | "
+                      f"in={payload['entry_time']} out={payload['time']} "
+                      f"dur={dur}")
+            elif event == "early_opposite":
+                print(
+                    f"EARLY_OPPOSITE {payload['side']} @ {payload['price']:.4f} "
+                    f"| prob={payload['prob']:.3f} | thr={payload['threshold']:.2f} "
+                    f"| in={payload['entry_time']} out={payload['time']} "
+                    f"| dur={payload['duration']} pnl_gross={payload['pnl_gross']:.2f}"
+                )
+            elif event == "withdrawal":
+                print(
+                    f"💰 RETIRO DETECTADO ({payload['timestamp']}) | "
+                    f"Monto: ${payload['amount']:.2f} | "
+                    f"Total Retirado: ${payload['total_withdrawn']:.2f} | "
+                    f"Capital Total (Eq+Ret): ${payload['capital_total']:.2f}"
+                )
+
+
+        #
+        #
+        # #
+        #
         # sim = TradeSimulator(
         #     analyzer,
         #     df,
-        #     initial_equity=30,
-        #     leverage=1000,
+        #     initial_equity=100,
+        #     leverage=500,
         #     risk_fraction=0.02,
         #     on_event=logger,  # <— activar callback
         #     verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
         #     log_every_bars=288,
-        #     proba_threshold_day=0.6,
-        #     proba_threshold_night=0.6,
-        #     n_keep_for_fit=122_000,
-        #     atr_mult_tp=4,
+        #     proba_threshold_day=0.2,
+        #     proba_threshold_night=0.2,
+        #     n_keep_for_fit=53_000,
+        #     atr_mult_tp=5.5,
         #     atr_mult_sl=3,
         #     retrain_each_bar=False,
-        #     retrain_every_bars=288,
+        #     retrain_every_bars=29000,
         #     suppress_fit_stdout=False,
         #     early_exit_threshold=0.75,
-        #     n_estimators=1000,
-        #     start_date="2023-01-01",
+        #     start_date="2021-09-15",
         #     end_date=end_date,
+        #     enable_withdrawals=False,
         #     m2_model=None,
-        #     enable_withdrawals=False
+        #     m2_df=None,
+        #     both_directions_predit=False,
+        #     shap_check_enable=False,
         # )
-        # # # #
-        # results = sim.run(test_start="2025-02-27", test_end="2025-02-28")
+        # results = sim.run(test_start=f"2026-02-01", test_end=f"2026-02-20")
         # print("DBG sim.run returned", results["final_equity"])
         # sim.plot_performance(
-        #     initial_equity=40,  # Capital inicial
-        #     save_html="backtest_report_sin_m2.html",  # Guardar como HTML (opcional)
+        #     initial_equity=100,  # Capital inicial
+        #     save_html="backtest_report_sin_m2_2026.html",  # Guardar como HTML (opcional)
+        #     show_plot=True,  # Mostrar en navegador
+        #     height=2400  # Altura en píxeles
+        # )
+        # #
+        # sim = TradeSimulator(
+        #     analyzer,
+        #     df,
+        #     initial_equity=100,
+        #     leverage=500,
+        #     risk_fraction=0.02,
+        #     on_event=logger,  # <— activar callback
+        #     verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
+        #     log_every_bars=288,
+        #     proba_threshold_day=0.38,
+        #     proba_threshold_night=0.38,
+        #     n_keep_for_fit=53000,
+        #     atr_mult_tp=5.5,
+        #     atr_mult_sl=3,
+        #     retrain_each_bar=False,
+        #     retrain_every_bars=290,
+        #     suppress_fit_stdout=False,
+        #     early_exit_threshold=0.75,
+        #     start_date="2021-09-15",
+        #     end_date=end_date,
+        #     enable_withdrawals=False,
+        #     m2_model=model_m2,
+        #     m2_df=df_cache,
+        #     both_directions_predit=False,
+        #     shap_check_enable=False,
+        #     max_depth=7,
+        #     num_leaves=118,
+        #     n_estimators=400,
+        #     n_childs=13,
+        # )
+        # results = sim.run(test_start=f"2026-02-05", test_end=f"2026-02-15")
+        # print("DBG sim.run returned", results["final_equity"])
+        # sim.plot_performance(
+        #     initial_equity=100,  # Capital inicial
+        #     save_html="backtest_report_sin_m2_2026.html",  # Guardar como HTML (opcional)
         #     show_plot=True,  # Mostrar en navegador
         #     height=2400  # Altura en píxeles
         # )
 
-        print("Iniciando simulacion con m2")
-        sim = TradeSimulator(
-            analyzer,
-            df,
-            initial_equity=30,
-            leverage=1000,
-            risk_fraction=0.02,
-            on_event=logger,  # <— activar callback
-            verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
-            log_every_bars=288,
-            proba_threshold_day=0.6,
-            proba_threshold_night=0.6,
-            n_keep_for_fit=122_000,
-            atr_mult_tp=4,
-            atr_mult_sl=3,
-            retrain_each_bar=False,
-            retrain_every_bars=288,
-            suppress_fit_stdout=False,
-            early_exit_threshold=0.75,
-            n_estimators=1000,
-            start_date="2023-01-01",
-            end_date=end_date,
-            m2_model=model_m2,
-            enable_withdrawals=False,
-            m2_df=df_cache
-        )
-        # # #
-        results = sim.run(test_start="2025-01-01", test_end="2025-02-01")
-        print("DBG sim.run returned", results["final_equity"])
-        sim.plot_performance(
-            initial_equity=40,  # Capital inicial
-            save_html="backtest_report_con_m2_2026.html",  # Guardar como HTML (opcional)
-            show_plot=True,  # Mostrar en navegador
-            height=2400  # Altura en píxeles
-        )
-        # # #
-        # # rules_raw = sim.autogen_rules_from_entries(
-        # #     min_support=5,  # exige soporte sólido
-        # #     max_pairs=200,  # pares
-        # #     max_triples=150,  # triples
-        # #     triples_from_top_k=50,  # solo combina las 25 mejores singles
-        # #     no_entry=True,
-        # #     no_entry_lift_max=0.9
-        # # )
-        # #
-        # # # 2) Exportar en formato deployable (filtrando un poco)
-        # #  deployable = sim.export_rules_deployable(
-        # #     rules=rules_raw,
-        # #     top_k_per_side=60,
-        # #     min_support=10,
-        # #     min_lift=1.2,
-        # #     min_win_rate=0.7,
-        # #     no_entry_top_k=90,
-        # #     no_entry_min_support=5,
-        # #     no_entry_max_lift=0.9,
-        # #     save_path="rules_autogen_220k_6months.py"
-        # # )
-        # #
-        # # # 3) Ya puedes importar 'rules' desde rules_autogen.py en tu rules_engine.py, o cargar el JSON.
-        # # print(deployable["bullish"][:3])
-        # # print(deployable["bearish"][:3])
-        #
-        # # =========== get bet best dataset trough step forward testing
+        # =========== get bet best dataset trough step forward testing
         # from math import isfinite
         #
         # mejor_n = None
         # mejor_equity = float("-inf")
         # equities_por_n = {}
         #
-        # for n in range(100_000, 140_001, 2000):
+        # for n in range(1, 6, 1):
         #     sim = TradeSimulator(
-        #             analyzer,
-        #             df,
-        #             initial_equity=30,
-        #             leverage=1000,
-        #             risk_fraction=0.02,
-        #             on_event=logger,  # <— activar callback
-        #             verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
-        #             log_every_bars=288,
-        #             proba_threshold_day=0.6,
-        #             proba_threshold_night=0.6,
-        #             n_keep_for_fit=n,
-        #             atr_mult_tp=4,
-        #             atr_mult_sl=3,
-        #             retrain_each_bar=False,
-        #             retrain_every_bars=288,
-        #             suppress_fit_stdout=False,
-        #             early_exit_threshold=0.75,
-        #             n_estimators=1000,
-        #             start_date="2023-01-01",
-        #             end_date=end_date,
-        #             m2_model=None,
-        #             enable_withdrawals=False
+        #         analyzer,
+        #         df,
+        #         initial_equity=100,
+        #         leverage=500,
+        #         risk_fraction=0.02,
+        #         on_event=logger,  # <— activar callback
+        #         verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
+        #         log_every_bars=288,
+        #         proba_threshold_day=0.6,
+        #         proba_threshold_night=0.6,
+        #         n_keep_for_fit=24000,
+        #         atr_mult_tp=5.5,
+        #         atr_mult_sl=3,
+        #         retrain_each_bar=False,
+        #         retrain_every_bars=2900,
+        #         suppress_fit_stdout=False,
+        #         early_exit_threshold=0.85,
+        #         start_date="2021-09-15",
+        #         end_date=end_date,
+        #         enable_withdrawals=False,
+        #         m2_model=None,
+        #         m2_df=None,
+        #         both_directions_predit=False,
+        #         shap_check_enable=False,
+        #         max_depth=7,
+        #         num_leaves=118,
+        #         n_estimators=400,
+        #         n_childs=13,
         #     )
         #
         #     try:
-        #         results = sim.run(test_start="2025-03-07", test_end="2025-03-10")
+        #         results = sim.run(test_start=f"2026-04-{n}", test_end=f"2026-04-{n+1}")
         #         final_winrate = results['metrics']['winrate']
         #         print("DBG sim.run returned", results["final_equity"])
         #         print("wins", results["wins"])
@@ -11975,34 +13276,40 @@ if __name__ == "__main__":
         # mejor_equity = float("-inf")
         # equities_por_n = {}
         #
-        # for n in range(70000, 200001, 10000):
+        # for n in range(1, 23, 1):
         #     sim = TradeSimulator(
         #         analyzer,
         #         df,
-        #         initial_equity=30,
-        #         leverage=1000,
+        #         initial_equity=100,
+        #         leverage=500,
         #         risk_fraction=0.02,
         #         on_event=logger,  # <— activar callback
         #         verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
         #         log_every_bars=288,
-        #         proba_threshold_day=0.6,
-        #         proba_threshold_night=0.6,
-        #         n_keep_for_fit=n,
-        #         atr_mult_tp=4,
+        #         proba_threshold_day=0.2,
+        #         proba_threshold_night=0.2,
+        #         n_keep_for_fit=53000,
+        #         atr_mult_tp=5.5,
         #         atr_mult_sl=3,
         #         retrain_each_bar=False,
-        #         retrain_every_bars=288,
+        #         retrain_every_bars=290,
         #         suppress_fit_stdout=False,
         #         early_exit_threshold=0.75,
-        #         n_estimators=1000,
-        #         start_date="2023-01-01",
+        #         start_date="2021-09-15",
         #         end_date=end_date,
+        #         enable_withdrawals=False,
         #         m2_model=None,
-        #         enable_withdrawals=False
+        #         m2_df=None,
+        #         both_directions_predit=False,
+        #         shap_check_enable=True,
+        #         max_depth=7,
+        #         num_leaves=118,
+        #         n_estimators=400,
+        #         n_childs=13,
         #     )
         #
         #     try:
-        #         results = sim.run(test_start="2025-01-30", test_end="2025-02-04")
+        #         results = sim.run(test_start=f"2026-04-{n}", test_end=f"2026-04-{n+1}")
         #         final_winrate = results['metrics']['winrate']
         #         print("DBG sim.run returned", results["final_equity"])
         #         print("wins", results["wins"])
@@ -12029,24 +13336,433 @@ if __name__ == "__main__":
         #     print(f"\nMejor n_keep_for_fit = {mejor_n} con winrate = {mejor_equity}")
         # else:
         #     print("\nNo hubo corridas válidas (todos devoFlvieron None/NaN o fallaron).")
-        # #
-        # # # =========== get_best_calibration_model
-        # #     start=65_000,
-        # #     start=65_000,
-        # # analyzer.get_best_calibration_model(display_graphic=True)
-        # #
-        # # # =============best dataset size:
-        # # df_results = analyzer.sweep_nkeep(
-        # #     start=65_000,        # analyzer.get_best_calibration_model(display_graphic=True)
-        # #     stop=105_000,
-        # #     step=1000,
-        # #     model_type="rf",
-        # #     model_kwargs={"n_estimators": 700, "max_features": "sqrt", "random_state": 42, "n_jobs": -1},
-        # #     calibrate_method="beta",
-        # #     export_csv_path="bestDataset_65k-105k_beta_700trees_trader_features.csv",
-        # #     sort_by="logloss"  # alternativas: 'logloss', 'brier', 'ece', 'macro_f1'
-        # # )
-        # # print(df_results.head(10))
+
+        # =========== get bet best dataset testing estimators <=========================================
+        # =========== get bet best dataset testing estimators <=========================================
+        # =========== get bet best dataset testing estimators <=========================================
+        # =========== get bet best dataset testing estimators <=========================================
+        # from math import isfinite
+        #
+        # mejor_n = None
+        # mejor_equity = float("-inf")
+        # equities_por_n = {}
+        # for n in range(1, 6, 1):
+        #
+        #     print("Creando Dataset M1")
+        #
+        #     builder = M1OutputCacheBuilder(
+        #         analyzer,
+        #         df,
+        #         proba_threshold=0.01,  # único umbral
+        #         atr_period=14,
+        #         atr_mult_tp=5.5,
+        #         atr_mult_sl=3.0,
+        #         offline_lookback_bars=50,
+        #         n_keep_for_fit=53000,
+        #         # cache=CacheConfig(cache_path=f"m1_outputs_1month_363k_march_{n}_1months_tp5_5sl3.parquet"),
+        #         cache=CacheConfig(None),
+        #     )
+        #
+        #     # start = datetime(2026, 2, n)
+        #     end_limit = datetime(2026, 4, n)
+        #     start = end_limit - relativedelta(days=1)  # último test_end deseado (exclusivo)
+        #
+        #     chunks = []
+        #     while start < end_limit:
+        #         end = start + relativedelta(days=2)
+        #         if end > end_limit:
+        #             end = end_limit  # por si el último tramo fuese parcial
+        #         ts, te = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+        #         print(f">>> Ejecutando ventana {ts} -> {te}")
+        #         meta_i = builder.build_and_cache(test_start=ts, test_end=te, verbose=1, export_parquet=True)
+        #         chunks.append(meta_i)
+        #         start = end  # avanza a la siguiente ventana
+        #     # Unir todos los resultados en un solo DataFrame
+        #     m1_output = pd.concat(chunks, ignore_index=True)
+        #     # FIX: Eliminamos duplicados por si los chunks se solapan
+        #     if "datetime" in m1_output.columns:
+        #         m1_output = m1_output.drop_duplicates(subset=["datetime"], keep="first")
+        #     else:
+        #         m1_output = m1_output.drop_duplicates()
+        #     # (opcional) Ordenar por columna temporal si existe
+        #     if "datetime" in m1_output.columns:
+        #         m1_output = m1_output.sort_values("datetime").reset_index(drop=True)
+        #
+        #     df_cache = m1_output
+        #     # Calcular winrate basado en la columna result
+        #     # Contar los valores de la columna result
+        #     result_counts = df_cache['result'].value_counts()
+        #     print("\nDistribución de resultados:")
+        #     print(result_counts)
+        #     # Calcular winrate (porcentaje de tp sobre el total)
+        #     total_trades = len(df_cache[df_cache['result'].notna()])
+        #     tp_count = len(df_cache[df_cache['result'] == 'tp'])
+        #     sl_count = len(df_cache[df_cache['result'] == 'sl'])
+        #     winrate = (tp_count / total_trades * 100) if total_trades > 0 else 0
+        #
+        #     try:
+        #         final_winrate = winrate
+        #         print(f"\n{'=' * 50}")
+        #         print(f"ESTADÍSTICAS DE TRADING")
+        #         print(f"{'=' * 50}")
+        #         print(f"Total de operaciones: {total_trades}")
+        #         print(f"Take Profit (TP): {tp_count} ({tp_count / total_trades * 100:.2f}%)")
+        #         print(f"Stop Loss (SL): {sl_count} ({sl_count / total_trades * 100:.2f}%)")
+        #         print(f"Winrate: {winrate:.2f}%")
+        #         print(f"{'=' * 50}\n")
+        #     except Exception as e:
+        #         print(f"[WARN] Estimators={n} falló: {e}")
+        #         final_winrate = None
+        #
+        #     equities_por_n[n] = final_winrate
+        #     print(f"Estimators={n} -> winrate={final_winrate}")
+        #
+        #     if final_winrate is not None and isfinite(final_winrate) and final_winrate > mejor_equity:
+        #         mejor_equity = final_winrate
+        #         mejor_n = n
+        #
+        # # Resumen final
+        # print("\nResumen:")
+        # for n, eq in sorted(equities_por_n.items()):
+        #     print(f"  n={n:5d}  winrate={eq}")
+        #
+        # if mejor_n is not None:
+        #     print(f"\nMejor n_keep_for_fit = {mejor_n} con winrate = {mejor_equity}")
+        # else:
+        #     print("\nNo hubo corridas válidas (todos devoFlvieron None/NaN o fallaron).")
+
+        # =========== get bet best dataset testing estimators <=========================================
+        from math import isfinite
+
+        mejor_n = None
+        mejor_equity = float("-inf")
+        equities_por_n = {}
+
+        for n in range(1, 6, 1):
+
+            # print("Creando Dataset M1")
+            # builder = M1OutputCacheBuilder(
+            #     analyzer,
+            #     df,
+            #     proba_threshold=0.2,  # único umbral
+            #     atr_period=14,
+            #     atr_mult_tp=5.5,
+            #     atr_mult_sl=3.0,
+            #     offline_lookback_bars=50,
+            #     n_keep_for_fit=53000,
+            #     cache=CacheConfig(cache_path=f"m1_outputs_2day_53k_april_{n}_6_month_tp5_5sl3_17features_kwargs_custom.parquet"),
+            #     # cache=CacheConfig(None),
+            # )
+
+            # # start = datetime(2026, 2, n)
+            # end_limit = datetime(2026, 4, n)
+            # start = end_limit - relativedelta(months=6)  # último test_end deseado (exclusivo)
+
+            # chunks = []
+            # while start < end_limit:
+            #     end = start + relativedelta(days=2)
+            #     if end > end_limit:
+            #         end = end_limit  # por si el último tramo fuese parcial
+            #     ts, te = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+            #     print(f">>> Ejecutando ventana {ts} -> {te}")
+            #     meta_i = builder.build_and_cache(test_start=ts, test_end=te, verbose=1, export_parquet=True)
+            #     chunks.append(meta_i)
+            #     start = end  # avanza a la siguiente ventana
+            # # Unir todos los resultados en un solo DataFrame
+            # m1_output = pd.concat(chunks, ignore_index=True)
+            # # FIX: Eliminamos duplicados por si los chunks se solapan
+            # if "datetime" in m1_output.columns:
+            #     m1_output = m1_output.drop_duplicates(subset=["datetime"], keep="first")
+            # else:
+            #     m1_output = m1_output.drop_duplicates()
+            # # (opcional) Ordenar por columna temporal si existe
+            # if "datetime" in m1_output.columns:
+            #     m1_output = m1_output.sort_values("datetime").reset_index(drop=True)
+            # print("M1 Output listo")
+            # df_cache = m1_output
+            df_cache = pd.read_parquet(f"m1_outputs_2days_53k_april_{n}_3_month_tp5_5sl3_17features_kwargs_custom.parquet")
+            result_counts = df_cache['result'].value_counts()
+            print("\nDistribución de resultados:")
+            print(result_counts)
+            # Calcular winrate (porcentaje de tp sobre el total)
+            total_trades = len(df_cache[df_cache['result'].notna()])
+            tp_count = len(df_cache[df_cache['result'] == 'tp'])
+            sl_count = len(df_cache[df_cache['result'] == 'sl'])
+            winrate = (tp_count / total_trades * 100) if total_trades > 0 else 0
+            print(f"\n{'=' * 50}")
+            print(f"ESTADÍSTICAS DE TRADING")
+            print(f"{'=' * 50}")
+            print(f"Total de operaciones: {total_trades}")
+            print(f"Take Profit (TP): {tp_count} ({tp_count / total_trades * 100:.2f}%)")
+            print(f"Stop Loss (SL): {sl_count} ({sl_count / total_trades * 100:.2f}%)")
+            print(f"Winrate: {winrate:.2f}%")
+            print(f"{'=' * 50}\n")
+            print(df_cache.iloc[-1])
+
+            # print("\n[🔍 SHAP] Filtrando features sin importancia predictiva...")
+            # FEATURES_M2 = select_features_by_shap(df_cache, FEATURES, threshold=0.1)
+
+            # fixed = [
+            #     'atr_vs_ema200',
+            #     'atr_norm',
+            #     'shock_ema',
+            #     'var_95_m',
+            #     'trend_slope_ema',
+            #     'dist_to_vwap',
+            #     'trend_slope_norm_100',
+            #     'signed_volume_ema',
+            #     'session_ny',
+            #     'trend_r2_100',
+            #     'vol_20',
+            #     'ret_kurt_m',
+            #     'ret_skew_m',
+            #     'vol_ratio',
+            #     'corr_close_vol_m',
+            #     'trend_dist_pct_100',
+            #     'slope_m',
+            #     'dist_to_high20',
+            # ]
+
+            # print("\n[🎯 M2] Iniciando Optimización de FEATURES para M2")
+            # FEATURES_M2 = get_best_features_by_pnl_m2(
+            #     df_general=df,
+            #     df_data=df_cache,
+            #     fixed_features=[],  # Se puede ajustar si quieres dejar "fechas fuertes" de M2 fijas
+            #     candidate_features=FEATURES,
+            #     trials=5000,
+            #     min_features=5,
+            #     thresh_optuna=0.4,
+            #     timeout_mins=720,
+            #     target_pnl=70
+            # )
+            # FEATURES_M2 = [
+            #     'z_atr_norm', 'volatility_50', 'shock_ema', 'min_dist_level_atr', 'dist_S1_8h_atr', 'trend_slope_ema',
+            #     'dist_to_vwap', 'dist_R1_8h_atr', 'trend_slope_norm_100', 'k100_x_trend_slope', 'session_ny',
+            #     'trend_r2_100', 'ret_skew_m', 'up_vol_ratio', 'session_ny_open', 'dist_to_high20', 'vol_ratio_lag1',
+            #     'volatility_10', 'micro_slope', 'ema21_slope', 'macd', 'dist_ema_50', 'ema_50_vs_200', 'ret_mean_m',
+            #     'macd_hist', 'p_entropy_s', 'z_volume_lag1', 'roc_10', 'momentum_diff', 'close_position',
+            #     'ema_bull_aligned', 'roc_5', 'vol_change_pct', 'vol_cv', 'gap_open_pct'
+            # ]
+            FEATURES_M2 = FEATURES
+            m2_optimized_features = FEATURES_M2 + FEATS_M2
+            #
+            print("[🎯 M2] Features optimizados listos.\n")
+
+
+            # {'class_weight': 'balanced', 'max_depth': 5, 'num_leaves': 53, 'min_child_samples': 112, 'n_estimators': 100, 'learning_rate': 0.05, 'subsample': 0.7, 'colsample_bytree': 1.0}
+
+            # print("\n[🎯 M2] Iniciando Optimización de KWARGS para M2 con las features ganadoras")
+            # -30.39%
+            # fixed = {'class_weight': 'balanced', 'max_depth': 6, 'num_leaves': 46, 'min_child_samples': 361, 'n_estimators': 150, 'learning_rate': 0.05, 'subsample': 0.8999999999999999, 'colsample_bytree': 0.7}
+            # optuna_kwargs = get_best_kwargs_by_df(df_general=df, df_data=df_cache, trials=5000, features=FEATURES, timeout_mins=50, target_pnl=40)
+
+            # #
+            optuna_kwargs = {
+                "random_state": 42,
+                "n_jobs": -1,
+                "verbosity": -1,
+                # 'class_weight': 'balanced', 'max_depth': 6, 'num_leaves': 22, 'min_child_samples': 66, 'n_estimators': 450, 'learning_rate': 0.01, 'subsample': 0.7, 'colsample_bytree': 0.7999999999999999
+            }
+            # Trial 3657 finished with value: -63.51761270706765 and parameters: {'use_atr_vs_ema200': True, 'use_atr_norm': True, 'use_dist_PP': False, 'use_z_atr_norm': False, 'use_volatility_50': False, 'use_shock_ema': True, 'use_var_95_m': True, 'use_min_dist_level_atr': False, 'use_dist_S1_8h_atr': False, 'use_dist_ema_200': False, 'use_trend_slope_ema': True, 'use_dist_to_vwap': True, 'use_dist_P_8h_atr': False, 'use_dist_R1_8h_atr': False, 'use_trend_slope_norm_100': True, 'use_e100': False, 'use_k100_x_trend_slope': False, 'use_signed_volume_ema': True, 'use_session_ny': True, 'use_trend_r2_100': True, 'use_var_ratio': False, 'use_vol_20': True, 'use_ret_kurt_m': True, 'use_session_london_open': False, 'use_ret_skew_m': True, 'use_trend_r2_50': False, 'use_vol_ratio': True, 'use_cross_ma_m': False, 'use_macd_signal': False, 'use_corr_close_vol_m': True, 'use_acf2_s': False, 'use_up_vol_ratio': False, 'use_ema21_vs_50_norm': False, 'use_session_ny_open': False, 'use_hurst_m': False, 'use_trend_dist_pct_100': True, 'use_close_vs_8h_mean': False, 'use_trend_channel_slope_high': False, 'use_slope_m': True, 'use_dist_to_high20': True, 'use_roc_30': True, 'use_dist_to_low50': False, 'use_dist_support_rl': False, 'use_obv_slope': True, 'use_dist_to_high50': False, 'use_vol_ratio_lag1': False, 'use_candle_range_norm': True, 'use_acf1_s': False, 'use_hmm_state': False, 'use_volatility_10': True, 'use_micro_slope': True, 'use_ema21_slope': False, 'use_candle_range_norm_lag1': False, 'use_rsi_50': True, 'use_macd': False, 'use_dist_ema_50': True, 'use_dist_resist_rl': False, 'use_atr_acceleration': True, 'use_ema_50_vs_200': True, 'use_ret_mean_s': True, 'use_ret_mean_m': True, 'use_ema_bear_aligned': False, 'use_macd_hist_lag1': True, 'use_macd_hist': True, 'use_p_entropy_s': True, 'use_session_asia_open': False, 'use_cci_20': False, 'use_z_volume_lag1': True, 'use_roc_10': True, 'use_z_volume': True, 'use_momentum_diff': False, 'use_k_lag3': False, 'use_lower_wick': True, 'use_close_position': True, 'use_ema_bull_aligned': False, 'use_roc_5': True, 'use_body_vs_atr': False, 'use_vol_change_pct': False, 'use_vol_oscillator': False, 'use_vol_cv': True, 'use_gap_open_pct_abs': False, 'use_gap_open_pct': True}. Best is trial 3657 with value: -63.51761270706765.
+
+            # --- ENTRENAMIENTO SEPARADO POR DIRECCIÓN (LONGS VS SHORTS) ---
+            df_longs = df_cache[df_cache['direction_sign'] == 1].copy()
+            df_shorts = df_cache[df_cache['direction_sign'] == -1].copy()
+
+            # Removemos direction_sign porque al separar datasets se vuelve constante (varianza 0)
+            features_for_training = [f for f in m2_optimized_features if f != 'direction_sign']
+
+            print("\n" + "="*60)
+            print("🟢 ENTRENANDO M2 PARA LONGS (direction_sign == 1)")
+            print("="*60)
+            optuna_kwargs_long = optuna_kwargs.copy()
+            # optuna_kwargs_long = get_best_kwargs_by_df(df_general=df, df_data=df_longs, trials=1000, features=FEATURES, timeout_mins=50, target_pnl=40)
+
+            constraints_long, p_high_l, p_low_l = generate_auto_monotone_constraints(
+                df_longs, features_for_training, bias_threshold=0.2, kwargs=optuna_kwargs_long
+            )
+            optuna_kwargs_long['monotone_constraints'] = constraints_long
+
+            model_long = create_predictive_model_m2(
+                df_model=df_longs,
+                features=features_for_training,
+                model_type='lightgbm',
+                model_kwargs=optuna_kwargs_long,
+                calibrate_method="sigmoid",
+                display_graphic=False,
+                return_metrics=False
+            )
+
+            print("\n" + "="*60)
+            print("🔴 ENTRENANDO M2 PARA SHORTS (direction_sign == -1)")
+            print("="*60)
+            optuna_kwargs_short = optuna_kwargs.copy()
+            # optuna_kwargs_short = get_best_kwargs_by_df(df_general=df, df_data=df_shorts, trials=1000, features=FEATURES, timeout_mins=50, target_pnl=110)
+            constraints_short, p_high_s, p_low_s = generate_auto_monotone_constraints(
+                df_shorts, features_for_training, bias_threshold=0.2, kwargs=optuna_kwargs_short
+            )
+            optuna_kwargs_short['monotone_constraints'] = constraints_short
+
+            model_short = create_predictive_model_m2(
+                df_model=df_shorts,
+                features=features_for_training,
+                model_type='lightgbm',
+                model_kwargs=optuna_kwargs_short,
+                calibrate_method="sigmoid",
+                display_graphic=False,
+                return_metrics=False
+            )
+
+            # Wrapper para unificar ambos modelos de cara al TradeSimulator
+            class M2DirectionalWrapper:
+                def __init__(self, model_l, model_s, dir_feat, features_list):
+                    self.model_l = model_l
+                    self.model_s = model_s
+                    self.dir_feat = dir_feat
+                    self.features_list = features_list # Lista original INCLUYENDO direction_sign
+
+                def predict_proba(self, X):
+                    import numpy as np
+                    import pandas as pd
+                    is_df = isinstance(X, pd.DataFrame)
+                    
+                    # 1. Extraer la dirección para saber a qué modelo rutear
+                    if is_df:
+                        dirs = X[self.dir_feat].values
+                    else:
+                        dir_idx = self.features_list.index(self.dir_feat)
+                        dirs = X[:, dir_idx]
+                        
+                    # 2. Ocultar direction_sign porque los modelos ya no la esperan
+                    if is_df:
+                        X_clean = X.drop(columns=[self.dir_feat])
+                    else:
+                        dir_idx = self.features_list.index(self.dir_feat)
+                        X_clean = np.delete(X, dir_idx, axis=1)
+                        
+                    probas = np.zeros((X.shape[0], 2))
+                    
+                    mask_l = (dirs == 1)
+                    mask_s = (dirs == -1)
+                    
+                    # 3. Predecir con los datos limpios (sin direction_sign)
+                    if np.any(mask_l):
+                        probas[mask_l] = self.model_l.predict_proba(X_clean[mask_l] if is_df else X_clean[mask_l, :])
+                    if np.any(mask_s):
+                        probas[mask_s] = self.model_s.predict_proba(X_clean[mask_s] if is_df else X_clean[mask_s, :])
+                        
+                    return probas
+            
+            # El TradeSimulator recibe el Wrapper como si fuera un solo modelo normal
+            # Pasamos m2_optimized_features (lista completa) para que el Wrapper sepa dónde encontrar la dirección
+            model_m2 = M2DirectionalWrapper(model_long, model_short, 'direction_sign', m2_optimized_features)
+
+            sim = TradeSimulator(
+                analyzer,
+                df,
+                initial_equity=100,
+                leverage=500,
+                risk_fraction=0.02,
+                on_event=logger,  # <— activar callback
+                verbose=1,  # 0: silencio, 1: heartbeat cada N barras, 2: +OPEN/CLOSE
+                log_every_bars=288,
+                proba_threshold_day=0.4,
+                proba_threshold_night=0.4,
+                n_keep_for_fit=53000,
+                atr_mult_tp=5.5,
+                atr_mult_sl=3,
+                retrain_each_bar=False,
+                retrain_every_bars=290,
+                suppress_fit_stdout=False,
+                early_exit_threshold=0.6,
+                thresholds={"bearish": 0.2, "bullish": 0.2, "lateral": 0.20},
+                start_date="2021-09-15",
+                end_date=end_date,
+                enable_withdrawals=False,
+                m2_model=model_m2,
+                m2_df=df_cache,
+                both_directions_predit=False,
+                shap_check_enable=False,
+                max_depth=7,
+                num_leaves=118,
+                n_estimators=400,
+                n_childs=13,
+            )
+
+            results = sim.run(test_start=f"2026-04-{n}", test_end=f"2026-04-{n+1}")
+            print("DBG sim.run returned", results["final_equity"])
+            # Calcular winrate basado en la columna result
+            # Contar los valores de la columna result
+
+            # Calcular winrate (porcentaje de tp sobre el total)
+            total_trades = results.get('n_trades', 0)
+            tp_count = results.get('wins', 0)
+            sl_count = results.get('losses', 0)
+
+            if total_trades > 0:
+                winrate = (tp_count / total_trades) * 100
+                print(f"\n{'=' * 50}")
+                print(f"ESTADÍSTICAS DE TRADING")
+                print(f"{'=' * 50}")
+                print(f"Total de operaciones: {total_trades}")
+                print(f"Take Profit (TP): {tp_count} ({(tp_count / total_trades) * 100:.2f}%)")
+                print(f"Stop Loss (SL): {sl_count} ({(sl_count / total_trades) * 100:.2f}%)")
+                print(f"Winrate: {winrate:.2f}%")
+                print(f"{'=' * 50}\n")
+            else:
+                winrate = 0.0
+                print(f"\n{'=' * 50}")
+                print("ESTADÍSTICAS DE TRADING")
+                print(f"{'=' * 50}")
+                print("Total de operaciones: 0")
+                print("M2 bloqueó absolutamente todo. ¡Día salvado!")
+                print(f"{'=' * 50}\n")
+            try:
+                final_winrate = winrate
+                # net_profit = results["metrics"]["net_profit"]
+                # final_netprofit = net_profit
+            except Exception as e:
+                print(f"[WARN] Estimators={n} falló: {e}")
+                final_netprofit = None
+            equities_por_n[n] = final_winrate
+
+            print(f"Estimators={n} -> winrate={final_winrate}")
+
+            if final_winrate is not None and isfinite(final_winrate) and final_winrate > mejor_equity:
+                mejor_equity = final_winrate
+                mejor_n = n
+
+            # if final_netprofit is not None and isfinite(final_netprofit) and final_netprofit > mejor_equity:
+            #     mejor_equity = final_netprofit
+            #     mejor_n = n
+
+        # Resumen final
+        print("\nResumen:")
+        for n, eq in sorted(equities_por_n.items()):
+            print(f"  n={n:5d}  winrate={eq}")
+
+        if mejor_n is not None:
+            print(f"\nMejor n_keep_for_fit = {mejor_n} con winrate = {mejor_equity}")
+        else:
+            print("\nNo hubo corridas válidas (todos devoFlvieron None/NaN o fallaron).")
+
+        # =========== get_best_calibration_model
+        #     start=65_000,
+        #     start=65_000,
+        # analyzer.get_best_calibration_model(display_graphic=True)
+        #
+        # # =============best dataset size:
+        # df_results = analyzer.sweep_nkeep(
+        #     start=65_000,        # analyzer.get_best_calibration_model(display_graphic=True)
+        #     stop=105_000,
+        #     step=1000,
+        #     model_type="rf",
+        #     model_kwargs={"n_estimators": 700, "max_features": "sqrt", "random_state": 42, "n_jobs": -1},
+        #     calibrate_method="beta",
+        #     export_csv_path="bestDataset_65k-105k_beta_700trees_trader_features.csv",
+        #     sort_by="logloss"  # alternativas: 'logloss', 'brier', 'ece', 'macro_f1'
+        # )
+        # print(df_results.head(10))
 
 
     else:
